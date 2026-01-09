@@ -1,13 +1,11 @@
 [target.xtensa-esp32-none-elf]
-runner = "probe-rs run --chip=esp32 --preverify --always-print-stacktrace --no-location --catch-hardfault"
+runner = "espflash flash --monitor --log-format defmt"
 
 [env]
-DEFMT_LOG="info"
+DEFMT_LOG = "info"
 
 [build]
-rustflags = [
-  "-C", "link-arg=-nostartfiles",
-]
+rustflags = ["-C", "link-arg=-nostartfiles"]
 
 target = "xtensa-esp32-none-elf"
 
