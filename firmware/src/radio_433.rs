@@ -1,20 +1,10 @@
-use cc1101::{Cc1101, Modulation, PacketLength, SyncMode};
+use cc1101::{Cc1101, GdoCfg, ModulationFormat, PacketLength, SyncMode};
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use esp_hal::Blocking;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::gpio::{InputPin, OutputPin};
 use esp_hal::spi::{Mode, master::Spi};
 use esp_hal::time::Rate;
-
-/// GDO output configuration values (from CC1101 datasheet)
-pub mod gdo_config {
-    /// Asserts when sync word has been sent / received
-    pub const SYNC_WORD: u8 = 0x06;
-    /// Asserts when a packet has been received with CRC OK
-    pub const CRC_OK: u8 = 0x07;
-    /// High impedance (tri-state)
-    pub const HIGH_Z: u8 = 0x2F;
-}
 
 pub fn setup_cc1101(
     spimaster: impl esp_hal::spi::master::Instance + 'static,
@@ -54,17 +44,19 @@ pub fn setup_cc1101(
     // Create CC1101 driver
     let mut cc1101 = Cc1101::new(spi_device).unwrap();
 
-    // Apply default configuration (sets up GDO pins, FIFOs, etc.)
-    // This should configure GDO0 to a useful signal
+    // Apply default configuration
     cc1101.set_defaults().unwrap();
 
-    // Configure for 433 MHz operation
+    // Configure for 433 MHz OOK operation
     cc1101.set_frequency(433_920_000).unwrap(); // 433.92 MHz
-    cc1101.set_modulation(Modulation::OnOffKeying).unwrap();
-    cc1101.set_sync_mode(SyncMode::MatchFull(0xD391)).unwrap();
     cc1101
-        .set_packet_length(PacketLength::Variable(61))
+        .set_modulation_format(ModulationFormat::AmplitudeShiftOnOffKeying)
         .unwrap();
+    cc1101.set_sync_mode(SyncMode::Disabled).unwrap(); // No sync for raw mode
+    cc1101.set_packet_length(PacketLength::Infinite).unwrap();
+
+    // Configure GDO0 for raw serial data output (async OOK mode)
+    cc1101.set_gdo0_config(GdoCfg::SERIAL_DATA_OUT).unwrap();
 
     // Module status data input
     let gdo0 = Input::new(gdo0, InputConfig::default().with_pull(Pull::Down));

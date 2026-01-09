@@ -205,30 +205,15 @@ async fn radio_433_rx_task(mut cc1101: Cc1101Radio, gdo0: Input<'static>) {
         gdo0_initial
     );
 
-    // If GDO0 is HIGH at startup, it's probably outputting a clock signal (default)
-    // We can't receive properly until GDO0 is configured correctly
+    // If GDO0 is HIGH at startup, it *might* be clock output, but we configured it
+    // to SERIAL_DATA_OUT. If there's noise, it might be high.
     if gdo0_initial {
-        info!("WARNING: GDO0 is HIGH at startup - likely default clock output");
-        info!("The cc1101 crate doesn't expose GDO configuration, so we'll just monitor");
+        info!("Note: GDO0 is high at startup. This is normal if there is RF noise.");
     }
 
-    let mut poll_count = 0u32;
-
-    loop {
-        poll_count = poll_count.wrapping_add(1);
-
-        // Log status periodically (every ~5 seconds at 100ms poll rate)
-        if poll_count % 128 == 0 {
-            let current_gdo0 = gdo0.is_high();
-            let rssi = cc1101.get_rssi_dbm().unwrap_or(-999);
-            let lqi = cc1101.get_lqi().unwrap_or(255);
-            info!(
-                "Radio status: GDO0={}, RSSI={} dBm, LQI={}",
-                current_gdo0, rssi, lqi
-            );
-        }
-
-        // Yield to other tasks - poll every 100ms
-        Timer::after(Duration::from_millis(100)).await;
-    }
+    // Start pulse capture and decoding
+    // This is an infinite loop that captures edges and decodes packets
+    use esp32_rust_project::pulse_capture::PulseCapture;
+    let mut capture = PulseCapture::new(gdo0);
+    capture.run().await;
 }
