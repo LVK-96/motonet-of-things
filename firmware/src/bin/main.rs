@@ -80,16 +80,16 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(TimerGroup::new(peripherals.TIMG0).timer0);
 
     // Spawn LED task first (so it works even if other setup fails)
-    spawner
-        .spawn(led_task(Output::new(
-            peripherals.GPIO2,
-            Level::Low,
-            OutputConfig::default(),
-        )))
-        .unwrap();
+    // spawner
+    //     .spawn(led_task(Output::new(
+    //         peripherals.GPIO2,
+    //         Level::Low,
+    //         OutputConfig::default(),
+    //     )))
+    //     .unwrap();
 
-    // Setup BLE
-    let host = ble_setup(peripherals.BT).unwrap();
+    // Setup BLE - DISABLED for 433MHz debugging
+    // let host = ble_setup(peripherals.BT).unwrap();
 
     // Setup 433MHz radio (this may block if CC1101 not connected!)
     info!("Setting up CC1101 radio...");
@@ -105,8 +105,9 @@ async fn main(spawner: Spawner) -> ! {
     info!("CC1101 setup complete!");
 
     // Spawn tasks
-    spawner.spawn(ble_runner_task(host.runner)).unwrap();
-    spawner.spawn(ble_peripheral_task(host.peripheral)).unwrap();
+    // BLE tasks disabled for debugging
+    // spawner.spawn(ble_runner_task(host.runner)).unwrap();
+    // spawner.spawn(ble_peripheral_task(host.peripheral)).unwrap();
     spawner.spawn(radio_433_rx_task(cc1101, gdo0)).unwrap();
 
     loop {
@@ -210,6 +211,25 @@ async fn radio_433_rx_task(mut cc1101: Cc1101Radio, gdo0: Input<'static>) {
     if gdo0_initial {
         info!("Note: GDO0 is high at startup. This is normal if there is RF noise.");
     }
+
+    // Measure RSSI at startup
+    info!("Measuring RSSI on 433.92 MHz for 3s...");
+    let mut min_rssi: i16 = 0;
+    let mut max_rssi: i16 = -128;
+    for _ in 0..60 {
+        if let Ok(rssi) = cc1101.get_rssi_dbm() {
+            if rssi < min_rssi {
+                min_rssi = rssi;
+            }
+            if rssi > max_rssi {
+                max_rssi = rssi;
+            }
+        }
+        Timer::after(Duration::from_millis(50)).await;
+    }
+    info!("RSSI: min={} max={} dBm", min_rssi, max_rssi);
+
+    info!("Starting pulse capture...");
 
     // Start pulse capture and decoding
     // This is an infinite loop that captures edges and decodes packets

@@ -1,4 +1,7 @@
-use cc1101::{Cc1101, GdoCfg, ModulationFormat, PacketLength, SyncMode};
+use cc1101::{
+    Cc1101, DecisionBoundary, FilterLength, GdoCfg, ModulationFormat, PacketLength, SyncMode,
+    TargetAmplitude,
+};
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use esp_hal::Blocking;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
@@ -23,7 +26,7 @@ pub fn setup_cc1101(
     let spi = Spi::new(
         spimaster,
         esp_hal::spi::master::Config::default()
-            .with_frequency(Rate::from_hz(1_000_000)) // CC1101 max is ~10MHz, start low
+            .with_frequency(Rate::from_hz(1_000_000)) // SPI bus speed (ESP32 <-> CC1101)
             .with_mode(Mode::_0), // CPOL=0, CPHA=0
     )
     .unwrap()
@@ -44,6 +47,9 @@ pub fn setup_cc1101(
     // Create CC1101 driver
     let mut cc1101 = Cc1101::new(spi_device).unwrap();
 
+    // Reset chip to ensure clean state
+    cc1101.reset_chip().unwrap();
+
     // Apply default configuration
     cc1101.set_defaults().unwrap();
 
@@ -55,8 +61,20 @@ pub fn setup_cc1101(
     cc1101.set_sync_mode(SyncMode::Disabled).unwrap(); // No sync for raw mode
     cc1101.set_packet_length(PacketLength::Infinite).unwrap();
 
-    // Configure GDO0 for raw serial data output (async OOK mode)
-    cc1101.set_gdo0_config(GdoCfg::SERIAL_DATA_OUT).unwrap();
+    // OOK-specific settings for Rubicson reception
+    // Try high data rate to make OOK demodulator more responsive
+    cc1101.set_data_rate(50000).unwrap(); // High data rate
+    cc1101.set_chanbw(540_000).unwrap(); // Maximum bandwidth
+
+    // OOK sensitivity settings (reduced to filter noise)
+    cc1101.set_magn_target(TargetAmplitude::Db33).unwrap(); // Higher threshold
+    cc1101
+        .set_filter_length(FilterLength::AmplitudeModulation(DecisionBoundary::Db8))
+        .unwrap(); // Less sensitive OOK
+
+    // Enable async serial mode for raw OOK data output
+    // This sets PKTCTRL0 = 0x30 (async serial mode) and GDO0 to SERIAL_DATA_OUT
+    cc1101.set_raw_mode().unwrap();
 
     // Module status data input
     let gdo0 = Input::new(gdo0, InputConfig::default().with_pull(Pull::Down));
