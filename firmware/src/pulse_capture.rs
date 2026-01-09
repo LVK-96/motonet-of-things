@@ -1,3 +1,4 @@
+use defmt::info;
 use embassy_time::Instant;
 use esp_hal::gpio::Input;
 use rubicson;
@@ -17,84 +18,55 @@ impl<'d> PulseCapture<'d> {
     }
 
     pub async fn run(&mut self) -> ! {
-        let mut last_edge = Instant::now();
-        let mut current_bits = [0u8; 5]; // 36 bits fits in 5 bytes
-        let mut bit_index = 0;
+        // The rubicson sensor sends 12 * 36 bit packets (432 bits)
+        // We collect the gap durations in a buffer of 512 u32s
+        let mut pulse_buffer = [0u32; 512];
+        let mut pulse_count = 0;
 
-        // Wait for initial long gap/silence to sync?
-        // Or just start.
+        // Wait for a 1
+        self.pin.wait_for_high().await;
 
+        // Wait for falling edge
+        self.pin.wait_for_low().await;
+        // Timestamp of the first falling edge we detected
+        let mut last_falling_edge = Instant::now();
+
+        // pin is the raw OOK demodulated signal
+        // i.e. when the radio is receiving a carrier -> 1, otherwise 0
         loop {
-            // Wait for rising edge (start of pulse)
+            // Wait for rising edge (start of next pulse)
+            // Previous state was Low
             self.pin.wait_for_high().await;
             let rising_edge = Instant::now();
 
-            // Calculate time since last rising edge (Pulse + Gap from previous bit)
-            // Or measure Gap: from last falling edge to this rising edge.
+            // Data in encoded in the gap between pulses, long = 1, short = 0
+            // Here we collect the gap durations in pulse_buffer
+            // rubicson::decode_gaps will try to decode the gaps
+            // once the buffer fills up
+            let gap = rising_edge.duration_since(last_falling_edge);
+            let micros = gap.as_micros() as u32;
 
-            // Let's track:
-            // 1. Wait for High (Start Pulse)
-            // 2. Wait for Low (End Pulse) -> Record Pulse Width
-            // 3. Wait for High (Start Next Pulse) -> Record Gap Width (Low duration)
-
-            // Actually, we are at Rising Edge now.
-            // Previous state was Low (Gap).
-            let gap_duration = rising_edge.duration_since(last_edge);
-
-            // Validate Gap
-            // Short: ~1000us -> 0
-            // Long: ~2000us -> 1
-            // Sync/Reset: > 3000us -> Start of new packet / End of old
-
-            let micros = gap_duration.as_micros();
-
-            if micros > 4000 {
-                // End of packet or noise. Reset.
-                if bit_index >= 36 {
-                    // Try to decode what we have
-                    match rubicson::decode_rubicson(&current_bits, bit_index) {
-                        Ok(reading) => {
-                            defmt::info!("Rubicson: {:?}", reading);
-                        }
-                        Err(_e) => {
-                            // defmt::debug!("Decode failed: {:?}", e);
-                        }
+            if pulse_count < pulse_buffer.len() {
+                pulse_buffer[pulse_count] = micros;
+                pulse_count += 1;
+            } else {
+                // Overflow -> decode and reset
+                match rubicson::decode_gaps(&pulse_buffer) {
+                    Ok(r) => {
+                        info!("Decoded: {:?}", r);
+                    }
+                    Err(e) => {
+                        info!("Decode error: {:?}", e);
                     }
                 }
-                // Reset
-                bit_index = 0;
-                current_bits = [0u8; 5];
-            } else if micros > 1500 {
-                // Long gap -> 1
-                add_bit(&mut current_bits, bit_index, 1);
-                bit_index += 1;
-            } else if micros > 500 {
-                // Short gap -> 0
-                add_bit(&mut current_bits, bit_index, 0);
-                bit_index += 1;
+                pulse_count = 0;
             }
 
-            // Limit buffer
-            if bit_index >= 36 * 2 {
-                bit_index = 0; // Overflow
-            }
+            info!("Gap: {}", micros);
 
-            // Wait for end of pulse (Low)
+            // Wait for falling edge (end of pulse)
             self.pin.wait_for_low().await;
-            last_edge = Instant::now(); // Timestamp of falling edge (start of gap)
+            last_falling_edge = Instant::now(); // Timestamp of falling edge (start of gap)
         }
-    }
-}
-
-fn add_bit(buf: &mut [u8], index: usize, val: u8) {
-    if index / 8 >= buf.len() {
-        return;
-    }
-    if val != 0 {
-        buf[index / 8] |= 1 << (7 - (index % 8)); // Big endian (MSB first) filling?
-        // rtl_433 says:
-        // data is grouped into 9 nibbles.
-        // usually transmission is MSB first.
-        // Let's assume MSB first.
     }
 }
