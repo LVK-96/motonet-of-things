@@ -9,9 +9,15 @@ use embassy_time::{Duration, Timer};
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use esp_hal::Blocking;
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Input, Level, Output, OutputConfig};
+use esp_hal::gpio::{DriveMode, Input, Output};
+use esp_hal::ledc::{
+    Ledc, LowSpeed, LSGlobalClkSource,
+    channel::{self, Channel, ChannelIFace},
+    timer::{self, TimerIFace},
+};
 use esp_hal::peripherals::Peripherals;
 use esp_hal::spi::master::Spi;
+use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
 use esp_radio::ble::Config as BleConfig;
@@ -79,17 +85,34 @@ async fn main(spawner: Spawner) -> ! {
     // Initialize async runtime
     esp_rtos::start(TimerGroup::new(peripherals.TIMG0).timer0);
 
-    // Spawn LED task first (so it works even if other setup fails)
-    // spawner
-    //     .spawn(led_task(Output::new(
-    //         peripherals.GPIO2,
-    //         Level::Low,
-    //         OutputConfig::default(),
-    //     )))
-    //     .unwrap();
+    // Setup hardware PWM for LED dimming
+    let mut ledc = Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+
+    static LEDC_TIMER: StaticCell<timer::Timer<'static, LowSpeed>> = StaticCell::new();
+    let lstimer0 = LEDC_TIMER.init(ledc.timer::<LowSpeed>(timer::Number::Timer0));
+    lstimer0
+        .configure(timer::config::Config {
+            duty: timer::config::Duty::Duty8Bit,
+            clock_source: timer::LSClockSource::APBClk,
+            frequency: Rate::from_khz(1),
+        })
+        .unwrap();
+
+    let mut channel0 = ledc.channel(channel::Number::Channel0, peripherals.GPIO2);
+    channel0
+        .configure(channel::config::Config {
+            timer: lstimer0,
+            duty_pct: 5, // 5% duty = dim LED
+            drive_mode: DriveMode::PushPull,
+        })
+        .unwrap();
+
+    // Spawn LED task with hardware PWM channel
+    spawner.spawn(led_pwm_task(channel0)).unwrap();
 
     // Setup BLE - DISABLED for 433MHz debugging
-    // let host = ble_setup(peripherals.BT).unwrap();
+    let host = ble_setup(peripherals.BT).unwrap();
 
     // Setup 433MHz radio (this may block if CC1101 not connected!)
     info!("Setting up CC1101 radio...");
@@ -106,8 +129,8 @@ async fn main(spawner: Spawner) -> ! {
 
     // Spawn tasks
     // BLE tasks disabled for debugging
-    // spawner.spawn(ble_runner_task(host.runner)).unwrap();
-    // spawner.spawn(ble_peripheral_task(host.peripheral)).unwrap();
+    spawner.spawn(ble_runner_task(host.runner)).unwrap();
+    spawner.spawn(ble_peripheral_task(host.peripheral)).unwrap();
     spawner.spawn(radio_433_rx_task(cc1101, gdo0)).unwrap();
 
     loop {
@@ -119,10 +142,25 @@ async fn main(spawner: Spawner) -> ! {
 type MyController = ExternalController<BleConnector<'static>, 10>;
 
 #[embassy_executor::task]
-async fn led_task(mut led: Output<'static>) {
+async fn led_pwm_task(channel: Channel<'static, LowSpeed>) {
+    // Breathing LED: fade up and down
+    let brightness = 15;
+    let duration_ms = 2000;
     loop {
-        led.toggle();
-        Timer::after(Duration::from_millis(1000)).await;
+        if channel.start_duty_fade(0, brightness, duration_ms).is_ok() {
+            wait_fade_done(&channel, duration_ms).await;
+        }
+
+        if channel.start_duty_fade(brightness, 0, duration_ms).is_ok() {
+            wait_fade_done(&channel, duration_ms).await;
+        }
+    }
+}
+
+/// Poll until fade completes, yielding to other tasks
+async fn wait_fade_done(channel: &Channel<'static, LowSpeed>, duration_ms: u16) {
+    while channel.is_duty_fade_running() {
+        Timer::after(Duration::from_millis(duration_ms as u64)).await;
     }
 }
 

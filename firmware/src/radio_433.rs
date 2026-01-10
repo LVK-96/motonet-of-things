@@ -1,5 +1,5 @@
 use cc1101::{
-    Cc1101, DecisionBoundary, FilterLength, GdoCfg, ModulationFormat, PacketLength, SyncMode,
+    Cc1101, DecisionBoundary, FilterLength, ModulationFormat, PacketLength, SyncMode,
     TargetAmplitude,
 };
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};

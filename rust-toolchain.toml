@@ -1,2 +1,3 @@
+#:schema false, silence linter
 [toolchain]
 channel = "esp"

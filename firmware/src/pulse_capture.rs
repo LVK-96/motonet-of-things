@@ -8,13 +8,11 @@ pub struct PulseCapture<'d> {
     pin: Input<'d>,
 }
 
-/// Timeout for considering a transmission ended (no edge for this long)
+/// Timeout for considering a transmission ended
 const TRANSMISSION_END_TIMEOUT_US: u64 = 4500;
 
-/// Maximum gap to record (anything longer is likely noise or end of transmission)
-const MAX_GAP_US: u32 = TRANSMISSION_END_TIMEOUT_US as u32;
-
 /// Dump gap buffer to logs for offline analysis
+#[allow(dead_code)]
 fn dump_gaps(gaps: &[u32]) {
     info!("=== GAP DUMP START ({} gaps) ===", gaps.len());
     // Print 10 gaps per line for readability
