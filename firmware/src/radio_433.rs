@@ -62,15 +62,18 @@ pub fn setup_cc1101(
     cc1101.set_packet_length(PacketLength::Infinite).unwrap();
 
     // OOK-specific settings for Rubicson reception
-    // Try high data rate to make OOK demodulator more responsive
-    cc1101.set_data_rate(50000).unwrap(); // High data rate
-    cc1101.set_chanbw(540_000).unwrap(); // Maximum bandwidth
+    // Rubicson uses ~500µs pulses and 1000-2000µs gaps
+    // Data rate doesn't matter much in async serial mode, but affects AGC timing
+    cc1101.set_data_rate(4800).unwrap(); // Slower rate for better AGC settling
+    cc1101.set_chanbw(325_000).unwrap(); // Narrower bandwidth reduces noise
 
-    // OOK sensitivity settings (reduced to filter noise)
-    cc1101.set_magn_target(TargetAmplitude::Db33).unwrap(); // Higher threshold
+    // OOK decision boundary - CRITICAL for proper demodulation
+    // Higher dB value = less sensitive = fewer false triggers
+    // Db8 was too sensitive (stuck HIGH), try Db16 or Db20
+    cc1101.set_magn_target(TargetAmplitude::Db42).unwrap(); // Higher AGC target
     cc1101
-        .set_filter_length(FilterLength::AmplitudeModulation(DecisionBoundary::Db8))
-        .unwrap(); // Less sensitive OOK
+        .set_filter_length(FilterLength::AmplitudeModulation(DecisionBoundary::Db16))
+        .unwrap(); // 16dB threshold - adjust if still stuck HIGH
 
     // Enable async serial mode for raw OOK data output
     // This sets PKTCTRL0 = 0x30 (async serial mode) and GDO0 to SERIAL_DATA_OUT
