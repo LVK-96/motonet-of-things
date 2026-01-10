@@ -2,15 +2,14 @@
 #![no_main]
 
 extern crate alloc;
-use alloc::string::String;
 
 use cc1101::{Cc1101, RadioMode};
 use core::fmt::Write;
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
-use embassy_net::tcp::TcpSocket;
-use embassy_net::{Ipv4Address, Runner, StackResources};
 use embassy_futures::select::{Either, select};
+use embassy_net::tcp::TcpSocket;
+use embassy_net::Ipv4Address;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, Receiver};
 use embassy_time::{Duration, Instant, Timer};
@@ -29,7 +28,6 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
 use esp_radio::init;
-use esp_radio::wifi::{self, ClientConfig, ModeConfig, WifiDevice};
 use rubicson::RubicsonReading;
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
@@ -39,10 +37,9 @@ use rust_mqtt::types::{MqttString, QoS, TopicName};
 use rust_mqtt::Bytes;
 use static_cell::StaticCell;
 
+use esp32_rust_project::network;
 use esp32_rust_project::radio_433;
-use esp32_rust_project::secrets::{
-    MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID, WIFI_PASSWORD, WIFI_SSID,
-};
+use esp32_rust_project::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
 
 /// Channel for passing readings from radio task to MQTT task
 static READING_CHANNEL: Channel<CriticalSectionRawMutex, RubicsonReading, 4> = Channel::new();
@@ -103,61 +100,8 @@ async fn main(spawner: Spawner) -> ! {
     static RADIO_CONTROLLER: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
     let radio_controller = RADIO_CONTROLLER.init(init().unwrap());
 
-    // Setup WiFi
-    info!("Setting up WiFi...");
-    let wifi_config = wifi::Config::default();
-    let (mut wifi_controller, interfaces) =
-        wifi::new(radio_controller, peripherals.WIFI, wifi_config).unwrap();
-
-    // Create network stack using the STA interface
-    static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
-    let resources = STACK_RESOURCES.init(StackResources::new());
-
-    let (stack, runner) = embassy_net::new(
-        interfaces.sta,
-        embassy_net::Config::dhcpv4(Default::default()),
-        resources,
-        1234u64, // Random seed
-    );
-
-    // Store stack in static for tasks
-    static STACK: StaticCell<embassy_net::Stack<'static>> = StaticCell::new();
-    let stack = STACK.init(stack);
-
-    // Spawn network runner task
-    spawner.spawn(net_task(runner)).unwrap();
-
-    // Configure WiFi as station
-    let client_config = ClientConfig::default()
-        .with_ssid(String::from(WIFI_SSID))
-        .with_password(String::from(WIFI_PASSWORD));
-    wifi_controller.set_config(&ModeConfig::Client(client_config)).unwrap();
-
-    // Start WiFi
-    info!("Starting WiFi...");
-    wifi_controller.start_async().await.unwrap();
-
-    // Connect to WiFi
-    info!("Connecting to WiFi SSID: {}", WIFI_SSID);
-    loop {
-        match wifi_controller.connect_async().await {
-            Ok(()) => {
-                info!("WiFi connected!");
-                break;
-            }
-            Err(e) => {
-                warn!("WiFi connection failed: {:?}, retrying...", defmt::Debug2Format(&e));
-                Timer::after(Duration::from_secs(1)).await;
-            }
-        }
-    }
-
-    // Wait for DHCP
-    info!("Waiting for DHCP...");
-    stack.wait_config_up().await;
-    if let Some(config) = stack.config_v4() {
-        info!("Got IP: {}", defmt::Debug2Format(&config.address));
-    }
+    // Setup WiFi and network stack
+    let stack = network::setup_wifi(radio_controller, peripherals.WIFI, &spawner).await;
 
     // Setup 433MHz radio
     info!("Setting up CC1101 radio...");
@@ -181,11 +125,6 @@ async fn main(spawner: Spawner) -> ! {
     loop {
         core::future::pending::<()>().await;
     }
-}
-
-#[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
-    runner.run().await;
 }
 
 #[embassy_executor::task]
