@@ -19,34 +19,37 @@ pub enum DecodeError {
 }
 
 #[derive(PartialEq, Debug, Clone, Copy)]
-pub enum BreakReset {
+pub enum BreakResetIgnore {
     Break,
     Reset,
+    Ignore,
 }
 
-fn decode_gap(gap: u32) -> Result<u8, BreakReset> {
-    // Short pulse ~1000us
+fn decode_gap(gap: u32) -> Result<u8, BreakResetIgnore> {
+    // Short pulse ~1000us, the sensor sends a short pulse ~500us right before the break
+    let zero_lower_limit = 750;
     let zero_upper_limit = 1500;
 
     // Long pulse ~2000us
-    let one_upper_limit = 3000;
+    let one_upper_limit = 2500;
 
-    // Breaks between packets ~3000us
-    // 4000us -> reset
-    let break_limit = 4000;
+    // Breaks between packets ~4000us
+    let break_upper_limit = 4500;
 
     // Decode the received pulse
-    if gap > break_limit {
-        Err(BreakReset::Reset)
+    if gap > break_upper_limit {
+        Err(BreakResetIgnore::Reset)
     } else if gap > one_upper_limit {
         // End of packet
-        Err(BreakReset::Break)
+        Err(BreakResetIgnore::Break)
     } else if gap > zero_upper_limit {
         // Long gap -> 1
         Ok(1)
-    } else {
+    } else if gap > zero_lower_limit {
         // Short gap -> 0
         Ok(0)
+    } else {
+        Err(BreakResetIgnore::Ignore)
     }
 }
 
@@ -60,58 +63,72 @@ fn add_bit(buf: &mut [u8], index: usize, val: u8) {
     }
 }
 
-pub fn decode_gaps(pulses: &[u32]) -> Result<RubicsonReading, ()> {
+fn try_row_decode(bit_buffer: &[u8]) -> Result<RubicsonReading, DecodeError> {
+    let result = decode_rubicson(bit_buffer);
+    match result {
+        Ok(ref result) => {
+            #[cfg(feature = "defmt")]
+            defmt::info!("Decoded at end: {:?}", result);
+        },
+        Err(ref decode_error) => {
+            #[cfg(feature = "defmt")]
+            defmt::info!("Decode error at end: {:?}", decode_error);
+        }
+    }
+    result
+}
+
+pub fn decode_gaps(pulses: &[u32]) -> Result<(usize, RubicsonReading), [u8; 5 * 12]> {
     let mut bit_buffer = [0u8; 5 * 12]; // Support up to 12 packets of 5 bytes
     let mut bit_index = 0;
     let mut bit_buffer_row = 0;
-
     for &gap in pulses.iter() {
         // Calculate start byte for the current row (packet)
         let row_start_byte = bit_buffer_row * 5;
-
         match decode_gap(gap) {
             Ok(bit) => {
-                if let Some(row_slice) = bit_buffer.get_mut(row_start_byte..row_start_byte + 5) {
-                    add_bit(row_slice, bit_index, bit);
-                }
+                let row_slice = &mut bit_buffer[row_start_byte..(row_start_byte + 5)];
+                add_bit(row_slice, bit_index, bit);
                 bit_index += 1;
             }
-            Err(e) => {
-                // If the break or reset is at bit index 36 we might have a complete packet
-                if bit_index == 36 {
-                    if let Some(row_slice) = bit_buffer.get_mut(row_start_byte..row_start_byte + 5)
-                    {
-                        // The same packet is send 12 time in a row
-                        // If we are able to decode one we can return
-                        match decode_rubicson(row_slice) {
-                            Ok(result) => {
-                                #[cfg(feature = "defmt")]
-                                defmt::info!("Decoded: {:?}", result);
-                                return Ok(result);
-                            }
-                            Err(decode_error) => {
-                                #[cfg(feature = "defmt")]
-                                defmt::info!("Decode error: {:?}", decode_error);
-                            }
+            Err (e) => {
+                match e {
+                    BreakResetIgnore::Ignore => {
+                        // Ignore the short gap before the break 
+                        continue;
+                    }
+                    BreakResetIgnore::Break => {
+                        // We have a complete packet, try to decode
+                        let row_slice = &bit_buffer[row_start_byte..(row_start_byte + 5)];
+                        if let Ok(reading) = try_row_decode(row_slice) {
+                            // Successfully decoded a packet
+                            return Ok((bit_buffer_row, reading));
                         }
+                        // If the decode failed, we continue to the next packet
+                        bit_buffer_row += 1;
+                        bit_index = 0;
+                        continue;
                     }
-                } else {
-                    // The break or reset is not at bit index 36
-                    // If it is a reset we are done, we were unable to decode the packets
-                    match e {
-                        BreakReset::Reset => return Err(()),
-                        _ => {}
+                    BreakResetIgnore::Reset => {
+                        // We are done, we were unable to decode the packets
+                        return Err(bit_buffer);
                     }
-
-                    // Otherwise move on to the next packet
-                    bit_buffer_row += 1;
-                    bit_index = 0;
                 }
             }
         }
     }
 
-    Err(()) // Unable to decode the gaps
+    // Final attempt to decode the last packet if we have 36 bits
+    if bit_index == 35 {
+        let row_start_byte = bit_buffer_row * 5;
+        let row_slice = &bit_buffer[row_start_byte..(row_start_byte + 5)];
+        if let Ok(reading) = try_row_decode(row_slice) {
+            // Successfully decoded a packet
+            return Ok((bit_buffer_row, reading));
+        }
+    }
+
+    Err(bit_buffer) // Unable to decode the gaps
 }
 
 fn decode_rubicson(bits: &[u8]) -> Result<RubicsonReading, DecodeError> {
@@ -185,6 +202,10 @@ fn calculate_crc8(data: &[u8], poly: u8, mut crc: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+    use std::path::Path;
+    use std::convert::AsRef;
 
     // ==================== TEST UTILITIES ====================
 
@@ -243,8 +264,81 @@ mod tests {
 
         gaps
     }
+    
+    fn captured_data_to_gaps<P: AsRef<Path>>(gaps_file: P) -> Vec<u32> {
+        let f = File::open(gaps_file.as_ref()).expect("Failed to open gaps file");
+        let reader = BufReader::new(f);
+        let mut gaps: Vec<u32> = Vec::new();
+        for line in reader.lines().filter_map(Result::ok) {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue; // Skip empty lines and comments
+            }
+            if let Ok(gap) = line.trim().parse::<u32>() {
+                gaps.push(gap);
+            }
+        }
+        gaps
+    }
 
     // ==================== TESTS ====================
+    
+    #[test]
+    fn test_decode_captured_data() {
+        let gaps = captured_data_to_gaps("test_data/sample_gaps.txt");
+        
+        // Decode the whole captured data, like in the real use case
+        let (valid_packet_idx, result) = decode_gaps(&gaps).expect("Failed to decode captured gaps");
+        // Expected: ID=230, Channel=1, BatteryOK=true, Temp=-9.4C
+        assert_eq!(result.id, 230);
+        assert_eq!(result.channel, 1);
+        assert!(result.battery_ok);
+        assert!((result.temperature_c - (-9.4)).abs() < 0.1);
+        assert_eq!(result.crc_ok, true);
+        // The second packet is the first valid one
+        assert_eq!(valid_packet_idx, 1);
+        
+        // The first packet seems to be corrupt in the captured data
+        let result = decode_gaps(&gaps[0..36]);
+        assert!(result.is_err(), "Expected first packet to be invalid");
+        let bits = result.unwrap_err();
+        assert!(matches!(decode_rubicson(&bits), Err(DecodeError::CrcMismatch)));
+
+        // Packets 3 and onwards should be valid as well
+        for packet_nro in 2..12 {
+            let start_bit = packet_nro * 38; // Each packet 36 gaps + 2 (short + break)
+            let end_bit = (start_bit + 38).min(gaps.len() - 1); // Last packet does not have tailing short + break
+            let result = decode_gaps(&gaps[start_bit..end_bit]);
+            match result {
+                Ok((_idx, reading)) => {
+                    assert_eq!(reading.id, 230);
+                    assert_eq!(reading.channel, 1);
+                    assert!(reading.battery_ok);
+                    assert!((reading.temperature_c - (-9.4)).abs() < 0.1);
+                    assert_eq!(reading.crc_ok, true);
+                }
+                Err(bits) => {
+                    // Try to decode
+                    let try_to_decode= decode_rubicson(&bits);
+                    match try_to_decode {
+                        Ok(reading) => {
+                            assert_eq!(reading.id, 230);
+                            assert_eq!(reading.channel, 1);
+                            assert!(reading.battery_ok);
+                            assert!((reading.temperature_c - (-9.4)).abs() < 0.1);
+                            assert_eq!(reading.crc_ok, true);
+                        }
+                        Err(e) => {
+                            panic!("Packet {} failed to decode: {:?}", packet_nro + 1, e);
+                        }
+                    }       
+                }
+            }           
+        }
+
+            
+
+    }
 
     #[test]
     fn test_calculate_crc8() {
@@ -313,7 +407,7 @@ mod tests {
         gaps.extend_from_slice(&single_packet);
         gaps.extend_from_slice(&single_packet);
 
-        let r = decode_gaps(&gaps).expect("Decode burst failed");
+        let (_valid_packet_idx, r) = decode_gaps(&gaps).expect("Decode burst failed");
         assert_eq!(r.id, 12);
         assert!((r.temperature_c - 21.5).abs() < 0.1);
     }
@@ -337,7 +431,7 @@ mod tests {
         let gaps = payload_to_gaps(&payload);
 
         // Run full decode pipeline
-        let result = decode_gaps(&gaps).expect("End-to-end decode failed");
+        let (_valid_packet_idx, result) = decode_gaps(&gaps).expect("End-to-end decode failed");
 
         // Verify decoded values
         assert_eq!(result.id, expected_id, "ID mismatch");
@@ -356,6 +450,9 @@ mod tests {
 
     #[test]
     fn test_decode_gap_timing() {
+        // Test Too Short to be valid -> ignore
+        assert_eq!(decode_gap(499), Err(BreakResetIgnore::Ignore));
+
         // Test Short Gap (0) -> Gap <= 1500
         assert_eq!(decode_gap(1000), Ok(0));
 
@@ -363,10 +460,10 @@ mod tests {
         assert_eq!(decode_gap(2000), Ok(1));
 
         // Test Break -> Gap > 3000
-        assert_eq!(decode_gap(3500), Err(BreakReset::Break));
+        assert_eq!(decode_gap(3500), Err(BreakResetIgnore::Break));
 
         // Test Reset -> Gap > 4000
-        assert_eq!(decode_gap(5000), Err(BreakReset::Reset));
+        assert_eq!(decode_gap(5000), Err(BreakResetIgnore::Reset));
     }
 
     /// End-to-end test for a FAILING packet (corrupted data / CRC mismatch)
