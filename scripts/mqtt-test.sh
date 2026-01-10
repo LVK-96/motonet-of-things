@@ -12,6 +12,7 @@ CONF_FILE=$(mktemp)
 cat > "$CONF_FILE" << EOF
 listener $BROKER_PORT 0.0.0.0
 allow_anonymous true
+max_keepalive 300
 EOF
 trap "rm -f $CONF_FILE" EXIT
 
@@ -22,7 +23,7 @@ case "${1:-all}" in
         ;;
     sub)
         echo "Subscribing to $TOPIC..."
-        mosquitto_sub -h localhost -p $BROKER_PORT -t "$TOPIC" -v
+        mosquitto_sub -h localhost -p $BROKER_PORT -t "$TOPIC" -v -F '%I %t %p'
         ;;
     pub)
         # Test publish - useful for verifying subscriber works
@@ -50,7 +51,7 @@ case "${1:-all}" in
         echo "---"
         
         # Subscribe in foreground
-        mosquitto_sub -h localhost -p $BROKER_PORT -t "$TOPIC" -v
+        mosquitto_sub -h localhost -p $BROKER_PORT -t "$TOPIC" -v -F '%I %t %p'
         ;;
     *)
         echo "Usage: $0 [broker|sub|pub|all]"

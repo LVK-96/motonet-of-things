@@ -31,9 +31,9 @@ use esp_radio::init;
 use rubicson::RubicsonReading;
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
-use rust_mqtt::client::options::{ConnectOptions, PublicationOptions};
+use rust_mqtt::client::options::{ConnectOptions, PublicationOptions, WillOptions};
 use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
-use rust_mqtt::types::{MqttString, QoS, TopicName};
+use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
 use rust_mqtt::Bytes;
 use static_cell::StaticCell;
 
@@ -200,14 +200,27 @@ async fn mqtt_task(
 
         let mut client: Client<'_, _, _, 4, 2, 2> = Client::new(&mut buffer);
 
-        // Connect to broker
+        // Connect to broker with Last Will and Testament
+        let lwt = WillOptions {
+            will_qos: QoS::AtMostOnce,
+            will_retain: true,
+            will_topic: MqttString::try_from("sensors/rubicson/status").unwrap(),
+            will_payload: MqttBinary::try_from(b"offline" as &[u8]).unwrap(),
+            will_delay_interval: 0,
+            is_payload_utf8: true,
+            message_expiry_interval: None,
+            content_type: None,
+            response_topic: None,
+            correlation_data: None,
+        };
+        
         let connect_options = ConnectOptions {
             clean_start: true,
-            keep_alive: KeepAlive::Seconds(60),
+            keep_alive: KeepAlive::Seconds(120),
             session_expiry_interval: SessionExpiryInterval::EndOnDisconnect,
             user_name: None,
             password: None,
-            will: None,
+            will: Some(lwt),
         };
         let client_id = MqttString::try_from(MQTT_CLIENT_ID).ok();
 
@@ -233,8 +246,23 @@ async fn mqtt_task(
         }
 
         // Publish loop with periodic pings
-        const PING_INTERVAL_SECS: u64 = 45; // Ping every 45s (keepalive is 60s)
+        const PING_INTERVAL_SECS: u64 = 90; // Ping every 90s (keepalive is 120s)
         let mut last_activity = Instant::now();
+        
+        // Publish "online" status message
+        unsafe { client.buffer().reset() };
+        let status_topic = MqttString::try_from("sensors/rubicson/status").unwrap();
+        let status_topic_name = unsafe { TopicName::new_unchecked(status_topic) };
+        let online_options = PublicationOptions {
+            retain: true,
+            topic: status_topic_name,
+            qos: QoS::AtMostOnce,
+        };
+        if let Err(e) = client.publish(&online_options, Bytes::from(b"online" as &[u8])).await {
+            warn!("MQTT: Failed to publish online status: {:?}", defmt::Debug2Format(&e));
+        } else {
+            info!("MQTT: Published online status");
+        }
         
         info!("MQTT: Ready");
         
