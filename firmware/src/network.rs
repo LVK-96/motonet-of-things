@@ -7,7 +7,7 @@ use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::{Runner, StackResources};
 use embassy_time::{Duration, Timer};
-use esp_radio::wifi::{self, ClientConfig, ModeConfig, WifiDevice};
+use esp_radio::wifi::{self, ClientConfig, ModeConfig, WifiController, WifiDevice};
 use static_cell::StaticCell;
 
 use crate::secrets::{WIFI_PASSWORD, WIFI_SSID};
@@ -87,10 +87,49 @@ pub async fn setup_wifi(
         info!("Got IP: {}", defmt::Debug2Format(&config.address));
     }
 
+    // Spawn WiFi connection monitor task
+    spawner.spawn(wifi_connection_task(wifi_controller)).unwrap();
+
     stack
 }
 
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await;
+}
+
+#[embassy_executor::task]
+async fn wifi_connection_task(mut controller: WifiController<'static>) {
+    info!("WiFi connection monitor started");
+    
+    loop {
+        // Check if still connected
+        match controller.is_connected() {
+            Ok(true) => {
+                // Still connected, all good
+            }
+            Ok(false) | Err(_) => {
+                warn!("WiFi disconnected, reconnecting...");
+                
+                loop {
+                    match controller.connect_async().await {
+                        Ok(()) => {
+                            info!("WiFi reconnected!");
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "WiFi reconnection failed: {:?}, retrying in 2s...",
+                                defmt::Debug2Format(&e)
+                            );
+                            Timer::after(Duration::from_secs(2)).await;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Check connection status periodically
+        Timer::after(Duration::from_secs(5)).await;
+    }
 }
