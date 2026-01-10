@@ -1,11 +1,14 @@
 use defmt::info;
 use embassy_futures::select::{Either, select};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Sender;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Input;
-use rubicson;
+use rubicson::{self, RubicsonReading};
 
 pub struct PulseCapture<'d> {
     pin: Input<'d>,
+    sender: Sender<'static, CriticalSectionRawMutex, RubicsonReading, 4>,
 }
 
 /// Timeout for considering a transmission ended
@@ -117,8 +120,11 @@ fn dump_gaps(gaps: &[u32]) {
 }
 
 impl<'d> PulseCapture<'d> {
-    pub fn new(pin: Input<'d>) -> Self {
-        Self { pin }
+    pub fn new(
+        pin: Input<'d>,
+        sender: Sender<'static, CriticalSectionRawMutex, RubicsonReading, 4>,
+    ) -> Self {
+        Self { pin, sender }
     }
 
     pub async fn run(&mut self) -> ! {
@@ -190,8 +196,12 @@ impl<'d> PulseCapture<'d> {
 
                 // We have at least one packet worth of data try to decode
                 match rubicson::decode_gaps(&gap_buffer[..gap_count]) {
-                    Ok(reading) => {
+                    Ok((_row, reading)) => {
                         info!("Decoded: {:?}", reading);
+                        // Send to MQTT task (non-blocking try_send to avoid stalling capture)
+                        if self.sender.try_send(reading).is_err() {
+                            info!("MQTT channel full, dropping reading");
+                        }
                     }
                     Err(e) => {
                         info!("Decode failed: {:?}", e);

@@ -1,18 +1,26 @@
 #![no_std]
 #![no_main]
 
-use bt_hci::controller::ExternalController;
+extern crate alloc;
+use alloc::string::String;
+
 use cc1101::{Cc1101, RadioMode};
-use defmt::{error, info};
+use core::fmt::Write;
+use defmt::{error, info, warn};
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_net::tcp::TcpSocket;
+use embassy_net::{Ipv4Address, Runner, StackResources};
+use embassy_futures::select::{Either, select};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::{Channel, Receiver};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use esp_hal::Blocking;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{DriveMode, Input, Output};
 use esp_hal::ledc::{
     Ledc, LowSpeed, LSGlobalClkSource,
-    channel::{self, Channel, ChannelIFace},
+    channel::{self, Channel as LedcChannel, ChannelIFace},
     timer::{self, TimerIFace},
 };
 use esp_hal::peripherals::Peripherals;
@@ -20,21 +28,30 @@ use esp_hal::spi::master::Spi;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
-use esp_radio::ble::Config as BleConfig;
-use esp_radio::ble::controller::BleConnector;
 use esp_radio::init;
+use esp_radio::wifi::{self, ClientConfig, ModeConfig, WifiDevice};
+use rubicson::RubicsonReading;
+use rust_mqtt::buffer::BumpBuffer;
+use rust_mqtt::client::Client;
+use rust_mqtt::client::options::{ConnectOptions, PublicationOptions};
+use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
+use rust_mqtt::types::{MqttString, QoS, TopicName};
+use rust_mqtt::Bytes;
 use static_cell::StaticCell;
-use trouble_host::prelude::*;
 
 use esp32_rust_project::radio_433;
+use esp32_rust_project::secrets::{
+    MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID, WIFI_PASSWORD, WIFI_SSID,
+};
+
+/// Channel for passing readings from radio task to MQTT task
+static READING_CHANNEL: Channel<CriticalSectionRawMutex, RubicsonReading, 4> = Channel::new();
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     error!("PANIC: {}", defmt::Debug2Format(info));
     loop {}
 }
-
-extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -46,36 +63,6 @@ fn system_setup() -> Result<Peripherals, ()> {
     info!("System setup complete!");
 
     Ok(peripherals)
-}
-
-fn ble_setup(
-    bt: esp_hal::peripherals::BT<'static>,
-) -> Result<Host<'static, MyController, DefaultPacketPool>, ()> {
-    // Initialize radio controller
-    info!("Initializing Radio...");
-    static RADIO_CONTROLLER: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
-    let radio_controller = RADIO_CONTROLLER.init(init().unwrap());
-
-    info!("Initializing BLE controller...");
-    let connector = BleConnector::new(radio_controller, bt, BleConfig::default()).unwrap();
-    let controller = ExternalController::new(connector);
-
-    info!("Initializing BLE host...");
-    static RESOURCES: StaticCell<HostResources<DefaultPacketPool, CONNS, CHANNELS, ADV_SETS>> =
-        StaticCell::new();
-    const CONNS: usize = 0;
-    const CHANNELS: usize = 1;
-    const ADV_SETS: usize = 1;
-    let resources = RESOURCES.init(HostResources::new());
-    // Create host stack
-    static STACK: StaticCell<Stack<'static, MyController, DefaultPacketPool>> = StaticCell::new();
-    let stack = trouble_host::new(controller, resources)
-        .set_random_address(Address::random([0x01, 0x00, 0xBE, 0xBA, 0xFE, 0xCA]));
-    let stack = STACK.init(stack);
-    let host = stack.build();
-    info!("BLE Setup complete!");
-
-    Ok(host)
 }
 
 #[esp_rtos::main]
@@ -103,18 +90,76 @@ async fn main(spawner: Spawner) -> ! {
     channel0
         .configure(channel::config::Config {
             timer: lstimer0,
-            duty_pct: 5, // 5% duty = dim LED
+            duty_pct: 5,
             drive_mode: DriveMode::PushPull,
         })
         .unwrap();
 
-    // Spawn LED task with hardware PWM channel
+    // Spawn LED task
     spawner.spawn(led_pwm_task(channel0)).unwrap();
 
-    // Setup BLE - DISABLED for 433MHz debugging
-    let host = ble_setup(peripherals.BT).unwrap();
+    // Initialize Radio controller
+    info!("Initializing Radio controller...");
+    static RADIO_CONTROLLER: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
+    let radio_controller = RADIO_CONTROLLER.init(init().unwrap());
 
-    // Setup 433MHz radio (this may block if CC1101 not connected!)
+    // Setup WiFi
+    info!("Setting up WiFi...");
+    let wifi_config = wifi::Config::default();
+    let (mut wifi_controller, interfaces) =
+        wifi::new(radio_controller, peripherals.WIFI, wifi_config).unwrap();
+
+    // Create network stack using the STA interface
+    static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    let resources = STACK_RESOURCES.init(StackResources::new());
+
+    let (stack, runner) = embassy_net::new(
+        interfaces.sta,
+        embassy_net::Config::dhcpv4(Default::default()),
+        resources,
+        1234u64, // Random seed
+    );
+
+    // Store stack in static for tasks
+    static STACK: StaticCell<embassy_net::Stack<'static>> = StaticCell::new();
+    let stack = STACK.init(stack);
+
+    // Spawn network runner task
+    spawner.spawn(net_task(runner)).unwrap();
+
+    // Configure WiFi as station
+    let client_config = ClientConfig::default()
+        .with_ssid(String::from(WIFI_SSID))
+        .with_password(String::from(WIFI_PASSWORD));
+    wifi_controller.set_config(&ModeConfig::Client(client_config)).unwrap();
+
+    // Start WiFi
+    info!("Starting WiFi...");
+    wifi_controller.start_async().await.unwrap();
+
+    // Connect to WiFi
+    info!("Connecting to WiFi SSID: {}", WIFI_SSID);
+    loop {
+        match wifi_controller.connect_async().await {
+            Ok(()) => {
+                info!("WiFi connected!");
+                break;
+            }
+            Err(e) => {
+                warn!("WiFi connection failed: {:?}, retrying...", defmt::Debug2Format(&e));
+                Timer::after(Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    // Wait for DHCP
+    info!("Waiting for DHCP...");
+    stack.wait_config_up().await;
+    if let Some(config) = stack.config_v4() {
+        info!("Got IP: {}", defmt::Debug2Format(&config.address));
+    }
+
+    // Setup 433MHz radio
     info!("Setting up CC1101 radio...");
     let (cc1101, gdo0, _gdo2) = radio_433::setup_cc1101(
         peripherals.SPI2,
@@ -128,22 +173,23 @@ async fn main(spawner: Spawner) -> ! {
     info!("CC1101 setup complete!");
 
     // Spawn tasks
-    // BLE tasks disabled for debugging
-    spawner.spawn(ble_runner_task(host.runner)).unwrap();
-    spawner.spawn(ble_peripheral_task(host.peripheral)).unwrap();
     spawner.spawn(radio_433_rx_task(cc1101, gdo0)).unwrap();
+    spawner
+        .spawn(mqtt_task(stack, READING_CHANNEL.receiver()))
+        .unwrap();
 
     loop {
-        // Main task should be stuck in pending forever
         core::future::pending::<()>().await;
     }
 }
 
-type MyController = ExternalController<BleConnector<'static>, 10>;
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+    runner.run().await;
+}
 
 #[embassy_executor::task]
-async fn led_pwm_task(channel: Channel<'static, LowSpeed>) {
-    // Breathing LED: fade up and down
+async fn led_pwm_task(channel: LedcChannel<'static, LowSpeed>) {
     let brightness = 15;
     let duration_ms = 2000;
     loop {
@@ -157,60 +203,197 @@ async fn led_pwm_task(channel: Channel<'static, LowSpeed>) {
     }
 }
 
-/// Poll until fade completes, yielding to other tasks
-async fn wait_fade_done(channel: &Channel<'static, LowSpeed>, duration_ms: u16) {
+async fn wait_fade_done(channel: &LedcChannel<'static, LowSpeed>, duration_ms: u16) {
     while channel.is_duty_fade_running() {
         Timer::after(Duration::from_millis(duration_ms as u64)).await;
     }
 }
 
 #[embassy_executor::task]
-async fn ble_runner_task(mut runner: Runner<'static, MyController, DefaultPacketPool>) {
+async fn mqtt_task(
+    stack: &'static embassy_net::Stack<'static>,
+    receiver: Receiver<'static, CriticalSectionRawMutex, RubicsonReading, 4>,
+) {
+    // Backoff parameters
+    const MIN_BACKOFF_SECS: u64 = 1;
+    const MAX_BACKOFF_SECS: u64 = 60;
+    let mut backoff_secs = MIN_BACKOFF_SECS;
+
     loop {
-        if let Err(e) = runner.run().await {
-            error!("BLE Runner Error: {:?}", e);
+        // Wait for network to be up
+        stack.wait_config_up().await;
+
+        info!("MQTT: Connecting to broker...");
+
+        // Create socket buffers
+        let mut rx_buffer = [0u8; 1024];
+        let mut tx_buffer = [0u8; 1024];
+
+        let mut socket = TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(Duration::from_secs(120))); // 2 minute timeout (longer than keepalive)
+        socket.set_nagle_enabled(false); // Disable Nagle for immediate sends
+
+        let broker_addr = (
+            Ipv4Address::new(
+                MQTT_BROKER_IP[0],
+                MQTT_BROKER_IP[1],
+                MQTT_BROKER_IP[2],
+                MQTT_BROKER_IP[3],
+            ),
+            MQTT_BROKER_PORT,
+        );
+
+        if let Err(e) = socket.connect(broker_addr).await {
+            warn!(
+                "MQTT: TCP connect failed: {:?}, retry in {}s",
+                e, backoff_secs
+            );
+            Timer::after(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+            continue;
         }
-    }
-}
 
-#[embassy_executor::task]
-async fn ble_peripheral_task(mut peripheral: Peripheral<'static, MyController, DefaultPacketPool>) {
-    let mut adv_data = [0u8; 31];
-    let len = AdStructure::encode_slice(
-        &[
-            AdStructure::Flags(0x06),
-            AdStructure::CompleteLocalName(b"ESP32-Rust-BLE"),
-            AdStructure::ManufacturerSpecificData {
-                company_identifier: 0xFFFF,
-                payload: &[0x02, 0x15, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05],
-            },
-        ],
-        &mut adv_data,
-    )
-    .unwrap();
+        info!("MQTT: TCP connected");
 
-    loop {
-        info!("Starting BLE Advertising...");
-        let advertiser = peripheral
-            .advertise(
-                &AdvertisementParameters::default(),
-                Advertisement::ConnectableScannableUndirected {
-                    adv_data: &adv_data[..len],
-                    scan_data: &[],
-                },
-            )
-            .await
-            .unwrap();
+        // Create MQTT client with bump buffer (larger for MQTT v5 packets)
+        let mut mqtt_buffer = [0u8; 1024];
+        let mut buffer = BumpBuffer::new(&mut mqtt_buffer);
 
-        match advertiser.accept().await {
-            Ok(_connection) => {
-                info!("BLE Connected!");
+        let mut client: Client<'_, _, _, 4, 2, 2> = Client::new(&mut buffer);
+
+        // Connect to broker
+        let connect_options = ConnectOptions {
+            clean_start: true,
+            keep_alive: KeepAlive::Seconds(60),
+            session_expiry_interval: SessionExpiryInterval::EndOnDisconnect,
+            user_name: None,
+            password: None,
+            will: None,
+        };
+        let client_id = MqttString::try_from(MQTT_CLIENT_ID).ok();
+
+        match client.connect(socket, &connect_options, client_id).await {
+            Ok(connect_info) => {
+                info!("MQTT: Connected to broker! Session present: {}", connect_info.session_present);
+                backoff_secs = MIN_BACKOFF_SECS; // Reset backoff on successful connect
+                
+                // Reset bump buffer after connect so it can be reused for publish
+                // Safety: connect is complete, buffer contents no longer needed
+                unsafe { client.buffer().reset() };
             }
             Err(e) => {
-                info!("BLE Advertising Error: {:?}", e);
+                warn!(
+                    "MQTT: Broker connect failed: {:?}, retry in {}s",
+                    defmt::Debug2Format(&e),
+                    backoff_secs
+                );
+                Timer::after(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                continue;
             }
         }
-        Timer::after(Duration::from_secs(1)).await;
+
+        // Publish loop with periodic pings
+        const PING_INTERVAL_SECS: u64 = 45; // Ping every 45s (keepalive is 60s)
+        let mut last_activity = Instant::now();
+        
+        info!("MQTT: Ready");
+        
+        loop {
+            // Wait for either a reading or ping timeout
+            let timeout = Duration::from_secs(PING_INTERVAL_SECS);
+            
+            match select(receiver.receive(), Timer::after(timeout)).await {
+                Either::First(reading) => {
+                    // Got a reading - publish it
+                    let time_since_last = last_activity.elapsed().as_secs();
+                    info!("MQTT: Got reading after {}s idle", time_since_last);
+                    
+                    // Send a ping first if we've been idle for a while
+                    if time_since_last > 10 {
+                        info!("MQTT: Sending ping before publish (idle {}s)", time_since_last);
+                        unsafe { client.buffer().reset() };
+                        if let Err(e) = client.ping().await {
+                            warn!("MQTT: Pre-publish ping failed: {:?}, reconnecting...", defmt::Debug2Format(&e));
+                            break;
+                        }
+                        // Small delay after ping
+                        Timer::after(Duration::from_millis(100)).await;
+                    }
+                    
+                    last_activity = Instant::now();
+                    
+                    // Reset buffer before publish
+                    unsafe { client.buffer().reset() };
+                    
+                    // Format topic: sensors/rubicson/{id}/temperature
+                    let mut topic: heapless::String<64> = heapless::String::new();
+                    if write!(topic, "sensors/rubicson/{}/temperature", reading.id).is_err() {
+                        continue;
+                    }
+
+                    // Format payload: id={id},ch={channel},temp={temp},batt={ok/low}
+                    let mut payload: heapless::String<64> = heapless::String::new();
+                    let batt = if reading.battery_ok { "ok" } else { "low" };
+                    if write!(
+                        payload,
+                        "id={},ch={},temp={:.1},batt={}",
+                        reading.id, reading.channel, reading.temperature_c, batt
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+
+                    info!(
+                        "MQTT: Publishing to {} : {}",
+                        topic.as_str(),
+                        payload.as_str()
+                    );
+
+                    // Create TopicName from the topic string
+                    let topic_name = match MqttString::from_slice(topic.as_str()) {
+                        Ok(s) => unsafe { TopicName::new_unchecked(s) },
+                        Err(_) => continue,
+                    };
+
+                    let pub_options = PublicationOptions {
+                        retain: false,
+                        topic: topic_name,
+                        qos: QoS::AtMostOnce,
+                    };
+
+                    if let Err(e) = client
+                        .publish(&pub_options, Bytes::from(payload.as_bytes()))
+                        .await
+                    {
+                        warn!(
+                            "MQTT: Publish failed: {:?}, reconnecting...",
+                            defmt::Debug2Format(&e)
+                        );
+                        break; // Break inner loop to reconnect
+                    }
+                    
+                    info!("MQTT: Publish successful!");
+                }
+                Either::Second(_) => {
+                    // Ping timeout - send keepalive
+                    info!("MQTT: Sending periodic ping");
+                    unsafe { client.buffer().reset() };
+                    
+                    if let Err(e) = client.ping().await {
+                        warn!("MQTT: Ping failed: {:?}, reconnecting...", defmt::Debug2Format(&e));
+                        break;
+                    }
+                    info!("MQTT: Ping sent successfully");
+                    last_activity = Instant::now();
+                }
+            }
+        }
+
+        // Backoff before reconnecting
+        Timer::after(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
     }
 }
 
@@ -221,7 +404,6 @@ type Cc1101Radio = Cc1101<ExclusiveDevice<Spi<'static, Blocking>, Output<'static
 async fn radio_433_rx_task(mut cc1101: Cc1101Radio, gdo0: Input<'static>) {
     info!("CC1101 RX task started");
 
-    // Check hardware info to verify SPI communication
     match cc1101.get_hw_info() {
         Ok((part, version)) => {
             info!(
@@ -231,11 +413,10 @@ async fn radio_433_rx_task(mut cc1101: Cc1101Radio, gdo0: Input<'static>) {
         }
         Err(e) => {
             error!("CC1101 not responding: {:?}", defmt::Debug2Format(&e));
-            return; // Exit task if chip not detected
+            return;
         }
     }
 
-    // Put radio in receive mode
     cc1101.set_radio_mode(RadioMode::Receive).unwrap();
 
     let gdo0_initial = gdo0.is_high();
@@ -244,13 +425,10 @@ async fn radio_433_rx_task(mut cc1101: Cc1101Radio, gdo0: Input<'static>) {
         gdo0_initial
     );
 
-    // If GDO0 is HIGH at startup, it *might* be clock output, but we configured it
-    // to SERIAL_DATA_OUT. If there's noise, it might be high.
     if gdo0_initial {
         info!("Note: GDO0 is high at startup. This is normal if there is RF noise.");
     }
 
-    // Measure RSSI at startup
     info!("Measuring RSSI on 433.92 MHz for 3s...");
     let mut min_rssi: i16 = 0;
     let mut max_rssi: i16 = -128;
@@ -269,9 +447,7 @@ async fn radio_433_rx_task(mut cc1101: Cc1101Radio, gdo0: Input<'static>) {
 
     info!("Starting pulse capture...");
 
-    // Start pulse capture and decoding
-    // This is an infinite loop that captures edges and decodes packets
     use esp32_rust_project::pulse_capture::PulseCapture;
-    let mut capture = PulseCapture::new(gdo0);
+    let mut capture = PulseCapture::new(gdo0, READING_CHANNEL.sender());
     capture.run().await;
 }
