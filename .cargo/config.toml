@@ -1,11 +1,12 @@
 [build]
 target = "xtensa-esp32-none-elf"
+rustflags = ["-C", "link-arg=-nostartfiles"]
 
 [target.xtensa-esp32-none-elf]
-runner = "espflash flash --monitor"
+runner = "espflash flash --monitor --log-format defmt"
 
 [unstable]
 build-std = ["core", "alloc"]
 
 [env]
-ESP_LOG = "INFO"
+DEFMT_LOG = "info"
