@@ -4,13 +4,118 @@ use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Input;
 use rubicson;
 
-#[derive(Debug)]
-pub enum CaptureError {
-    Timeout,
-}
-
 pub struct PulseCapture<'d> {
     pin: Input<'d>,
+}
+
+/// Timeout for considering a transmission ended (no edge for this long)
+const TRANSMISSION_END_TIMEOUT_US: u64 = 4500;
+
+/// Maximum gap to record (anything longer is likely noise or end of transmission)
+const MAX_GAP_US: u32 = TRANSMISSION_END_TIMEOUT_US as u32;
+
+/// Dump gap buffer to logs for offline analysis
+fn dump_gaps(gaps: &[u32]) {
+    info!("=== GAP DUMP START ({} gaps) ===", gaps.len());
+    // Print 10 gaps per line for readability
+    for chunk_start in (0..gaps.len()).step_by(10) {
+        let chunk_end = (chunk_start + 10).min(gaps.len());
+        match chunk_end - chunk_start {
+            10 => info!(
+                "{}: {} {} {} {} {} {} {} {} {} {}",
+                chunk_start,
+                gaps[chunk_start],
+                gaps[chunk_start + 1],
+                gaps[chunk_start + 2],
+                gaps[chunk_start + 3],
+                gaps[chunk_start + 4],
+                gaps[chunk_start + 5],
+                gaps[chunk_start + 6],
+                gaps[chunk_start + 7],
+                gaps[chunk_start + 8],
+                gaps[chunk_start + 9]
+            ),
+            9 => info!(
+                "{}: {} {} {} {} {} {} {} {} {}",
+                chunk_start,
+                gaps[chunk_start],
+                gaps[chunk_start + 1],
+                gaps[chunk_start + 2],
+                gaps[chunk_start + 3],
+                gaps[chunk_start + 4],
+                gaps[chunk_start + 5],
+                gaps[chunk_start + 6],
+                gaps[chunk_start + 7],
+                gaps[chunk_start + 8]
+            ),
+            8 => info!(
+                "{}: {} {} {} {} {} {} {} {}",
+                chunk_start,
+                gaps[chunk_start],
+                gaps[chunk_start + 1],
+                gaps[chunk_start + 2],
+                gaps[chunk_start + 3],
+                gaps[chunk_start + 4],
+                gaps[chunk_start + 5],
+                gaps[chunk_start + 6],
+                gaps[chunk_start + 7]
+            ),
+            7 => info!(
+                "{}: {} {} {} {} {} {} {}",
+                chunk_start,
+                gaps[chunk_start],
+                gaps[chunk_start + 1],
+                gaps[chunk_start + 2],
+                gaps[chunk_start + 3],
+                gaps[chunk_start + 4],
+                gaps[chunk_start + 5],
+                gaps[chunk_start + 6]
+            ),
+            6 => info!(
+                "{}: {} {} {} {} {} {}",
+                chunk_start,
+                gaps[chunk_start],
+                gaps[chunk_start + 1],
+                gaps[chunk_start + 2],
+                gaps[chunk_start + 3],
+                gaps[chunk_start + 4],
+                gaps[chunk_start + 5]
+            ),
+            5 => info!(
+                "{}: {} {} {} {} {}",
+                chunk_start,
+                gaps[chunk_start],
+                gaps[chunk_start + 1],
+                gaps[chunk_start + 2],
+                gaps[chunk_start + 3],
+                gaps[chunk_start + 4]
+            ),
+            4 => info!(
+                "{}: {} {} {} {}",
+                chunk_start,
+                gaps[chunk_start],
+                gaps[chunk_start + 1],
+                gaps[chunk_start + 2],
+                gaps[chunk_start + 3]
+            ),
+            3 => info!(
+                "{}: {} {} {}",
+                chunk_start,
+                gaps[chunk_start],
+                gaps[chunk_start + 1],
+                gaps[chunk_start + 2]
+            ),
+            2 => info!(
+                "{}: {} {}",
+                chunk_start,
+                gaps[chunk_start],
+                gaps[chunk_start + 1]
+            ),
+            1 => info!("{}: {}", chunk_start, gaps[chunk_start]),
+            _ => {}
+        }
+    }
+    info!("=== GAP DUMP END ===");
 }
 
 impl<'d> PulseCapture<'d> {
@@ -19,97 +124,88 @@ impl<'d> PulseCapture<'d> {
     }
 
     pub async fn run(&mut self) -> ! {
-        // The rubicson sensor sends 12 * 36 bit packets (432 bits)
-        // We collect the gap durations in a buffer of 512 u32s
-        let mut pulse_buffer = [0u32; 512];
-        let mut pulse_count = 0;
+        // Buffer for gap durations
+        // 12 repetitions × 36 bits = 432 gaps, plus some margin
+        let mut gap_buffer = [0u32; 512];
 
-        // Stats for periodic reporting
-        let mut edge_count = 0u32;
-        let mut timeout_count = 0u32;
-        let mut last_stats_report = Instant::now();
+        info!("PulseCapture: Ready, waiting for signal...");
 
-        info!("PulseCapture: GDO0 initial state = {}", self.pin.is_high());
-        info!("PulseCapture: entering main loop...");
-
-        let mut last_edge = Instant::now();
-
-        // Main loop: capture gaps between pulses with timeouts
         loop {
-            let is_high = self.pin.is_high();
+            // === PHASE 1: SLEEP until signal arrives ===
+            // Wait for first edge (low->high transition = start of pulse)
+            self.pin.wait_for_rising_edge().await;
+            let capture_start = Instant::now();
+            
+            info!("Signal detected, capturing...");
 
-            // Wait for any edge change with 1 second timeout
-            let edge_result = if is_high {
-                select(
-                    self.pin.wait_for_low(),
-                    Timer::after(Duration::from_secs(1)),
+            // === PHASE 2: CAPTURE all gaps until silence ===
+            let mut gap_count = 0;
+
+            loop {
+                // Wait for falling edge (end of pulse, start of gap)
+                let fall_result = select(
+                    self.pin.wait_for_falling_edge(),
+                    Timer::after(Duration::from_micros(TRANSMISSION_END_TIMEOUT_US)),
                 )
-                .await
+                .await;
+
+                if matches!(fall_result, Either::Second(())) {
+                    // Timeout waiting for falling edge - transmission ended
+                    break;
+                }
+
+                let gap_start = Instant::now();
+
+                // Wait for rising edge (end of gap, start of next pulse)
+                let rise_result = select(
+                    self.pin.wait_for_rising_edge(),
+                    Timer::after(Duration::from_micros(TRANSMISSION_END_TIMEOUT_US)),
+                )
+                .await;
+
+                if matches!(rise_result, Either::Second(())) {
+                    // Timeout waiting for rising edge - transmission ended
+                    break;
+                }
+
+                let gap_end = Instant::now();
+                let gap_us = gap_end.duration_since(gap_start).as_micros() as u32;
+
+                // Store gap if buffer not full
+                if gap_count < gap_buffer.len() {
+                    gap_buffer[gap_count] = gap_us;
+                    gap_count += 1;
+                }
+            }
+
+            // === PHASE 3: DECODE captured data ===
+            let capture_duration = Instant::now().duration_since(capture_start);
+            info!(
+                "Capture complete: {} gaps in {} ms",
+                gap_count,
+                capture_duration.as_millis()
+            );
+
+            if gap_count >= 36 {
+                // Uncomment to dump gaps for offline analysis
+                // dump_gaps(&gap_buffer[..gap_count]);
+
+                // We have at least one packet worth of data try to decode
+                match rubicson::decode_gaps(&gap_buffer[..gap_count]) {
+                    Ok(reading) => {
+                        info!("Decoded: {:?}", reading);
+                    }
+                    Err(e) => {
+                        info!("Decode failed: {:?}", e);
+                    }
+                }
             } else {
-                select(
-                    self.pin.wait_for_high(),
-                    Timer::after(Duration::from_secs(1)),
-                )
-                .await
-            };
-
-            let now = Instant::now();
-
-            match edge_result {
-                Either::First(()) => {
-                    // Got an edge
-                    let duration = now.duration_since(last_edge);
-                    let micros = duration.as_micros() as u32;
-                    edge_count += 1;
-
-                    // If we were low and now high, this is a rising edge (end of gap)
-                    if !is_high {
-                        // Store gap in buffer
-                        if pulse_count < pulse_buffer.len() {
-                            pulse_buffer[pulse_count] = micros;
-                            pulse_count += 1;
-                        } else {
-                            // Overflow -> decode and reset
-                            match rubicson::decode_gaps(&pulse_buffer) {
-                                Ok(r) => {
-                                    info!("Decoded: {:?}", r);
-                                }
-                                Err(_e) => {
-                                    // Decode errors are common, don't spam
-                                }
-                            }
-                            pulse_count = 0;
-                        }
-
-                        // Log gaps in Rubicson timing range (800-4500 µs)
-                        if micros >= 800 && micros <= 4500 {
-                            info!("Gap: {} us", micros);
-                        }
-                    }
-                    last_edge = now;
-                }
-                Either::Second(()) => {
-                    // Timeout - no edge activity
-                    timeout_count += 1;
-                    // Reset buffer on silence (signal lost)
-                    if pulse_count > 0 {
-                        pulse_count = 0;
-                    }
-                }
+                info!("Not enough gaps for decoding (need 36, got {})", gap_count);
             }
 
-            // Periodic stats report every 5 seconds
-            let elapsed = now.duration_since(last_stats_report);
-            if elapsed > Duration::from_secs(5) {
-                let current_state = if self.pin.is_high() { "HIGH" } else { "LOW" };
-                info!(
-                    "Stats (5s): edges={}, timeouts={}, state={}, buf={}",
-                    edge_count, timeout_count, current_state, pulse_count
-                );
-                edge_count = 0;
-                timeout_count = 0;
-                last_stats_report = now;
-            }
+            // Delay 1s before listening again (debounce)
+            Timer::after(Duration::from_millis(1000)).await;
+            info!("Ready, waiting for signal...");
         }
     }
 }

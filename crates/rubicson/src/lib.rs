@@ -63,21 +63,6 @@ fn add_bit(buf: &mut [u8], index: usize, val: u8) {
     }
 }
 
-fn try_row_decode(bit_buffer: &[u8]) -> Result<RubicsonReading, DecodeError> {
-    let result = decode_rubicson(bit_buffer);
-    match result {
-        Ok(ref result) => {
-            #[cfg(feature = "defmt")]
-            defmt::info!("Decoded at end: {:?}", result);
-        },
-        Err(ref decode_error) => {
-            #[cfg(feature = "defmt")]
-            defmt::info!("Decode error at end: {:?}", decode_error);
-        }
-    }
-    result
-}
-
 pub fn decode_gaps(pulses: &[u32]) -> Result<(usize, RubicsonReading), [u8; 5 * 12]> {
     let mut bit_buffer = [0u8; 5 * 12]; // Support up to 12 packets of 5 bytes
     let mut bit_index = 0;
@@ -100,7 +85,7 @@ pub fn decode_gaps(pulses: &[u32]) -> Result<(usize, RubicsonReading), [u8; 5 * 
                     BreakResetIgnore::Break => {
                         // We have a complete packet, try to decode
                         let row_slice = &bit_buffer[row_start_byte..(row_start_byte + 5)];
-                        if let Ok(reading) = try_row_decode(row_slice) {
+                        if let Ok(reading) = decode_rubicson(row_slice) {
                             // Successfully decoded a packet
                             return Ok((bit_buffer_row, reading));
                         }
@@ -122,7 +107,7 @@ pub fn decode_gaps(pulses: &[u32]) -> Result<(usize, RubicsonReading), [u8; 5 * 
     if bit_index == 35 {
         let row_start_byte = bit_buffer_row * 5;
         let row_slice = &bit_buffer[row_start_byte..(row_start_byte + 5)];
-        if let Ok(reading) = try_row_decode(row_slice) {
+        if let Ok(reading) = decode_rubicson(row_slice) {
             // Successfully decoded a packet
             return Ok((bit_buffer_row, reading));
         }
