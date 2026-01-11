@@ -51,6 +51,11 @@ rust-mqtt = { version = "0.4", default-features = false, features = ["defmt", "v
 heapless = "0.8"
 xtensa-lx = "0.13.0"
 
+# Display
+mini-oled = "0.1"
+embedded-graphics = "0.8"
+profont = "0.7"
+
 [profile.dev]
 opt-level = "s"
 

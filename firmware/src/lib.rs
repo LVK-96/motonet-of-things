@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod display;
 pub mod network;
 pub mod pulse_capture;
 pub mod radio_433;

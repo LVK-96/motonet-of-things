@@ -11,12 +11,13 @@ use embassy_futures::select::{Either, select};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::Ipv4Address;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Channel, Receiver};
+use embassy_sync::watch::Watch;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use esp_hal::Blocking;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{DriveMode, Input, Output};
+use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::ledc::{
     Ledc, LowSpeed, LSGlobalClkSource,
     channel::{self, Channel as LedcChannel, ChannelIFace},
@@ -37,12 +38,13 @@ use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
 use rust_mqtt::Bytes;
 use static_cell::StaticCell;
 
+use esp32_rust_project::display::{Display, Sh1106Display};
 use esp32_rust_project::network;
 use esp32_rust_project::radio_433;
 use esp32_rust_project::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
 
-/// Channel for passing readings from radio task to MQTT task
-static READING_CHANNEL: Channel<CriticalSectionRawMutex, RubicsonReading, 4> = Channel::new();
+/// Watch for sharing readings with multiple consumers (MQTT + display)
+static READING_WATCH: Watch<CriticalSectionRawMutex, RubicsonReading, 2> = Watch::new();
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -116,10 +118,27 @@ async fn main(spawner: Spawner) -> ! {
     );
     info!("CC1101 setup complete!");
 
+    // Setup I2C for display (GPIO21 = SDA, GPIO22 = SCL)
+    info!("Setting up I2C display...");
+    let i2c = I2c::new(
+        peripherals.I2C0,
+        I2cConfig::default().with_frequency(Rate::from_khz(400)),
+    )
+    .unwrap()
+    .with_sda(peripherals.GPIO21)
+    .with_scl(peripherals.GPIO22);
+
+    let mut display = Sh1106Display::new(i2c).expect("Failed to init display");
+    display.show_status("Starting...").ok();
+    info!("Display initialized!");
+
     // Spawn tasks
     spawner.spawn(radio_433_rx_task(cc1101, gdo0)).unwrap();
     spawner
-        .spawn(mqtt_task(stack, READING_CHANNEL.receiver()))
+        .spawn(mqtt_task(stack, READING_WATCH.receiver().unwrap()))
+        .unwrap();
+    spawner
+        .spawn(display_task(display, READING_WATCH.receiver().unwrap()))
         .unwrap();
 
     loop {
@@ -151,7 +170,7 @@ async fn wait_fade_done(channel: &LedcChannel<'static, LowSpeed>, duration_ms: u
 #[embassy_executor::task]
 async fn mqtt_task(
     stack: &'static embassy_net::Stack<'static>,
-    receiver: Receiver<'static, CriticalSectionRawMutex, RubicsonReading, 4>,
+    mut receiver: embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, RubicsonReading, 2>,
 ) {
     // Backoff parameters
     const MIN_BACKOFF_SECS: u64 = 1;
@@ -270,7 +289,7 @@ async fn mqtt_task(
             // Wait for either a reading or ping timeout
             let timeout = Duration::from_secs(PING_INTERVAL_SECS);
             
-            match select(receiver.receive(), Timer::after(timeout)).await {
+            match select(receiver.changed(), Timer::after(timeout)).await {
                 Either::First(reading) => {
                     // Got a reading - publish it
                     let time_since_last = last_activity.elapsed().as_secs();
@@ -364,6 +383,39 @@ async fn mqtt_task(
     }
 }
 
+/// Display task - updates OLED when new readings arrive
+#[embassy_executor::task]
+async fn display_task(
+    mut display: Sh1106Display<I2c<'static, Blocking>>,
+    mut receiver: embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, RubicsonReading, 2>,
+) {
+    info!("Display task started");
+
+    // Show waiting message
+    if display.show_status("Waiting...").is_err() {
+        error!("Display: Failed to show status");
+    }
+
+    loop {
+        // Wait for new reading
+        let reading = receiver.changed().await;
+
+        info!(
+            "Display: Showing temp {}C from sensor {}",
+            reading.temperature_c, reading.id
+        );
+
+        if let Err(e) = display.show_temperature(
+            reading.temperature_c,
+            reading.id,
+            reading.channel,
+            reading.battery_ok,
+        ) {
+            error!("Display: Failed to update: {:?}", e);
+        }
+    }
+}
+
 /// Type alias for the CC1101 radio driver
 type Cc1101Radio = Cc1101<ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, NoDelay>>;
 
@@ -415,6 +467,6 @@ async fn radio_433_rx_task(mut cc1101: Cc1101Radio, gdo0: Input<'static>) {
     info!("Starting pulse capture...");
 
     use esp32_rust_project::pulse_capture::PulseCapture;
-    let mut capture = PulseCapture::new(gdo0, READING_CHANNEL.sender());
+    let mut capture = PulseCapture::new(gdo0, READING_WATCH.sender());
     capture.run().await;
 }
