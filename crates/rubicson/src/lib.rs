@@ -25,27 +25,31 @@ pub enum BreakResetIgnore {
     Ignore,
 }
 
+const BITS_IN_PACKET: usize = 36;
+const BYTES_IN_PACKET: usize = (BITS_IN_PACKET + 7) / 8; // Roundup division
+const MAX_PACKETS: usize = 12; // Support up to 12 packets in burst
+
 fn decode_gap(gap: u32) -> Result<u8, BreakResetIgnore> {
     // Short pulse ~1000us, the sensor sends a short pulse ~500us right before the break
-    let zero_lower_limit = 750;
-    let zero_upper_limit = 1500;
+    const ZERO_LOWER_LIMIT: u32 = 750;
+    const ZERO_UPPER_LIMIT: u32 = 1500;
 
     // Long pulse ~2000us
-    let one_upper_limit = 2500;
+    const ONE_UPPER_LIMIT: u32 = 2500;
 
     // Breaks between packets ~4000us
-    let break_upper_limit = 4500;
+    const BREAK_UPPER_LIMIT: u32 = 4500;
 
     // Decode the received pulse
-    if gap > break_upper_limit {
+    if gap > BREAK_UPPER_LIMIT {
         Err(BreakResetIgnore::Reset)
-    } else if gap > one_upper_limit {
+    } else if gap > ONE_UPPER_LIMIT {
         // End of packet
         Err(BreakResetIgnore::Break)
-    } else if gap > zero_upper_limit {
+    } else if gap > ZERO_UPPER_LIMIT {
         // Long gap -> 1
         Ok(1)
-    } else if gap > zero_lower_limit {
+    } else if gap > ZERO_LOWER_LIMIT {
         // Short gap -> 0
         Ok(0)
     } else {
@@ -63,16 +67,20 @@ fn add_bit(buf: &mut [u8], index: usize, val: u8) {
     }
 }
 
-pub fn decode_gaps(pulses: &[u32]) -> Result<(usize, RubicsonReading), [u8; 5 * 12]> {
-    let mut bit_buffer = [0u8; 5 * 12]; // Support up to 12 packets of 5 bytes
+pub fn decode_gaps(pulses: &[u32]) -> Result<(usize, RubicsonReading), [u8; BYTES_IN_PACKET * MAX_PACKETS]> {
+    let mut bit_buffer = [0u8; BYTES_IN_PACKET * MAX_PACKETS]; // Support up to 12 packets of 5 bytes
     let mut bit_index = 0;
     let mut bit_buffer_row = 0;
     for &gap in pulses.iter() {
+        // Check if we've exceeded the buffer capacity
+        if bit_buffer_row >= MAX_PACKETS {
+            return Err(bit_buffer);
+        }
         // Calculate start byte for the current row (packet)
-        let row_start_byte = bit_buffer_row * 5;
+        let row_start_byte = bit_buffer_row * BYTES_IN_PACKET;
         match decode_gap(gap) {
             Ok(bit) => {
-                let row_slice = &mut bit_buffer[row_start_byte..(row_start_byte + 5)];
+                let row_slice = &mut bit_buffer[row_start_byte..(row_start_byte + BYTES_IN_PACKET)];
                 add_bit(row_slice, bit_index, bit);
                 bit_index += 1;
             }
@@ -84,7 +92,7 @@ pub fn decode_gaps(pulses: &[u32]) -> Result<(usize, RubicsonReading), [u8; 5 * 
                     }
                     BreakResetIgnore::Break => {
                         // We have a complete packet, try to decode
-                        let row_slice = &bit_buffer[row_start_byte..(row_start_byte + 5)];
+                        let row_slice = &bit_buffer[row_start_byte..(row_start_byte + BYTES_IN_PACKET)];
                         if let Ok(reading) = decode_rubicson(row_slice) {
                             // Successfully decoded a packet
                             return Ok((bit_buffer_row, reading));
@@ -104,9 +112,9 @@ pub fn decode_gaps(pulses: &[u32]) -> Result<(usize, RubicsonReading), [u8; 5 * 
     }
 
     // Final attempt to decode the last packet if we have 36 bits
-    if bit_index == 35 {
-        let row_start_byte = bit_buffer_row * 5;
-        let row_slice = &bit_buffer[row_start_byte..(row_start_byte + 5)];
+    if bit_index == BITS_IN_PACKET - 1 {
+        let row_start_byte = bit_buffer_row * BYTES_IN_PACKET;
+        let row_slice = &bit_buffer[row_start_byte..(row_start_byte + BYTES_IN_PACKET)];
         if let Ok(reading) = decode_rubicson(row_slice) {
             // Successfully decoded a packet
             return Ok((bit_buffer_row, reading));
