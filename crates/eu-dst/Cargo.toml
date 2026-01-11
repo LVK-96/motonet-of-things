@@ -1,0 +1,7 @@
+[package]
+name = "eu-dst"
+version = "0.1.0"
+edition = "2024"
+description = "EU Daylight Saving Time calculation for no_std environments"
+
+[dependencies]

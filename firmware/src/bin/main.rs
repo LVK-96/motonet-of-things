@@ -42,6 +42,7 @@ use esp32_rust_project::display::{Display, Sh1106Display};
 use esp32_rust_project::network;
 use esp32_rust_project::radio_433;
 use esp32_rust_project::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
+use esp32_rust_project::time_sync::{self, TIME_WATCH};
 
 /// Watch for sharing readings with multiple consumers (MQTT + display)
 static READING_WATCH: Watch<CriticalSectionRawMutex, RubicsonReading, 2> = Watch::new();
@@ -140,6 +141,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(display_task(display, READING_WATCH.receiver().unwrap()))
         .unwrap();
+    spawner.spawn(time_sync_task(stack)).unwrap();
 
     loop {
         core::future::pending::<()>().await;
@@ -383,6 +385,12 @@ async fn mqtt_task(
     }
 }
 
+/// Time sync task - syncs time from NTP server
+#[embassy_executor::task]
+async fn time_sync_task(stack: &'static embassy_net::Stack<'static>) {
+    time_sync::time_sync_loop(stack).await;
+}
+
 /// Display task - updates OLED when new readings arrive
 #[embassy_executor::task]
 async fn display_task(
@@ -390,6 +398,9 @@ async fn display_task(
     mut receiver: embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, RubicsonReading, 2>,
 ) {
     info!("Display task started");
+
+    // Get a receiver for time updates
+    let mut time_receiver = TIME_WATCH.receiver().unwrap();
 
     // Show waiting message
     if display.show_status("Waiting...").is_err() {
@@ -399,6 +410,15 @@ async fn display_task(
     loop {
         // Wait for new reading
         let reading = receiver.changed().await;
+
+        // Get current timestamp if available
+        let mut time_str: heapless::String<16> = heapless::String::new();
+        let timestamp = if let Some(Some(time_ref)) = time_receiver.try_get() {
+            time_ref.format_time(&mut time_str);
+            Some(time_str.as_str())
+        } else {
+            None
+        };
 
         info!(
             "Display: Showing temp {}C from sensor {}",
@@ -410,6 +430,7 @@ async fn display_task(
             reading.id,
             reading.channel,
             reading.battery_ok,
+            timestamp,
         ) {
             error!("Display: Failed to update: {:?}", e);
         }

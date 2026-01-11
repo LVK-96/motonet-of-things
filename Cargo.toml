@@ -1,6 +1,13 @@
 [workspace]
-members = ["firmware", "crates/rubicson"]
+members = ["firmware", "crates/rubicson", "crates/eu-dst"]
 resolver = "2"
 
 [profile.dev]
 opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+incremental = false
+lto = 'fat'
+opt-level = 's'
+overflow-checks = false

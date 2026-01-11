@@ -26,13 +26,14 @@ pub trait Display {
     /// Clear the display buffer
     fn clear(&mut self) -> Result<(), DisplayError>;
 
-    /// Show temperature, sensor ID, channel, and battery status
+    /// Show temperature, sensor ID, channel, battery status, and optional timestamp
     fn show_temperature(
         &mut self,
         temperature_c: f32,
         sensor_id: u8,
         channel: u8,
         battery_ok: bool,
+        timestamp: Option<&str>,
     ) -> Result<(), DisplayError>;
 
     /// Flush the display buffer to the screen
@@ -83,6 +84,7 @@ where
         sensor_id: u8,
         channel: u8,
         battery_ok: bool,
+        timestamp: Option<&str>,
     ) -> Result<(), DisplayError> {
         self.clear()?;
 
@@ -100,19 +102,31 @@ where
         .draw(self.driver.get_mut_canvas())
         .map_err(|_| DisplayError::DrawFailed)?;
 
-        // Sensor info at top
-        let mut info_str: String<32> = String::new();
-        write!(info_str, "Sensor {} Ch{}", sensor_id, channel).ok();
-
+        // Sensor info at top left, timestamp at top right
         let style_small = MonoTextStyle::new(&PROFONT_10_POINT, BinaryColor::On);
+
+        let mut info_str: String<32> = String::new();
+        write!(info_str, "S{} Ch{}", sensor_id, channel).ok();
         Text::with_alignment(
             info_str.as_str(),
-            Point::new(64, 10),
+            Point::new(4, 10),
             style_small,
-            Alignment::Center,
+            Alignment::Left,
         )
         .draw(self.driver.get_mut_canvas())
         .map_err(|_| DisplayError::DrawFailed)?;
+
+        // Timestamp at top right (if available)
+        if let Some(ts) = timestamp {
+            Text::with_alignment(
+                ts,
+                Point::new(124, 10),
+                style_small,
+                Alignment::Right,
+            )
+            .draw(self.driver.get_mut_canvas())
+            .map_err(|_| DisplayError::DrawFailed)?;
+        }
 
         // Battery status at bottom
         let battery_str = if battery_ok { "BAT OK" } else { "BAT LOW!" };

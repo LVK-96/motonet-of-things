@@ -244,8 +244,8 @@ mod tests {
             }
         }
 
-        // Add packet separator (triggers decode)
-        gaps.push(5000);
+        // Add packet separator (Break range 2500-4500µs triggers decode)
+        gaps.push(4000);
 
         gaps
     }
