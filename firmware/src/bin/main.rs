@@ -3,7 +3,6 @@
 
 extern crate alloc;
 
-use cc1101::{Cc1101, RadioMode};
 use core::fmt::Write;
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
@@ -13,10 +12,9 @@ use embassy_net::Ipv4Address;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::watch::Watch;
 use embassy_time::{Duration, Instant, Timer};
-use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use esp_hal::Blocking;
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{DriveMode, Input, Output};
+use esp_hal::gpio::DriveMode;
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::ledc::{
     Ledc, LowSpeed, LSGlobalClkSource,
@@ -24,7 +22,6 @@ use esp_hal::ledc::{
     timer::{self, TimerIFace},
 };
 use esp_hal::peripherals::Peripherals;
-use esp_hal::spi::master::Spi;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
@@ -40,7 +37,7 @@ use static_cell::StaticCell;
 
 use esp32_rust_project::display::{Display, Sh1106Display};
 use esp32_rust_project::network;
-use esp32_rust_project::radio_433;
+use esp32_rust_project::radio_433::{Cc1101Radio, Radio433};
 use esp32_rust_project::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
 use esp32_rust_project::time_sync::{self, TIME_WATCH};
 
@@ -108,7 +105,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // Setup 433MHz radio
     info!("Setting up CC1101 radio...");
-    let (cc1101, gdo0, _gdo2) = radio_433::setup_cc1101(
+    let radio = Cc1101Radio::new(
         peripherals.SPI2,
         peripherals.GPIO18,
         peripherals.GPIO23,
@@ -116,7 +113,8 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO5,
         peripherals.GPIO4,
         peripherals.GPIO15,
-    );
+    )
+    .expect("Failed to initialize CC1101");
     info!("CC1101 setup complete!");
 
     // Setup I2C for display (GPIO21 = SDA, GPIO22 = SCL)
@@ -134,7 +132,7 @@ async fn main(spawner: Spawner) -> ! {
     info!("Display initialized!");
 
     // Spawn tasks
-    spawner.spawn(radio_433_rx_task(cc1101, gdo0)).unwrap();
+    spawner.spawn(radio_433_rx_task(radio)).unwrap();
     spawner
         .spawn(mqtt_task(stack, READING_WATCH.receiver().unwrap()))
         .unwrap();
@@ -437,43 +435,49 @@ async fn display_task(
     }
 }
 
-/// Type alias for the CC1101 radio driver
-type Cc1101Radio = Cc1101<ExclusiveDevice<Spi<'static, Blocking>, Output<'static>, NoDelay>>;
-
 #[embassy_executor::task]
-async fn radio_433_rx_task(mut cc1101: Cc1101Radio, gdo0: Input<'static>) {
-    info!("CC1101 RX task started");
+async fn radio_433_rx_task(mut radio: Cc1101Radio) {
+    info!("Radio 433 RX task started");
 
-    match cc1101.get_hw_info() {
+    match radio.get_hw_info().await {
         Ok((part, version)) => {
             info!(
-                "CC1101 detected: Part=0x{:02X}, Version=0x{:02X}",
+                "Radio detected: Part=0x{:02X}, Version=0x{:02X}",
                 part, version
             );
         }
         Err(e) => {
-            error!("CC1101 not responding: {:?}", defmt::Debug2Format(&e));
+            error!("Radio not responding: {:?}", e);
             return;
         }
     }
 
-    cc1101.set_radio_mode(RadioMode::Receive).unwrap();
+    if let Err(e) = radio.set_receive_mode().await {
+        error!("Failed to set receive mode: {:?}", e);
+        return;
+    }
 
-    let gdo0_initial = gdo0.is_high();
-    info!(
-        "CC1101 in receive mode, GDO0 initial state: {}",
-        gdo0_initial
-    );
+    // Take ownership of the data pin for pulse capture
+    let data_pin = match radio.take_data_pin() {
+        Some(pin) => pin,
+        None => {
+            error!("Data pin already taken");
+            return;
+        }
+    };
 
-    if gdo0_initial {
-        info!("Note: GDO0 is high at startup. This is normal if there is RF noise.");
+    let data_pin_initial = data_pin.is_high();
+    info!("Radio in receive mode, data pin initial state: {}", data_pin_initial);
+
+    if data_pin_initial {
+        info!("Note: Data pin is high at startup. This is normal if there is RF noise.");
     }
 
     info!("Measuring RSSI on 433.92 MHz for 3s...");
     let mut min_rssi: i16 = 0;
     let mut max_rssi: i16 = -128;
     for _ in 0..60 {
-        if let Ok(rssi) = cc1101.get_rssi_dbm() {
+        if let Ok(rssi) = radio.get_rssi_dbm().await {
             if rssi < min_rssi {
                 min_rssi = rssi;
             }
@@ -488,6 +492,6 @@ async fn radio_433_rx_task(mut cc1101: Cc1101Radio, gdo0: Input<'static>) {
     info!("Starting pulse capture...");
 
     use esp32_rust_project::pulse_capture::PulseCapture;
-    let mut capture = PulseCapture::new(gdo0, READING_WATCH.sender());
+    let mut capture = PulseCapture::new(data_pin, READING_WATCH.sender());
     capture.run().await;
 }
