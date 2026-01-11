@@ -117,13 +117,10 @@ async fn sync_time_once(stack: &Stack<'static>) -> Option<TimeReference> {
 
     match sntpc::get_time(server_addr, &socket_wrapper, context).await {
         Ok(result) => {
-            // NTP epoch is 1900-01-01, Unix epoch is 1970-01-01
-            // Difference is 70 years = 2208988800 seconds
-            const NTP_TO_UNIX_OFFSET: u32 = 2_208_988_800;
-            let ntp_secs = result.sec();
-            let unix_secs = (ntp_secs as u64).saturating_sub(NTP_TO_UNIX_OFFSET as u64);
+            // sntpc returns Unix timestamp directly (seconds since 1970-01-01)
+            let unix_secs = result.seconds as u64;
 
-            defmt::info!("NTP: Synced! Unix timestamp: {}", unix_secs);
+            defmt::info!("NTP: Synced! unix_secs={}", unix_secs);
 
             Some(TimeReference {
                 unix_secs,
