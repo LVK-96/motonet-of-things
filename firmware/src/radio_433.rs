@@ -111,7 +111,7 @@ impl Cc1101Radio {
             .set_data_rate(4800)
             .map_err(|_| RadioError::ConfigError)?;
         driver
-            .set_chanbw(325_000)
+            .set_channel_bandwidth(325_000)
             .map_err(|_| RadioError::ConfigError)?;
         driver
             .set_magn_target(TargetAmplitude::Db42)
@@ -121,9 +121,7 @@ impl Cc1101Radio {
             .map_err(|_| RadioError::ConfigError)?;
 
         // Enable async serial mode for raw OOK data output
-        driver
-            .set_raw_mode()
-            .map_err(|_| RadioError::ConfigError)?;
+        driver.set_raw_mode().map_err(|_| RadioError::ConfigError)?;
 
         // Configure GPIO pins
         let gdo0 = Input::new(gdo0, InputConfig::default().with_pull(Pull::Down));

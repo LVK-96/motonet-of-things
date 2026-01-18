@@ -1,5 +1,4 @@
 /// Display abstraction layer for UI rendering.
-
 use core::fmt::Write;
 use embedded_graphics::{
     mono_font::MonoTextStyle,
@@ -9,7 +8,7 @@ use embedded_graphics::{
 };
 use heapless::String;
 use mini_oled::prelude::*;
-use profont::{PROFONT_24_POINT, PROFONT_14_POINT, PROFONT_10_POINT};
+use profont::{PROFONT_10_POINT, PROFONT_14_POINT, PROFONT_24_POINT};
 
 /// Error type for display operations
 #[derive(Debug, defmt::Format)]
@@ -41,6 +40,9 @@ pub trait Display {
 
     /// Show a status message on the display
     fn show_status(&mut self, message: &str) -> Result<(), DisplayError>;
+
+    /// Show a dummy screen for testing UI events
+    fn show_dummy_screen(&mut self) -> Result<(), DisplayError>;
 }
 
 /// SH1106 OLED display driver implementation using mini-oled.
@@ -56,10 +58,10 @@ where
     pub fn new(i2c: I2C) -> Result<Self, DisplayError> {
         // The display module listens @0x3C
         let i2c_interface = I2cInterface::new(i2c, 0x3C);
-        
+
         // Initialize display driver
         let mut driver = Sh1106::new(i2c_interface);
-        
+
         driver.init().map_err(|_| DisplayError::InitFailed)?;
         driver.get_mut_canvas().clear(BinaryColor::Off).ok();
         driver.flush().map_err(|_| DisplayError::I2c)?;
@@ -118,14 +120,9 @@ where
 
         // Timestamp at top right (if available)
         if let Some(ts) = timestamp {
-            Text::with_alignment(
-                ts,
-                Point::new(124, 10),
-                style_small,
-                Alignment::Right,
-            )
-            .draw(self.driver.get_mut_canvas())
-            .map_err(|_| DisplayError::DrawFailed)?;
+            Text::with_alignment(ts, Point::new(124, 10), style_small, Alignment::Right)
+                .draw(self.driver.get_mut_canvas())
+                .map_err(|_| DisplayError::DrawFailed)?;
         }
 
         // Battery status at bottom
@@ -152,6 +149,17 @@ where
 
         let style = MonoTextStyle::new(&PROFONT_14_POINT, BinaryColor::On);
         Text::with_alignment(message, Point::new(64, 32), style, Alignment::Center)
+            .draw(self.driver.get_mut_canvas())
+            .map_err(|_| DisplayError::DrawFailed)?;
+
+        self.flush()
+    }
+
+    fn show_dummy_screen(&mut self) -> Result<(), DisplayError> {
+        self.clear()?;
+
+        let style = MonoTextStyle::new(&PROFONT_14_POINT, BinaryColor::On);
+        Text::with_alignment("Dummy Screen", Point::new(64, 32), style, Alignment::Center)
             .draw(self.driver.get_mut_canvas())
             .map_err(|_| DisplayError::DrawFailed)?;
 

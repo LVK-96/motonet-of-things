@@ -13,13 +13,13 @@ use static_cell::StaticCell;
 use crate::secrets::{WIFI_PASSWORD, WIFI_SSID};
 
 /// Initialize WiFi and return the network stack
-/// 
+///
 /// This function:
 /// 1. Creates the WiFi controller and interfaces
 /// 2. Sets up the network stack with DHCP
 /// 3. Spawns the network runner task
 /// 4. Connects to WiFi and waits for DHCP
-/// 
+///
 /// Returns a static reference to the network stack for use in other tasks.
 pub async fn setup_wifi(
     radio_controller: &'static mut esp_radio::Controller<'static>,
@@ -27,7 +27,7 @@ pub async fn setup_wifi(
     spawner: &Spawner,
 ) -> &'static embassy_net::Stack<'static> {
     info!("Setting up WiFi...");
-    
+
     let wifi_config = wifi::Config::default();
     let (mut wifi_controller, interfaces) =
         wifi::new(radio_controller, wifi_peripheral, wifi_config).unwrap();
@@ -88,7 +88,9 @@ pub async fn setup_wifi(
     }
 
     // Spawn WiFi connection monitor task
-    spawner.spawn(wifi_connection_task(wifi_controller)).unwrap();
+    spawner
+        .spawn(wifi_connection_task(wifi_controller))
+        .unwrap();
 
     stack
 }
@@ -101,7 +103,7 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
 #[embassy_executor::task]
 async fn wifi_connection_task(mut controller: WifiController<'static>) {
     info!("WiFi connection monitor started");
-    
+
     loop {
         // Check if still connected
         match controller.is_connected() {
@@ -110,7 +112,7 @@ async fn wifi_connection_task(mut controller: WifiController<'static>) {
             }
             Ok(false) | Err(_) => {
                 warn!("WiFi disconnected, reconnecting...");
-                
+
                 loop {
                     match controller.connect_async().await {
                         Ok(()) => {
@@ -128,7 +130,7 @@ async fn wifi_connection_task(mut controller: WifiController<'static>) {
                 }
             }
         }
-        
+
         // Check connection status periodically
         Timer::after(Duration::from_secs(5)).await;
     }

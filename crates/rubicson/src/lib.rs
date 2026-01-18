@@ -3,7 +3,7 @@
 #[cfg(feature = "defmt")]
 use defmt::Format;
 
-#[derive(Format, Clone, Debug)]
+#[derive(Format, Clone, Copy, Debug)]
 pub struct RubicsonReading {
     pub id: u8,
     pub channel: u8,
@@ -67,7 +67,9 @@ fn add_bit(buf: &mut [u8], index: usize, val: u8) {
     }
 }
 
-pub fn decode_gaps(pulses: &[u32]) -> Result<(usize, RubicsonReading), [u8; BYTES_IN_PACKET * MAX_PACKETS]> {
+pub fn decode_gaps(
+    pulses: &[u32],
+) -> Result<(usize, RubicsonReading), [u8; BYTES_IN_PACKET * MAX_PACKETS]> {
     let mut bit_buffer = [0u8; BYTES_IN_PACKET * MAX_PACKETS]; // Support up to 12 packets of 5 bytes
     let mut bit_index = 0;
     let mut bit_buffer_row = 0;
@@ -84,15 +86,16 @@ pub fn decode_gaps(pulses: &[u32]) -> Result<(usize, RubicsonReading), [u8; BYTE
                 add_bit(row_slice, bit_index, bit);
                 bit_index += 1;
             }
-            Err (e) => {
+            Err(e) => {
                 match e {
                     BreakResetIgnore::Ignore => {
-                        // Ignore the short gap before the break 
+                        // Ignore the short gap before the break
                         continue;
                     }
                     BreakResetIgnore::Break => {
                         // We have a complete packet, try to decode
-                        let row_slice = &bit_buffer[row_start_byte..(row_start_byte + BYTES_IN_PACKET)];
+                        let row_slice =
+                            &bit_buffer[row_start_byte..(row_start_byte + BYTES_IN_PACKET)];
                         if let Ok(reading) = decode_rubicson(row_slice) {
                             // Successfully decoded a packet
                             return Ok((bit_buffer_row, reading));
@@ -195,10 +198,10 @@ fn calculate_crc8(data: &[u8], poly: u8, mut crc: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::AsRef;
     use std::fs::File;
     use std::io::{BufRead, BufReader};
     use std::path::Path;
-    use std::convert::AsRef;
 
     // ==================== TEST UTILITIES ====================
 
@@ -257,7 +260,7 @@ mod tests {
 
         gaps
     }
-    
+
     fn captured_data_to_gaps<P: AsRef<Path>>(gaps_file: P) -> Vec<u32> {
         let f = File::open(gaps_file.as_ref()).expect("Failed to open gaps file");
         let reader = BufReader::new(f);
@@ -275,13 +278,14 @@ mod tests {
     }
 
     // ==================== TESTS ====================
-    
+
     #[test]
     fn test_decode_captured_data() {
         let gaps = captured_data_to_gaps("test_data/sample_gaps.txt");
-        
+
         // Decode the whole captured data, like in the real use case
-        let (valid_packet_idx, result) = decode_gaps(&gaps).expect("Failed to decode captured gaps");
+        let (valid_packet_idx, result) =
+            decode_gaps(&gaps).expect("Failed to decode captured gaps");
         // Expected: ID=230, Channel=1, BatteryOK=true, Temp=-9.4C
         assert_eq!(result.id, 230);
         assert_eq!(result.channel, 1);
@@ -290,12 +294,15 @@ mod tests {
         assert_eq!(result.crc_ok, true);
         // The second packet is the first valid one
         assert_eq!(valid_packet_idx, 1);
-        
+
         // The first packet seems to be corrupt in the captured data
         let result = decode_gaps(&gaps[0..36]);
         assert!(result.is_err(), "Expected first packet to be invalid");
         let bits = result.unwrap_err();
-        assert!(matches!(decode_rubicson(&bits), Err(DecodeError::CrcMismatch)));
+        assert!(matches!(
+            decode_rubicson(&bits),
+            Err(DecodeError::CrcMismatch)
+        ));
 
         // Packets 3 and onwards should be valid as well
         for packet_nro in 2..12 {
@@ -312,7 +319,7 @@ mod tests {
                 }
                 Err(bits) => {
                     // Try to decode
-                    let try_to_decode= decode_rubicson(&bits);
+                    let try_to_decode = decode_rubicson(&bits);
                     match try_to_decode {
                         Ok(reading) => {
                             assert_eq!(reading.id, 230);
@@ -324,13 +331,10 @@ mod tests {
                         Err(e) => {
                             panic!("Packet {} failed to decode: {:?}", packet_nro + 1, e);
                         }
-                    }       
+                    }
                 }
-            }           
+            }
         }
-
-            
-
     }
 
     #[test]

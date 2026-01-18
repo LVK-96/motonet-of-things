@@ -1,5 +1,6 @@
 //! UI input abstraction for rotary encoder (TRA/TRB)
 
+use core::future::Future;
 use embassy_time::{Duration, Timer};
 use esp_hal::gpio::Input;
 
@@ -10,45 +11,46 @@ pub enum UiEvent {
 }
 
 pub trait UiInput {
-    fn next_event(&mut self) -> impl Future<Output = UiEvent>;
+    fn next_event(&mut self, cw: UiEvent, ccw: UiEvent) -> impl Future<Output = UiEvent>;
 }
 
 pub struct EC11RotaryEncoderInput {
     pin_a: Input<'static>,
     pin_b: Input<'static>,
-    last_state: u8,
 }
 
 impl EC11RotaryEncoderInput {
     pub fn new(pin_a: Input<'static>, pin_b: Input<'static>) -> Self {
-        let a = pin_a.is_high();
-        let b = pin_b.is_high();
-        let last_state = (a as u8) << 1 | (b as u8);
-        Self { pin_a, pin_b, last_state }
+        Self { pin_a, pin_b }
     }
 }
 
 impl UiInput for EC11RotaryEncoderInput {
-    async fn next_event(&mut self) -> UiEvent {
+    async fn next_event(&mut self, cw: UiEvent, ccw: UiEvent) -> UiEvent {
         loop {
+            // Wait for rising edge on A
             self.pin_a.wait_for_rising_edge().await;
-            let a: u8 = 1; // Rising edge -> a is 1
-            let b = self.pin_b.is_high() as u8;
-            let state = (a << 1) | b;
-            if state != self.last_state {
-                let last_a = (self.last_state >> 1) & 0b1;
-                let a_rose = last_a == 0 && a == 1;
-                self.last_state = state;
 
-                // 00->01->11->10->00 is one direction, reverse is the other
-                // We'll just check for A rising/falling for simplicity
-                if a_rose && b == 0 {
-                    return UiEvent::NextScreen;
-                } else if a_rose && b == 1 {
-                    return UiEvent::PrevScreen;
-                }
-            }
+            // Sample B immediately at the moment of the edge (before bounce settles)
+            let b_at_edge = self.pin_b.is_low();
+
+            // Debounce - wait for contacts to settle
             Timer::after(Duration::from_millis(2)).await;
+
+            // Confirm A is still high (valid edge, not noise)
+            if !self.pin_a.is_high() {
+                continue;
+            }
+
+            // Direction based on B state at the moment of A's rising edge:
+            // B Low at A rising -> CW
+            // B High at A rising -> CCW
+            let event = if b_at_edge { cw } else { ccw };
+
+            // Cooldown to prevent double-firing on same detent
+            Timer::after(Duration::from_millis(200)).await;
+
+            return event;
         }
     }
 }

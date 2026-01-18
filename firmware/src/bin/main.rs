@@ -7,17 +7,17 @@ use core::fmt::Write;
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
-use embassy_net::tcp::TcpSocket;
 use embassy_net::Ipv4Address;
+use embassy_net::tcp::TcpSocket;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::watch::Watch;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::Blocking;
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::DriveMode;
+use esp_hal::gpio::{DriveMode, Input, InputConfig, Pull};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::ledc::{
-    Ledc, LowSpeed, LSGlobalClkSource,
+    LSGlobalClkSource, Ledc, LowSpeed,
     channel::{self, Channel as LedcChannel, ChannelIFace},
     timer::{self, TimerIFace},
 };
@@ -27,12 +27,12 @@ use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
 use esp_radio::init;
 use rubicson::RubicsonReading;
+use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
 use rust_mqtt::client::options::{ConnectOptions, PublicationOptions, WillOptions};
 use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
 use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
-use rust_mqtt::Bytes;
 use static_cell::StaticCell;
 
 use esp32_rust_project::display::{Display, Sh1106Display};
@@ -40,6 +40,7 @@ use esp32_rust_project::network;
 use esp32_rust_project::radio_433::{Cc1101Radio, Radio433};
 use esp32_rust_project::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
 use esp32_rust_project::time_sync::{self, TIME_WATCH};
+use esp32_rust_project::ui_input::{EC11RotaryEncoderInput, UiEvent, UiInput};
 
 /// Watch for sharing readings with multiple consumers (MQTT + display)
 static READING_WATCH: Watch<CriticalSectionRawMutex, RubicsonReading, 2> = Watch::new();
@@ -131,13 +132,29 @@ async fn main(spawner: Spawner) -> ! {
     display.show_status("Starting...").ok();
     info!("Display initialized!");
 
+    // Setup Rotary Encoder (GPIO 14, 13)
+    info!("Setting up Rotary Encoder...");
+    let rotary_a = Input::new(
+        peripherals.GPIO14,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    let rotary_b = Input::new(
+        peripherals.GPIO13,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    let ui_input = EC11RotaryEncoderInput::new(rotary_a, rotary_b);
+
     // Spawn tasks
     spawner.spawn(radio_433_rx_task(radio)).unwrap();
     spawner
         .spawn(mqtt_task(stack, READING_WATCH.receiver().unwrap()))
         .unwrap();
     spawner
-        .spawn(display_task(display, READING_WATCH.receiver().unwrap()))
+        .spawn(display_task(
+            display,
+            READING_WATCH.receiver().unwrap(),
+            ui_input,
+        ))
         .unwrap();
     spawner.spawn(time_sync_task(stack)).unwrap();
 
@@ -170,7 +187,12 @@ async fn wait_fade_done(channel: &LedcChannel<'static, LowSpeed>, duration_ms: u
 #[embassy_executor::task]
 async fn mqtt_task(
     stack: &'static embassy_net::Stack<'static>,
-    mut receiver: embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, RubicsonReading, 2>,
+    mut receiver: embassy_sync::watch::Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        RubicsonReading,
+        2,
+    >,
 ) {
     // Backoff parameters
     const MIN_BACKOFF_SECS: u64 = 1;
@@ -232,7 +254,7 @@ async fn mqtt_task(
             response_topic: None,
             correlation_data: None,
         };
-        
+
         let connect_options = ConnectOptions {
             clean_start: true,
             keep_alive: KeepAlive::Seconds(120),
@@ -245,9 +267,12 @@ async fn mqtt_task(
 
         match client.connect(socket, &connect_options, client_id).await {
             Ok(connect_info) => {
-                info!("MQTT: Connected to broker! Session present: {}", connect_info.session_present);
+                info!(
+                    "MQTT: Connected to broker! Session present: {}",
+                    connect_info.session_present
+                );
                 backoff_secs = MIN_BACKOFF_SECS; // Reset backoff on successful connect
-                
+
                 // Reset bump buffer after connect so it can be reused for publish
                 // Safety: connect is complete, buffer contents no longer needed
                 unsafe { client.buffer().reset() };
@@ -267,7 +292,7 @@ async fn mqtt_task(
         // Publish loop with periodic pings
         const PING_INTERVAL_SECS: u64 = 90; // Ping every 90s (keepalive is 120s)
         let mut last_activity = Instant::now();
-        
+
         // Publish "online" status message
         unsafe { client.buffer().reset() };
         let status_topic = MqttString::try_from("sensors/rubicson/status").unwrap();
@@ -277,41 +302,53 @@ async fn mqtt_task(
             topic: status_topic_name,
             qos: QoS::AtMostOnce,
         };
-        if let Err(e) = client.publish(&online_options, Bytes::from(b"online" as &[u8])).await {
-            warn!("MQTT: Failed to publish online status: {:?}", defmt::Debug2Format(&e));
+        if let Err(e) = client
+            .publish(&online_options, Bytes::from(b"online" as &[u8]))
+            .await
+        {
+            warn!(
+                "MQTT: Failed to publish online status: {:?}",
+                defmt::Debug2Format(&e)
+            );
         } else {
             info!("MQTT: Published online status");
         }
-        
+
         info!("MQTT: Ready");
-        
+
         loop {
             // Wait for either a reading or ping timeout
             let timeout = Duration::from_secs(PING_INTERVAL_SECS);
-            
+
             match select(receiver.changed(), Timer::after(timeout)).await {
                 Either::First(reading) => {
                     // Got a reading - publish it
                     let time_since_last = last_activity.elapsed().as_secs();
                     info!("MQTT: Got reading after {}s idle", time_since_last);
-                    
+
                     // Send a ping first if we've been idle for a while
                     if time_since_last > 10 {
-                        info!("MQTT: Sending ping before publish (idle {}s)", time_since_last);
+                        info!(
+                            "MQTT: Sending ping before publish (idle {}s)",
+                            time_since_last
+                        );
                         unsafe { client.buffer().reset() };
                         if let Err(e) = client.ping().await {
-                            warn!("MQTT: Pre-publish ping failed: {:?}, reconnecting...", defmt::Debug2Format(&e));
+                            warn!(
+                                "MQTT: Pre-publish ping failed: {:?}, reconnecting...",
+                                defmt::Debug2Format(&e)
+                            );
                             break;
                         }
                         // Small delay after ping
                         Timer::after(Duration::from_millis(100)).await;
                     }
-                    
+
                     last_activity = Instant::now();
-                    
+
                     // Reset buffer before publish
                     unsafe { client.buffer().reset() };
-                    
+
                     // Format topic: sensors/rubicson/{id}/temperature
                     let mut topic: heapless::String<64> = heapless::String::new();
                     if write!(topic, "sensors/rubicson/{}/temperature", reading.id).is_err() {
@@ -359,16 +396,19 @@ async fn mqtt_task(
                         );
                         break; // Break inner loop to reconnect
                     }
-                    
+
                     info!("MQTT: Publish successful!");
                 }
                 Either::Second(_) => {
                     // Ping timeout - send keepalive
                     info!("MQTT: Sending periodic ping");
                     unsafe { client.buffer().reset() };
-                    
+
                     if let Err(e) = client.ping().await {
-                        warn!("MQTT: Ping failed: {:?}, reconnecting...", defmt::Debug2Format(&e));
+                        warn!(
+                            "MQTT: Ping failed: {:?}, reconnecting...",
+                            defmt::Debug2Format(&e)
+                        );
                         break;
                     }
                     info!("MQTT: Ping sent successfully");
@@ -393,7 +433,13 @@ async fn time_sync_task(stack: &'static embassy_net::Stack<'static>) {
 #[embassy_executor::task]
 async fn display_task(
     mut display: Sh1106Display<I2c<'static, Blocking>>,
-    mut receiver: embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, RubicsonReading, 2>,
+    mut receiver: embassy_sync::watch::Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        RubicsonReading,
+        2,
+    >,
+    mut ui: EC11RotaryEncoderInput,
 ) {
     info!("Display task started");
 
@@ -405,32 +451,73 @@ async fn display_task(
         error!("Display: Failed to show status");
     }
 
+    enum DisplayState {
+        Main,
+        Dummy,
+    }
+    let mut state = DisplayState::Main;
+    let mut last_reading: Option<RubicsonReading> = None;
+
     loop {
-        // Wait for new reading
-        let reading = receiver.changed().await;
+        let mut update_needed = false;
 
-        // Get current timestamp if available
-        let mut time_str: heapless::String<16> = heapless::String::new();
-        let timestamp = if let Some(Some(time_ref)) = time_receiver.try_get() {
-            time_ref.format_time(&mut time_str);
-            Some(time_str.as_str())
-        } else {
-            None
-        };
+        match select(
+            receiver.changed(),
+            ui.next_event(UiEvent::NextScreen, UiEvent::PrevScreen),
+        )
+        .await
+        {
+            Either::First(reading) => {
+                last_reading = Some(reading);
+                if let DisplayState::Main = state {
+                    update_needed = true;
+                }
+            }
+            Either::Second(_event) => {
+                // Toggle state on any event
+                state = match state {
+                    DisplayState::Main => DisplayState::Dummy,
+                    DisplayState::Dummy => DisplayState::Main,
+                };
+                update_needed = true;
+            }
+        }
 
-        info!(
-            "Display: Showing temp {}C from sensor {}",
-            reading.temperature_c, reading.id
-        );
+        if update_needed {
+            match state {
+                DisplayState::Main => {
+                    if let Some(reading) = &last_reading {
+                        // Get current timestamp if available
+                        let mut time_str: heapless::String<16> = heapless::String::new();
+                        let timestamp = if let Some(Some(time_ref)) = time_receiver.try_get() {
+                            time_ref.format_time(&mut time_str);
+                            Some(time_str.as_str())
+                        } else {
+                            None
+                        };
 
-        if let Err(e) = display.show_temperature(
-            reading.temperature_c,
-            reading.id,
-            reading.channel,
-            reading.battery_ok,
-            timestamp,
-        ) {
-            error!("Display: Failed to update: {:?}", e);
+                        info!(
+                            "Display: Showing temp {}C from sensor {}",
+                            reading.temperature_c, reading.id
+                        );
+
+                        if let Err(e) = display.show_temperature(
+                            reading.temperature_c,
+                            reading.id,
+                            reading.channel,
+                            reading.battery_ok,
+                            timestamp,
+                        ) {
+                            error!("Display: Failed to update: {:?}", e);
+                        }
+                    } else {
+                        display.show_status("Waiting...").ok();
+                    }
+                }
+                DisplayState::Dummy => {
+                    display.show_dummy_screen().ok();
+                }
+            }
         }
     }
 }
@@ -467,7 +554,10 @@ async fn radio_433_rx_task(mut radio: Cc1101Radio) {
     };
 
     let data_pin_initial = data_pin.is_high();
-    info!("Radio in receive mode, data pin initial state: {}", data_pin_initial);
+    info!(
+        "Radio in receive mode, data pin initial state: {}",
+        data_pin_initial
+    );
 
     if data_pin_initial {
         info!("Note: Data pin is high at startup. This is normal if there is RF noise.");

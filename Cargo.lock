@@ -112,7 +112,7 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 [[package]]
 name = "cc1101"
 version = "0.1.3"
-source = "git+https://github.com/dsvensson/cc1101.git?branch=main#1c349add4193bc1678ae502ed4dca77fe8ec4fdc"
+source = "git+https://github.com/dsvensson/cc1101.git?branch=main#11a24c471188493d6815d3ea35f27979ef405f55"
 dependencies = [
  "embedded-hal 1.0.0",
 ]
@@ -752,7 +752,7 @@ dependencies = [
  "paste",
  "portable-atomic",
  "rand_core 0.6.4",
- "rand_core 0.9.3",
+ "rand_core 0.9.5",
  "riscv",
  "sha1",
  "sha2",
@@ -960,7 +960,6 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
- "esp-sync",
  "eu-dst",
  "heapless 0.8.0",
  "mini-oled",
@@ -1452,9 +1451,9 @@ checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 
 [[package]]
 name = "rand_core"
-version = "0.9.3"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
+checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 
 [[package]]
 name = "riscv"

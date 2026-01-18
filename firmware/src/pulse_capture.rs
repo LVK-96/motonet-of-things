@@ -139,7 +139,7 @@ impl<'d> PulseCapture<'d> {
             // Wait for first edge (low->high transition = start of pulse)
             self.pin.wait_for_rising_edge().await;
             let capture_start = Instant::now();
-            
+
             info!("Signal detected, capturing...");
 
             // === PHASE 2: CAPTURE all gaps until silence ===
