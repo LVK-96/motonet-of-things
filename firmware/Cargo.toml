@@ -47,7 +47,6 @@ static_cell = "2.1.1"
 embedded-hal = "1.0"
 embedded-hal-bus = { version = "0.3.0", features = ["defmt-03"] }
 embedded-io-async = "0.6"
-esp-sync = { version = "0.1.1", features = ["esp32"] }
 cc1101 = { git = "https://github.com/dsvensson/cc1101.git", branch = "main" }
 rust-mqtt = { version = "0.4", default-features = false, features = ["defmt", "v5", "bump"] }
 heapless = "0.8"
@@ -61,3 +60,6 @@ profont = "0.7"
 # Time sync
 sntpc = { version = "0.8", default-features = false }
 sntpc-net-embassy = "0.8"
+
+[lints]
+workspace = true

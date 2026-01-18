@@ -40,7 +40,7 @@ impl TimeReference {
         use core::fmt::Write;
         let secs = self.now_unix_secs();
         let (hours, minutes, seconds) = TIMEZONE.to_local_hms(secs);
-        write!(buf, "{:02}:{:02}:{:02}", hours, minutes, seconds).ok();
+        let _ = write!(buf, "{:02}:{:02}:{:02}", hours, minutes, seconds);
     }
 }
 

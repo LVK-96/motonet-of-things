@@ -5,3 +5,6 @@ edition = "2024"
 description = "EU Daylight Saving Time calculation for no_std environments"
 
 [dependencies]
+
+[lints]
+workspace = true

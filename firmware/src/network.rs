@@ -30,7 +30,8 @@ pub async fn setup_wifi(
 
     let wifi_config = wifi::Config::default();
     let (mut wifi_controller, interfaces) =
-        wifi::new(radio_controller, wifi_peripheral, wifi_config).unwrap();
+        wifi::new(radio_controller, wifi_peripheral, wifi_config)
+            .expect("Failed to create WiFi controller");
 
     // Create network stack using the STA interface
     static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
@@ -48,19 +49,26 @@ pub async fn setup_wifi(
     let stack = STACK.init(stack);
 
     // Spawn network runner task
-    spawner.spawn(net_task(runner)).unwrap();
+    spawner
+        .spawn(net_task(runner))
+        .expect("Failed to spawn network task");
 
     // Configure WiFi as station
     let client_config = ClientConfig::default()
         .with_ssid(String::from(WIFI_SSID))
         .with_password(String::from(WIFI_PASSWORD));
-    wifi_controller
+    if wifi_controller
         .set_config(&ModeConfig::Client(client_config))
-        .unwrap();
+        .is_err()
+    {
+        defmt::error!("Failed to set WiFi config");
+    }
 
     // Start WiFi
     info!("Starting WiFi...");
-    wifi_controller.start_async().await.unwrap();
+    if wifi_controller.start_async().await.is_err() {
+        defmt::error!("Failed to start WiFi");
+    }
 
     // Connect to WiFi
     info!("Connecting to WiFi SSID: {}", WIFI_SSID);
@@ -88,9 +96,12 @@ pub async fn setup_wifi(
     }
 
     // Spawn WiFi connection monitor task
-    spawner
+    if spawner
         .spawn(wifi_connection_task(wifi_controller))
-        .unwrap();
+        .is_err()
+    {
+        defmt::error!("Failed to spawn WiFi connection task");
+    }
 
     stack
 }

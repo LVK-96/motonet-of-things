@@ -22,7 +22,11 @@ pub enum DisplayError {
 }
 
 pub trait Display {
-    /// Clear the display buffer
+    /// Clear the display
+    ///
+    /// # Errors
+    ///
+    /// Returns `DisplayError` if the operation fails buffer
     fn clear(&mut self) -> Result<(), DisplayError>;
 
     /// Show temperature, sensor ID, channel, battery status, and optional timestamp
@@ -36,12 +40,28 @@ pub trait Display {
     ) -> Result<(), DisplayError>;
 
     /// Flush the display buffer to the screen
+    ///
+    /// # Errors
+    ///
+    /// Returns `DisplayError` if the operation fails
     fn flush(&mut self) -> Result<(), DisplayError>;
 
-    /// Show a status message on the display
+    /// Show a status message
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - The message to display
+    ///
+    /// # Errors
+    ///
+    /// Returns `DisplayError` if the operation fails on the display
     fn show_status(&mut self, message: &str) -> Result<(), DisplayError>;
 
-    /// Show a dummy screen for testing UI events
+    /// Show a dummy screen for testing
+    ///
+    /// # Errors
+    ///
+    /// Returns `DisplayError` if the operation fails UI events
     fn show_dummy_screen(&mut self) -> Result<(), DisplayError>;
 }
 
@@ -63,7 +83,7 @@ where
         let mut driver = Sh1106::new(i2c_interface);
 
         driver.init().map_err(|_| DisplayError::InitFailed)?;
-        driver.get_mut_canvas().clear(BinaryColor::Off).ok();
+        let _ = driver.get_mut_canvas().clear(BinaryColor::Off);
         driver.flush().map_err(|_| DisplayError::I2c)?;
 
         Ok(Self { driver })
@@ -76,7 +96,7 @@ where
     E: core::fmt::Debug,
 {
     fn clear(&mut self) -> Result<(), DisplayError> {
-        self.driver.get_mut_canvas().clear(BinaryColor::Off).ok();
+        let _ = self.driver.get_mut_canvas().clear(BinaryColor::Off);
         Ok(())
     }
 
@@ -92,7 +112,7 @@ where
 
         // Large temperature display in center
         let mut temp_str: String<16> = String::new();
-        write!(temp_str, "{:.1}C", temperature_c).ok();
+        let _ = write!(temp_str, "{:.1}C", temperature_c);
 
         let style_large = MonoTextStyle::new(&PROFONT_24_POINT, BinaryColor::On);
         Text::with_alignment(
@@ -108,7 +128,7 @@ where
         let style_small = MonoTextStyle::new(&PROFONT_10_POINT, BinaryColor::On);
 
         let mut info_str: String<32> = String::new();
-        write!(info_str, "S{} Ch{}", sensor_id, channel).ok();
+        let _ = write!(info_str, "S{} Ch{}", sensor_id, channel);
         Text::with_alignment(
             info_str.as_str(),
             Point::new(4, 10),

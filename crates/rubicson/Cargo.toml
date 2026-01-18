@@ -8,3 +8,6 @@ defmt = { version = "1.0.1", optional = true }
 
 [features]
 default = ["defmt"]
+
+[lints]
+workspace = true

@@ -64,8 +64,12 @@ fn linker_be_nice() {
         std::process::exit(0);
     }
 
-    println!(
-        "cargo:rustc-link-arg=-Wl,--error-handling-script={}",
-        std::env::current_exe().unwrap().display()
-    );
+    if let Ok(current_exe) = std::env::current_exe() {
+        println!(
+            "cargo:rustc-link-arg=-Wl,--error-handling-script={}",
+            current_exe.display()
+        );
+    } else {
+        eprintln!("Warning: Could not get current executable path for error handling script");
+    }
 }

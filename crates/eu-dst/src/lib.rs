@@ -1,4 +1,4 @@
-//! EU Daylight Saving Time calculation for no_std environments.
+//! EU Daylight Saving Time calculation for `no_std` environments.
 //!
 //! This crate provides timezone offset calculation with automatic DST handling
 //! for European Union timezone rules. DST transitions follow EU regulations:
@@ -44,6 +44,7 @@ impl Timezone {
     ///
     /// * `base_offset_secs` - The base timezone offset from UTC in seconds.
     ///   For example, EET (Eastern European Time) is UTC+2, so pass `2 * 3600`.
+    #[must_use]
     pub const fn new(base_offset_secs: i64) -> Self {
         Self { base_offset_secs }
     }
@@ -52,6 +53,7 @@ impl Timezone {
     /// accounting for DST.
     ///
     /// Returns `base_offset + 3600` during summer time, `base_offset` during winter.
+    #[must_use]
     pub fn offset_secs(&self, unix_secs: u64) -> i64 {
         if is_dst_active(unix_secs) {
             self.base_offset_secs + DST_OFFSET_SECS
@@ -61,14 +63,16 @@ impl Timezone {
     }
 
     /// Check if DST is currently active for the given Unix timestamp.
+    #[must_use]
     pub fn is_dst(&self, unix_secs: u64) -> bool {
         is_dst_active(unix_secs)
     }
 
     /// Convert a Unix timestamp to local time, returning (hours, minutes, seconds).
+    #[must_use]
     pub fn to_local_hms(&self, unix_secs: u64) -> (u32, u32, u32) {
         let offset = self.offset_secs(unix_secs);
-        let local_secs = (unix_secs as i64 + offset) as u64;
+        let local_secs = unix_secs.wrapping_add(offset as u64);
         let secs_today = local_secs % 86400;
         let hours = (secs_today / 3600) as u32;
         let minutes = ((secs_today % 3600) / 60) as u32;
@@ -124,7 +128,7 @@ fn is_dst_active(unix_secs: u64) -> bool {
 /// Convert Unix timestamp to (year, month, day, hour).
 fn unix_to_date(unix_secs: u64) -> (u32, u32, u32, u32) {
     // Days since Unix epoch (1970-01-01)
-    let days = (unix_secs / 86400) as u32;
+    let days = u32::try_from(unix_secs / 86400).unwrap_or(u32::MAX);
     let hour = ((unix_secs % 86400) / 3600) as u32;
 
     // Calculate year
@@ -164,14 +168,14 @@ fn unix_to_date(unix_secs: u64) -> (u32, u32, u32, u32) {
 
 /// Check if a year is a leap year.
 fn is_leap_year(year: u32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 /// Find the last Sunday of a given month (returns day of month).
+#[allow(clippy::many_single_char_names)]
 fn last_sunday_of_month(year: u32, month: u32) -> u32 {
     let days_in_month = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
         2 => {
             if is_leap_year(year) {
                 29
@@ -183,6 +187,7 @@ fn last_sunday_of_month(year: u32, month: u32) -> u32 {
     };
 
     // Calculate day of week for last day of month using Zeller's formula
+    // https://en.wikipedia.org/wiki/Zeller%27s_congruence
     // 0 = Saturday, 1 = Sunday, ..., 6 = Friday
     let day = days_in_month;
     let m = if month < 3 { month + 12 } else { month };
@@ -190,7 +195,7 @@ fn last_sunday_of_month(year: u32, month: u32) -> u32 {
     let k = y % 100;
     let j = y / 100;
 
-    let h = (day + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
+    let h = (day + ((13 * (m + 1)) / 5) + k + (k / 4) + (j / 4) + (5 * j)) % 7;
     // Convert to: 0 = Sunday, 1 = Monday, ..., 6 = Saturday
     let dow = ((h + 6) % 7) as u32;
 

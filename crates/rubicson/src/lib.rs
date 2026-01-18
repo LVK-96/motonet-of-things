@@ -26,7 +26,7 @@ pub enum BreakResetIgnore {
 }
 
 const BITS_IN_PACKET: usize = 36;
-const BYTES_IN_PACKET: usize = (BITS_IN_PACKET + 7) / 8; // Roundup division
+const BYTES_IN_PACKET: usize = BITS_IN_PACKET.div_ceil(8); // Roundup division
 const MAX_PACKETS: usize = 12; // Support up to 12 packets in burst
 
 fn decode_gap(gap: u32) -> Result<u8, BreakResetIgnore> {
@@ -67,13 +67,28 @@ fn add_bit(buf: &mut [u8], index: usize, val: u8) {
     }
 }
 
+/// Decodes gap timings into sensor readings.
+///
+/// # Arguments
+///
+/// * `pulses` - Array of pulse durations in microseconds
+///
+/// # Returns
+///
+/// * `Ok((packet_index, reading))` - Successfully decoded reading with packet index
+/// * `Err(buffer)` - Returns the bit buffer if decoding fails
+///
+/// # Errors
+///
+/// Returns `Err` if the pulses cannot be decoded into valid sensor data,
+/// either due to CRC mismatches, invalid packet structure, or insufficient data.
 pub fn decode_gaps(
     pulses: &[u32],
 ) -> Result<(usize, RubicsonReading), [u8; BYTES_IN_PACKET * MAX_PACKETS]> {
     let mut bit_buffer = [0u8; BYTES_IN_PACKET * MAX_PACKETS]; // Support up to 12 packets of 5 bytes
     let mut bit_index = 0;
     let mut bit_buffer_row = 0;
-    for &gap in pulses.iter() {
+    for &gap in pulses {
         // Check if we've exceeded the buffer capacity
         if bit_buffer_row >= MAX_PACKETS {
             return Err(bit_buffer);
@@ -90,7 +105,6 @@ pub fn decode_gaps(
                 match e {
                     BreakResetIgnore::Ignore => {
                         // Ignore the short gap before the break
-                        continue;
                     }
                     BreakResetIgnore::Break => {
                         // We have a complete packet, try to decode
@@ -103,7 +117,6 @@ pub fn decode_gaps(
                         // If the decode failed, we continue to the next packet
                         bit_buffer_row += 1;
                         bit_index = 0;
-                        continue;
                     }
                     BreakResetIgnore::Reset => {
                         // We are done, we were unable to decode the packets
@@ -164,13 +177,11 @@ fn decode_rubicson(bits: &[u8]) -> Result<RubicsonReading, DecodeError> {
     // Nibble 3 is lower nibble of b[1].
     // Nibble 4 is upper nibble of b[2].
     // Nibble 5 is lower nibble of b[2].
-    // Combined: [N3] [N4] [N5]
-    let temp_raw_high = (b[1] as u16) << 12; // Shift N3 to top
-    let temp_raw_low = (b[2] as u16) << 4; // Shift N4 N5 to follow
-
+    //
     // Sign-extend from 12 bits to 16 bits
-    let temp_raw = (temp_raw_high | temp_raw_low) as i16;
-    let temp_c = (temp_raw >> 4) as f32 * 0.1;
+    let combined = (u16::from(b[1]) << 12) | (u16::from(b[2]) << 4);
+    let temp_raw = ((combined as i16) << 4) >> 4;
+    let temp_c = f32::from(temp_raw >> 4) * 0.1;
 
     Ok(RubicsonReading {
         id,

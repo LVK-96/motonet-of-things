@@ -11,3 +11,25 @@ incremental = false
 lto = 'fat'
 opt-level = 's'
 overflow-checks = false
+
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+explicit_iter_loop = "deny"      # Prefer iterator chains over for loops
+manual_find = "deny"             # Prefer .find() over loops
+manual_filter = "deny"           # Prefer .filter() over loops
+manual_flatten = "deny"          # Prefer .flatten() over loops
+manual_map = "deny"              # Prefer .map() over matches
+map_flatten = "deny"             # Prefer .flat_map()
+needless_range_loop = "deny"     # Prefer iterating over the collection directly
+option_if_let_else = "deny"      # Forces .map_or_else() instead of if let
+manual_ok_or = "deny"            # Prefer .ok_or()
+manual_unwrap_or = "deny"        # Prefer .unwrap_or()
+unnecessary_unwrap = "deny"      # Don't unwrap if you can map
+question_mark = "deny"           # Prefer ? operator (monadic propagaton)
+needless_return = "deny"         # Ban explicit 'return' keyword (use expressions)
+semicolon_if_nothing_returned = "deny" # Ensure blocks end in expressions
+redundant_closure_for_method_calls = "deny" # Prefer point-free style: .map(f)
+unwrap_used = "deny"             # Ban .unwrap() (force error handling)
+expect_used = "deny"             # Ban .expect()
+panic = "deny"                   # Ban panic! (force Result types)verflow-checks = false

@@ -129,7 +129,7 @@ async fn main(spawner: Spawner) -> ! {
     .with_scl(peripherals.GPIO22);
 
     let mut display = Sh1106Display::new(i2c).expect("Failed to init display");
-    display.show_status("Starting...").ok();
+    let _ = display.show_status("Starting...");
     info!("Display initialized!");
 
     // Setup Rotary Encoder (GPIO 14, 13)
@@ -511,11 +511,11 @@ async fn display_task(
                             error!("Display: Failed to update: {:?}", e);
                         }
                     } else {
-                        display.show_status("Waiting...").ok();
+                        let _ = display.show_status("Waiting...");
                     }
                 }
                 DisplayState::Dummy => {
-                    display.show_dummy_screen().ok();
+                    let _ = display.show_dummy_screen();
                 }
             }
         }
