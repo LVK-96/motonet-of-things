@@ -40,6 +40,10 @@ pub trait Radio433 {
     /// Get current RSSI in dBm
     fn get_rssi_dbm(&mut self) -> impl Future<Output = Result<i16, RadioError>>;
 
+    /// Get the configured detection threshold in dB.
+    /// This is the minimum signal-to-noise ratio required for OOK detection.
+    fn get_detection_threshold(&self) -> u8;
+
     /// Take ownership of the data pin for use with PulseCapture.
     /// Returns None if the pin has already been taken.
     fn take_data_pin(&mut self) -> Option<Self::DataPin>;
@@ -157,6 +161,12 @@ impl Radio433 for Cc1101Radio {
     fn get_rssi_dbm(&mut self) -> impl Future<Output = Result<i16, RadioError>> {
         let result = self.driver.get_rssi_dbm().map_err(|_| RadioError::Spi);
         async move { result }
+    }
+
+    fn get_detection_threshold(&self) -> u8 {
+        // Returns the configured Decision Boundary for OOK detection.
+        // Currently hardcoded to match DecisionBoundary::Db16 set in new().
+        16
     }
 
     fn take_data_pin(&mut self) -> Option<Self::DataPin> {

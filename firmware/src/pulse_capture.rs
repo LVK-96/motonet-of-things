@@ -4,11 +4,15 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::watch::Sender;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Input;
-use rubicson::{self, RubicsonReading};
+use rubicson;
 
-pub struct PulseCapture<'d> {
+use crate::messages::RadioReading;
+use crate::radio_433::Radio433;
+
+pub struct PulseCapture<'d, R: Radio433> {
     pin: Input<'d>,
-    sender: Sender<'static, CriticalSectionRawMutex, RubicsonReading, 2>,
+    radio: &'d mut R,
+    sender: Sender<'static, CriticalSectionRawMutex, RadioReading, 2>,
 }
 
 /// Timeout for considering a transmission ended
@@ -119,12 +123,13 @@ fn dump_gaps(gaps: &[u32]) {
     info!("=== GAP DUMP END ===");
 }
 
-impl<'d> PulseCapture<'d> {
+impl<'d, R: Radio433> PulseCapture<'d, R> {
     pub fn new(
         pin: Input<'d>,
-        sender: Sender<'static, CriticalSectionRawMutex, RubicsonReading, 2>,
+        radio: &'d mut R,
+        sender: Sender<'static, CriticalSectionRawMutex, RadioReading, 2>,
     ) -> Self {
-        Self { pin, sender }
+        Self { pin, radio, sender }
     }
 
     pub async fn run(&mut self) -> ! {
@@ -197,8 +202,18 @@ impl<'d> PulseCapture<'d> {
                 // We have at least one packet worth of data try to decode
                 match rubicson::decode_gaps(&gap_buffer[..gap_count]) {
                     Ok((_row, reading)) => {
-                        info!("Decoded: {:?}", reading);
-                        self.sender.send(reading);
+                        // Capture RSSI immediately after successful decode
+                        let rssi = self.radio.get_rssi_dbm().await.unwrap_or(-128);
+                        let snr_threshold = self.radio.get_detection_threshold();
+
+                        info!("Decoded: {:?}, RSSI={}dBm", reading, rssi);
+
+                        let radio_reading = RadioReading {
+                            inner: reading,
+                            rssi,
+                            snr_threshold,
+                        };
+                        self.sender.send(radio_reading);
                     }
                     Err(e) => {
                         info!("Decode failed: {:?}", e);

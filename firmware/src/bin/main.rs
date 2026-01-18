@@ -26,7 +26,6 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
 use esp_radio::init;
-use rubicson::RubicsonReading;
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
@@ -36,6 +35,7 @@ use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
 use static_cell::StaticCell;
 
 use esp32_rust_project::display::{Display, Sh1106Display};
+use esp32_rust_project::messages::RadioReading;
 use esp32_rust_project::network;
 use esp32_rust_project::radio_433::{Cc1101Radio, Radio433};
 use esp32_rust_project::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
@@ -43,7 +43,7 @@ use esp32_rust_project::time_sync::{self, TIME_WATCH};
 use esp32_rust_project::ui_input::{EC11RotaryEncoderInput, UiEvent, UiInput};
 
 /// Watch for sharing readings with multiple consumers (MQTT + display)
-static READING_WATCH: Watch<CriticalSectionRawMutex, RubicsonReading, 2> = Watch::new();
+static READING_WATCH: Watch<CriticalSectionRawMutex, RadioReading, 2> = Watch::new();
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -187,12 +187,7 @@ async fn wait_fade_done(channel: &LedcChannel<'static, LowSpeed>, duration_ms: u
 #[embassy_executor::task]
 async fn mqtt_task(
     stack: &'static embassy_net::Stack<'static>,
-    mut receiver: embassy_sync::watch::Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        RubicsonReading,
-        2,
-    >,
+    mut receiver: embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, RadioReading, 2>,
 ) {
     // Backoff parameters
     const MIN_BACKOFF_SECS: u64 = 1;
@@ -351,17 +346,26 @@ async fn mqtt_task(
 
                     // Format topic: sensors/rubicson/{id}/temperature
                     let mut topic: heapless::String<64> = heapless::String::new();
-                    if write!(topic, "sensors/rubicson/{}/temperature", reading.id).is_err() {
+                    if write!(topic, "sensors/rubicson/{}/temperature", reading.inner.id).is_err() {
                         continue;
                     }
 
-                    // Format payload: id={id},ch={channel},temp={temp},batt={ok/low}
-                    let mut payload: heapless::String<64> = heapless::String::new();
-                    let batt = if reading.battery_ok { "ok" } else { "low" };
+                    // Format payload: id={id},ch={channel},temp={temp},batt={ok/low},rssi={rssi},snr={snr}
+                    let mut payload: heapless::String<96> = heapless::String::new();
+                    let batt = if reading.inner.battery_ok {
+                        "ok"
+                    } else {
+                        "low"
+                    };
                     if write!(
                         payload,
-                        "id={},ch={},temp={:.1},batt={}",
-                        reading.id, reading.channel, reading.temperature_c, batt
+                        "id={},ch={},temp={:.1},batt={},rssi={},snr={}",
+                        reading.inner.id,
+                        reading.inner.channel,
+                        reading.inner.temperature_c,
+                        batt,
+                        reading.rssi,
+                        reading.snr_threshold
                     )
                     .is_err()
                     {
@@ -433,12 +437,7 @@ async fn time_sync_task(stack: &'static embassy_net::Stack<'static>) {
 #[embassy_executor::task]
 async fn display_task(
     mut display: Sh1106Display<I2c<'static, Blocking>>,
-    mut receiver: embassy_sync::watch::Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        RubicsonReading,
-        2,
-    >,
+    mut receiver: embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, RadioReading, 2>,
     mut ui: EC11RotaryEncoderInput,
 ) {
     info!("Display task started");
@@ -453,14 +452,12 @@ async fn display_task(
 
     enum DisplayState {
         Main,
-        Dummy,
+        Radio,
     }
     let mut state = DisplayState::Main;
-    let mut last_reading: Option<RubicsonReading> = None;
+    let mut last_reading: Option<RadioReading> = None;
 
     loop {
-        let mut update_needed = false;
-
         match select(
             receiver.changed(),
             ui.next_event(UiEvent::NextScreen, UiEvent::PrevScreen),
@@ -469,54 +466,51 @@ async fn display_task(
         {
             Either::First(reading) => {
                 last_reading = Some(reading);
-                if let DisplayState::Main = state {
-                    update_needed = true;
-                }
             }
             Either::Second(_event) => {
                 // Toggle state on any event
                 state = match state {
-                    DisplayState::Main => DisplayState::Dummy,
-                    DisplayState::Dummy => DisplayState::Main,
+                    DisplayState::Main => DisplayState::Radio,
+                    DisplayState::Radio => DisplayState::Main,
                 };
-                update_needed = true;
             }
         }
 
-        if update_needed {
-            match state {
-                DisplayState::Main => {
-                    if let Some(reading) = &last_reading {
-                        // Get current timestamp if available
-                        let mut time_str: heapless::String<16> = heapless::String::new();
-                        let timestamp = if let Some(Some(time_ref)) = time_receiver.try_get() {
-                            time_ref.format_time(&mut time_str);
-                            Some(time_str.as_str())
-                        } else {
-                            None
-                        };
-
-                        info!(
-                            "Display: Showing temp {}C from sensor {}",
-                            reading.temperature_c, reading.id
-                        );
-
-                        if let Err(e) = display.show_temperature(
-                            reading.temperature_c,
-                            reading.id,
-                            reading.channel,
-                            reading.battery_ok,
-                            timestamp,
-                        ) {
-                            error!("Display: Failed to update: {:?}", e);
-                        }
+        // Always update display after any event
+        match state {
+            DisplayState::Main => {
+                if let Some(reading) = &last_reading {
+                    // Get current timestamp if available
+                    let mut time_str: heapless::String<16> = heapless::String::new();
+                    let timestamp = if let Some(Some(time_ref)) = time_receiver.try_get() {
+                        time_ref.format_time(&mut time_str);
+                        Some(time_str.as_str())
                     } else {
-                        let _ = display.show_status("Waiting...");
+                        None
+                    };
+
+                    info!(
+                        "Display: Showing temp {}C from sensor {}",
+                        reading.inner.temperature_c, reading.inner.id
+                    );
+
+                    if let Err(e) = display.show_temperature(
+                        reading.inner.temperature_c,
+                        reading.inner.id,
+                        reading.inner.channel,
+                        reading.inner.battery_ok,
+                        timestamp,
+                    ) {
+                        error!("Display: Failed to update: {:?}", e);
                     }
+                } else {
+                    let _ = display.show_status("Waiting...");
                 }
-                DisplayState::Dummy => {
-                    let _ = display.show_dummy_screen();
-                }
+            }
+            DisplayState::Radio => {
+                let rssi = last_reading.as_ref().map(|r| r.rssi);
+                let snr_threshold = last_reading.as_ref().map(|r| r.snr_threshold).unwrap_or(16); // Default to 16dB if no reading yet
+                let _ = display.show_radio_info(rssi, snr_threshold);
             }
         }
     }
@@ -582,6 +576,6 @@ async fn radio_433_rx_task(mut radio: Cc1101Radio) {
     info!("Starting pulse capture...");
 
     use esp32_rust_project::pulse_capture::PulseCapture;
-    let mut capture = PulseCapture::new(data_pin, READING_WATCH.sender());
+    let mut capture = PulseCapture::new(data_pin, &mut radio, READING_WATCH.sender());
     capture.run().await;
 }

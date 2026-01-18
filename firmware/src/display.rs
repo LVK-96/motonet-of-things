@@ -4,11 +4,14 @@ use embedded_graphics::{
     mono_font::MonoTextStyle,
     pixelcolor::BinaryColor,
     prelude::*,
+    primitives::{PrimitiveStyle, Rectangle},
     text::{Alignment, Text},
 };
 use heapless::String;
 use mini_oled::prelude::*;
 use profont::{PROFONT_10_POINT, PROFONT_14_POINT, PROFONT_24_POINT};
+
+use crate::messages::SignalQuality;
 
 /// Error type for display operations
 #[derive(Debug, defmt::Format)]
@@ -57,12 +60,18 @@ pub trait Display {
     /// Returns `DisplayError` if the operation fails on the display
     fn show_status(&mut self, message: &str) -> Result<(), DisplayError>;
 
-    /// Show a dummy screen for testing
+    /// Show radio information screen
+    ///
+    /// # Arguments
+    ///
+    /// * `rssi` - Last received signal strength in dBm (or None if no signal yet)
+    /// * `snr_threshold` - Configured SNR threshold in dB
     ///
     /// # Errors
     ///
-    /// Returns `DisplayError` if the operation fails UI events
-    fn show_dummy_screen(&mut self) -> Result<(), DisplayError>;
+    /// Returns `DisplayError` if the operation fails
+    fn show_radio_info(&mut self, rssi: Option<i16>, snr_threshold: u8)
+    -> Result<(), DisplayError>;
 }
 
 /// SH1106 OLED display driver implementation using mini-oled.
@@ -175,13 +184,105 @@ where
         self.flush()
     }
 
-    fn show_dummy_screen(&mut self) -> Result<(), DisplayError> {
+    fn show_radio_info(
+        &mut self,
+        rssi: Option<i16>,
+        _snr_threshold: u8,
+    ) -> Result<(), DisplayError> {
         self.clear()?;
 
-        let style = MonoTextStyle::new(&PROFONT_14_POINT, BinaryColor::On);
-        Text::with_alignment("Dummy Screen", Point::new(64, 32), style, Alignment::Center)
+        let style_header = MonoTextStyle::new(&PROFONT_14_POINT, BinaryColor::On);
+        let style_normal = MonoTextStyle::new(&PROFONT_10_POINT, BinaryColor::On);
+
+        // Header
+        Text::with_alignment(
+            "RADIO STATUS",
+            Point::new(64, 12),
+            style_header,
+            Alignment::Center,
+        )
+        .draw(self.driver.get_mut_canvas())
+        .map_err(|_| DisplayError::DrawFailed)?;
+
+        // Signal strength and quality
+        if let Some(rssi_val) = rssi {
+            let quality = SignalQuality::from_rssi(rssi_val);
+
+            // RSSI value (shortened to fit screen)
+            let mut rssi_str: String<20> = String::new();
+            let _ = write!(rssi_str, "RSSI: {}dBm", rssi_val);
+            Text::with_alignment(
+                rssi_str.as_str(),
+                Point::new(64, 30),
+                style_normal,
+                Alignment::Center,
+            )
             .draw(self.driver.get_mut_canvas())
             .map_err(|_| DisplayError::DrawFailed)?;
+
+            // Quality label
+            let mut quality_str: String<24> = String::new();
+            let _ = write!(quality_str, "Quality: {}", quality.as_str());
+            Text::with_alignment(
+                quality_str.as_str(),
+                Point::new(64, 44),
+                style_normal,
+                Alignment::Center,
+            )
+            .draw(self.driver.get_mut_canvas())
+            .map_err(|_| DisplayError::DrawFailed)?;
+        } else {
+            Text::with_alignment(
+                "No signal yet",
+                Point::new(64, 37),
+                style_normal,
+                Alignment::Center,
+            )
+            .draw(self.driver.get_mut_canvas())
+            .map_err(|_| DisplayError::DrawFailed)?;
+        }
+
+        // Hamburger menu icon (settings indicator) - bottom center
+        // Draw 3 horizontal lines
+        let menu_center_x = 64;
+        let menu_top_y = 52;
+        let line_width = 14u32;
+        let line_height = 2u32;
+        let line_spacing = 4i32;
+        let style_filled = PrimitiveStyle::with_fill(BinaryColor::On);
+
+        // Top line
+        Rectangle::new(
+            Point::new(menu_center_x - (line_width as i32 / 2), menu_top_y),
+            Size::new(line_width, line_height),
+        )
+        .into_styled(style_filled)
+        .draw(self.driver.get_mut_canvas())
+        .map_err(|_| DisplayError::DrawFailed)?;
+
+        // Middle line
+        Rectangle::new(
+            Point::new(
+                menu_center_x - (line_width as i32 / 2),
+                menu_top_y + line_spacing,
+            ),
+            Size::new(line_width, line_height),
+        )
+        .into_styled(style_filled)
+        .draw(self.driver.get_mut_canvas())
+        .map_err(|_| DisplayError::DrawFailed)?;
+
+        // Bottom line
+        Rectangle::new(
+            Point::new(
+                menu_center_x - (line_width as i32 / 2),
+                menu_top_y + line_spacing * 2,
+            ),
+            Size::new(line_width, line_height),
+        )
+        .into_styled(style_filled)
+        .draw(self.driver.get_mut_canvas())
+        .map_err(|_| DisplayError::DrawFailed)?;
 
         self.flush()
     }
