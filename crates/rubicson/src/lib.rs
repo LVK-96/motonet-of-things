@@ -178,10 +178,12 @@ fn decode_rubicson(bits: &[u8]) -> Result<RubicsonReading, DecodeError> {
     // Nibble 4 is upper nibble of b[2].
     // Nibble 5 is lower nibble of b[2].
     //
+    // mask b[1] to get only the lower nibble (temp high bits)
+    let temp_hi4 = u16::from(b[1] & 0x0F);
+    let combined = (temp_hi4 << 8) | u16::from(b[2]);
     // Sign-extend from 12 bits to 16 bits
-    let combined = (u16::from(b[1]) << 12) | (u16::from(b[2]) << 4);
     let temp_raw = ((combined as i16) << 4) >> 4;
-    let temp_c = f32::from(temp_raw >> 4) * 0.1;
+    let temp_c = f32::from(temp_raw) / 10.0;
 
     Ok(RubicsonReading {
         id,
@@ -358,10 +360,12 @@ mod tests {
 
     #[test]
     fn test_decode_valid_packet() {
+        // -21.5°C = -215 raw. As 12-bit two's complement: 4096 - 215 = 3881 = 0xF29
+        // High nibble (N3) = 0xF, Low byte = 0x29
         let mut payload = [0u8; 5];
         payload[0] = 0x0C; // ID
-        payload[1] = 0x80; // Bat OK, Chan 1, TempHi 0
-        payload[2] = 0xD7; // Temp 0xD7 = 215
+        payload[1] = 0x8F; // Bat OK, Chan 1, TempHi = 0xF
+        payload[2] = 0x29; // TempLo = 0x29
         payload[3] = 0xF0; // N6=F
         payload[4] = 0x00;
 
@@ -379,7 +383,7 @@ mod tests {
         assert_eq!(r.id, 12);
         assert_eq!(r.battery_ok, true);
         assert_eq!(r.channel, 1);
-        assert!((r.temperature_c - 21.5).abs() < 0.01);
+        assert!((r.temperature_c - (-21.5)).abs() < 0.01);
     }
 
     #[test]
@@ -406,8 +410,9 @@ mod tests {
 
     #[test]
     fn test_decode_gaps() {
-        // ID=12, Channel=1, BatteryOK=true, Temp=21.5C (raw=215)
-        let payload = build_payload(0x0C, 1, true, 215);
+        // ID=12, Channel=1, BatteryOK=true, Temp=-21.5°C
+        // -215 as 12-bit two's complement = 0xF29 = 3881
+        let payload = build_payload(0x0C, 1, true, 0xF29);
 
         // Convert to gaps and repeat for burst
         let mut gaps = payload_to_gaps(&payload);
@@ -417,7 +422,7 @@ mod tests {
 
         let (_valid_packet_idx, r) = decode_gaps(&gaps).expect("Decode burst failed");
         assert_eq!(r.id, 12);
-        assert!((r.temperature_c - 21.5).abs() < 0.1);
+        assert!((r.temperature_c - (-21.5)).abs() < 0.1);
     }
 
     /// End-to-end test: Raw gaps → Bits → Decoded Message
@@ -427,7 +432,8 @@ mod tests {
         let expected_id: u8 = 0xAB;
         let expected_channel: u8 = 2;
         let expected_battery_ok = true;
-        let expected_temp_raw: u16 = 253; // 25.3°C
+        // -15.3°C = -153 raw. As 12-bit two's complement: 4096 - 153 = 3943 = 0xF67
+        let expected_temp_raw: u16 = 0xF67;
 
         // Build payload and convert to gaps
         let payload = build_payload(
@@ -449,8 +455,8 @@ mod tests {
             "Battery status mismatch"
         );
         assert!(
-            (result.temperature_c - 25.3).abs() < 0.1,
-            "Temperature mismatch: expected 25.3, got {}",
+            (result.temperature_c - (-15.3)).abs() < 0.1,
+            "Temperature mismatch: expected -15.3, got {}",
             result.temperature_c
         );
         assert!(result.crc_ok, "CRC validation failed");
