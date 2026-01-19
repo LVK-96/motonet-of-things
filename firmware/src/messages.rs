@@ -15,9 +15,27 @@ pub struct RadioReading {
     pub inner: RubicsonReading,
     /// Received Signal Strength Indicator in dBm (e.g., -75)
     pub rssi: i16,
-    /// Configured SNR threshold in dB (e.g., 16)
+    /// Configured detection threshold in dB (e.g., 16)
     /// This is the minimum signal-to-noise ratio required for detection.
-    pub snr_threshold: u8,
+    pub detection_threshold: u8,
+}
+
+/// Radio settings that can be changed at runtime.
+#[derive(Debug, Clone, Copy, defmt::Format)]
+pub struct RadioSettings {
+    /// Detection threshold in dB (valid values: 4, 8, 12, 16)
+    pub detection_threshold_db: u8,
+    /// AGC target amplitude level (0-7, corresponding to 24-42 dB)
+    pub magn_target: u8,
+}
+
+impl Default for RadioSettings {
+    fn default() -> Self {
+        Self {
+            detection_threshold_db: 16,
+            magn_target: 7, // 42 dB - matches CC1101 default
+        }
+    }
 }
 
 /// Signal quality classification based on RSSI.

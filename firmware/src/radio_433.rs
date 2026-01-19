@@ -44,6 +44,18 @@ pub trait Radio433 {
     /// This is the minimum signal-to-noise ratio required for OOK detection.
     fn get_detection_threshold(&self) -> u8;
 
+    /// Set the detection threshold (decision boundary) for OOK detection.
+    /// Valid values: 4, 8, 12, 16 dB
+    fn set_detection_threshold(&mut self, db: u8) -> impl Future<Output = Result<(), RadioError>>;
+
+    /// Get the current filter output level (AGC target amplitude).
+    /// Returns 0-7, corresponding to 24-42 dB.
+    fn get_filter_level(&self) -> u8;
+
+    /// Set the filter output level (AGC target amplitude).
+    /// Valid values: 0-7 (corresponding to 24, 27, 30, 33, 36, 38, 40, 42 dB)
+    fn set_filter_level(&mut self, level: u8) -> impl Future<Output = Result<(), RadioError>>;
+
     /// Take ownership of the data pin for use with PulseCapture.
     /// Returns None if the pin has already been taken.
     fn take_data_pin(&mut self) -> Option<Self::DataPin>;
@@ -55,6 +67,8 @@ pub struct Cc1101Radio {
     data_pin: Option<Input<'static>>,
     #[allow(dead_code)]
     gdo2: Input<'static>,
+    detection_threshold_db: u8,
+    filter_level: u8,
 }
 
 impl Cc1101Radio {
@@ -135,6 +149,8 @@ impl Cc1101Radio {
             driver,
             data_pin: Some(gdo0),
             gdo2,
+            detection_threshold_db: 16, // Default from DecisionBoundary::Db16
+            filter_level: 7,            // Default from TargetAmplitude::Db42
         })
     }
 }
@@ -164,9 +180,57 @@ impl Radio433 for Cc1101Radio {
     }
 
     fn get_detection_threshold(&self) -> u8 {
-        // Returns the configured Decision Boundary for OOK detection.
-        // Currently hardcoded to match DecisionBoundary::Db16 set in new().
-        16
+        self.detection_threshold_db
+    }
+
+    fn set_detection_threshold(&mut self, db: u8) -> impl Future<Output = Result<(), RadioError>> {
+        // Map dB value to DecisionBoundary enum
+        let boundary = match db {
+            0..=6 => DecisionBoundary::Db4,
+            7..=10 => DecisionBoundary::Db8,
+            11..=14 => DecisionBoundary::Db12,
+            _ => DecisionBoundary::Db16, // 15+ dB, default to max
+        };
+
+        let result = self
+            .driver
+            .set_filter_length(FilterLength::AmplitudeModulation(boundary))
+            .map_err(|_| RadioError::ConfigError);
+
+        if result.is_ok() {
+            self.detection_threshold_db = db;
+        }
+
+        async move { result }
+    }
+
+    fn get_filter_level(&self) -> u8 {
+        self.filter_level
+    }
+
+    fn set_filter_level(&mut self, level: u8) -> impl Future<Output = Result<(), RadioError>> {
+        // Map 0-7 to TargetAmplitude enum (24-42 dB)
+        let target = match level {
+            0 => TargetAmplitude::Db24,
+            1 => TargetAmplitude::Db27,
+            2 => TargetAmplitude::Db30,
+            3 => TargetAmplitude::Db33,
+            4 => TargetAmplitude::Db36,
+            5 => TargetAmplitude::Db38,
+            6 => TargetAmplitude::Db40,
+            _ => TargetAmplitude::Db42, // 7 or higher
+        };
+
+        let result = self
+            .driver
+            .set_magn_target(target)
+            .map_err(|_| RadioError::ConfigError);
+
+        if result.is_ok() {
+            self.filter_level = level.min(7);
+        }
+
+        async move { result }
     }
 
     fn take_data_pin(&mut self) -> Option<Self::DataPin> {

@@ -35,7 +35,7 @@ use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
 use static_cell::StaticCell;
 
 use esp32_rust_project::display::{Display, Sh1106Display};
-use esp32_rust_project::messages::RadioReading;
+use esp32_rust_project::messages::{RadioReading, RadioSettings};
 use esp32_rust_project::network;
 use esp32_rust_project::radio_433::{Cc1101Radio, Radio433};
 use esp32_rust_project::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
@@ -44,6 +44,9 @@ use esp32_rust_project::ui_input::{EC11RotaryEncoderInput, UiEvent, UiInput};
 
 /// Watch for sharing readings with multiple consumers (MQTT + display)
 static READING_WATCH: Watch<CriticalSectionRawMutex, RadioReading, 2> = Watch::new();
+
+/// Watch for sharing radio settings with the radio task
+static RADIO_SETTINGS_WATCH: Watch<CriticalSectionRawMutex, RadioSettings, 2> = Watch::new();
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -132,7 +135,7 @@ async fn main(spawner: Spawner) -> ! {
     let _ = display.show_status("Starting...");
     info!("Display initialized!");
 
-    // Setup Rotary Encoder (GPIO 14, 13)
+    // Setup Rotary Encoder (GPIO 14, 13) and push button (GPIO 27)
     info!("Setting up Rotary Encoder...");
     let rotary_a = Input::new(
         peripherals.GPIO14,
@@ -142,7 +145,11 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO13,
         InputConfig::default().with_pull(Pull::Up),
     );
-    let ui_input = EC11RotaryEncoderInput::new(rotary_a, rotary_b);
+    let rotary_sw = Input::new(
+        peripherals.GPIO27,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    let ui_input = EC11RotaryEncoderInput::new(rotary_a, rotary_b, rotary_sw);
 
     // Spawn tasks
     spawner.spawn(radio_433_rx_task(radio)).unwrap();
@@ -365,7 +372,7 @@ async fn mqtt_task(
                         reading.inner.temperature_c,
                         batt,
                         reading.rssi,
-                        reading.snr_threshold
+                        reading.detection_threshold
                     )
                     .is_err()
                     {
@@ -450,12 +457,27 @@ async fn display_task(
         error!("Display: Failed to show status");
     }
 
+    #[derive(Clone, Copy)]
     enum DisplayState {
         Main,
         Radio,
+        Settings { nav_index: u8, editing: bool },
     }
     let mut state = DisplayState::Main;
     let mut last_reading: Option<RadioReading> = None;
+
+    // Settings values (pending values, not yet applied)
+    let mut pending_threshold: u8 = 16; // Default from CC1101 config
+    let mut pending_magn_target: u8 = 7; // Default (42 dB)
+
+    // Get sender for radio settings
+    let settings_sender = RADIO_SETTINGS_WATCH.sender();
+
+    // Send initial settings
+    settings_sender.send(RadioSettings {
+        detection_threshold_db: pending_threshold,
+        magn_target: pending_magn_target,
+    });
 
     loop {
         match select(
@@ -467,11 +489,115 @@ async fn display_task(
             Either::First(reading) => {
                 last_reading = Some(reading);
             }
-            Either::Second(_event) => {
-                // Toggle state on any event
+            Either::Second(event) => {
+                // Handle UI events based on current state
                 state = match state {
-                    DisplayState::Main => DisplayState::Radio,
-                    DisplayState::Radio => DisplayState::Main,
+                    DisplayState::Main => match event {
+                        UiEvent::NextScreen => DisplayState::Radio,
+                        UiEvent::PrevScreen => DisplayState::Radio,
+                        UiEvent::Select => DisplayState::Settings {
+                            nav_index: 0,
+                            editing: false,
+                        },
+                    },
+                    DisplayState::Radio => match event {
+                        UiEvent::NextScreen => DisplayState::Main,
+                        UiEvent::PrevScreen => DisplayState::Main,
+                        UiEvent::Select => DisplayState::Settings {
+                            nav_index: 0,
+                            editing: false,
+                        },
+                    },
+                    DisplayState::Settings { nav_index, editing } => match event {
+                        UiEvent::Select => {
+                            if editing {
+                                // Exit editing mode, go back to navigation
+                                DisplayState::Settings {
+                                    nav_index,
+                                    editing: false,
+                                }
+                            } else if nav_index == 2 {
+                                // Save selected - apply settings and exit
+                                settings_sender.send(RadioSettings {
+                                    detection_threshold_db: pending_threshold,
+                                    magn_target: pending_magn_target,
+                                });
+                                info!(
+                                    "Settings saved: threshold={} dB, magn_target={}",
+                                    pending_threshold, pending_magn_target
+                                );
+                                DisplayState::Radio
+                            } else {
+                                // Enter editing mode for current item
+                                DisplayState::Settings {
+                                    nav_index,
+                                    editing: true,
+                                }
+                            }
+                        }
+                        UiEvent::NextScreen => {
+                            if editing {
+                                // Adjust value up
+                                match nav_index {
+                                    0 => {
+                                        // Detection threshold: 4, 8, 12, 16 dB
+                                        pending_threshold = if pending_threshold >= 16 {
+                                            4
+                                        } else {
+                                            pending_threshold + 4
+                                        };
+                                    }
+                                    1 => {
+                                        // Magn target: 0-7
+                                        pending_magn_target = if pending_magn_target >= 7 {
+                                            0
+                                        } else {
+                                            pending_magn_target + 1
+                                        };
+                                    }
+                                    _ => {}
+                                }
+                                DisplayState::Settings { nav_index, editing }
+                            } else {
+                                // Navigate to next item (wrap around)
+                                let next = if nav_index >= 2 { 0 } else { nav_index + 1 };
+                                DisplayState::Settings {
+                                    nav_index: next,
+                                    editing: false,
+                                }
+                            }
+                        }
+                        UiEvent::PrevScreen => {
+                            if editing {
+                                // Adjust value down
+                                match nav_index {
+                                    0 => {
+                                        pending_threshold = if pending_threshold <= 4 {
+                                            16
+                                        } else {
+                                            pending_threshold - 4
+                                        };
+                                    }
+                                    1 => {
+                                        pending_magn_target = if pending_magn_target == 0 {
+                                            7
+                                        } else {
+                                            pending_magn_target - 1
+                                        };
+                                    }
+                                    _ => {}
+                                }
+                                DisplayState::Settings { nav_index, editing }
+                            } else {
+                                // Navigate to previous item (wrap around)
+                                let prev = if nav_index == 0 { 2 } else { nav_index - 1 };
+                                DisplayState::Settings {
+                                    nav_index: prev,
+                                    editing: false,
+                                }
+                            }
+                        }
+                    },
                 };
             }
         }
@@ -509,8 +635,19 @@ async fn display_task(
             }
             DisplayState::Radio => {
                 let rssi = last_reading.as_ref().map(|r| r.rssi);
-                let snr_threshold = last_reading.as_ref().map(|r| r.snr_threshold).unwrap_or(16); // Default to 16dB if no reading yet
-                let _ = display.show_radio_info(rssi, snr_threshold);
+                let det_threshold = last_reading
+                    .as_ref()
+                    .map(|r| r.detection_threshold)
+                    .unwrap_or(pending_threshold);
+                let _ = display.show_radio_info(rssi, det_threshold);
+            }
+            DisplayState::Settings { nav_index, editing } => {
+                let _ = display.show_settings_menu(
+                    nav_index,
+                    editing,
+                    pending_threshold,
+                    pending_magn_target,
+                );
             }
         }
     }
@@ -576,6 +713,12 @@ async fn radio_433_rx_task(mut radio: Cc1101Radio) {
     info!("Starting pulse capture...");
 
     use esp32_rust_project::pulse_capture::PulseCapture;
-    let mut capture = PulseCapture::new(data_pin, &mut radio, READING_WATCH.sender());
+    let settings_receiver = RADIO_SETTINGS_WATCH.receiver().unwrap();
+    let mut capture = PulseCapture::new(
+        data_pin,
+        &mut radio,
+        READING_WATCH.sender(),
+        settings_receiver,
+    );
     capture.run().await;
 }

@@ -1,18 +1,19 @@
 use defmt::info;
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::watch::Sender;
+use embassy_sync::watch::{Receiver, Sender};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Input;
 use rubicson;
 
-use crate::messages::RadioReading;
+use crate::messages::{RadioReading, RadioSettings};
 use crate::radio_433::Radio433;
 
 pub struct PulseCapture<'d, R: Radio433> {
     pin: Input<'d>,
     radio: &'d mut R,
     sender: Sender<'static, CriticalSectionRawMutex, RadioReading, 2>,
+    settings_receiver: Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
 }
 
 /// Timeout for considering a transmission ended
@@ -128,8 +129,14 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
         pin: Input<'d>,
         radio: &'d mut R,
         sender: Sender<'static, CriticalSectionRawMutex, RadioReading, 2>,
+        settings_receiver: Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
     ) -> Self {
-        Self { pin, radio, sender }
+        Self {
+            pin,
+            radio,
+            sender,
+            settings_receiver,
+        }
     }
 
     pub async fn run(&mut self) -> ! {
@@ -204,14 +211,14 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                     Ok((_row, reading)) => {
                         // Capture RSSI immediately after successful decode
                         let rssi = self.radio.get_rssi_dbm().await.unwrap_or(-128);
-                        let snr_threshold = self.radio.get_detection_threshold();
+                        let detection_threshold = self.radio.get_detection_threshold();
 
                         info!("Decoded: {:?}, RSSI={}dBm", reading, rssi);
 
                         let radio_reading = RadioReading {
                             inner: reading,
                             rssi,
-                            snr_threshold,
+                            detection_threshold,
                         };
                         self.sender.send(radio_reading);
                     }
@@ -224,7 +231,38 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
             }
 
             // Delay 1s before listening again (debounce)
+            // Also check for settings changes during this quiet period
             Timer::after(Duration::from_millis(1000)).await;
+
+            // Apply any pending settings changes
+            if let Some(settings) = self.settings_receiver.try_get() {
+                let current_threshold = self.radio.get_detection_threshold();
+                if settings.detection_threshold_db != current_threshold {
+                    info!(
+                        "Applying new detection threshold: {} dB (was {} dB)",
+                        settings.detection_threshold_db, current_threshold
+                    );
+                    if let Err(e) = self
+                        .radio
+                        .set_detection_threshold(settings.detection_threshold_db)
+                        .await
+                    {
+                        info!("Failed to set detection threshold: {:?}", e);
+                    }
+                }
+
+                let current_magn_target = self.radio.get_filter_level();
+                if settings.magn_target != current_magn_target {
+                    info!(
+                        "Applying new magn target: {} (was {})",
+                        settings.magn_target, current_magn_target
+                    );
+                    if let Err(e) = self.radio.set_filter_level(settings.magn_target).await {
+                        info!("Failed to set filter level: {:?}", e);
+                    }
+                }
+            }
+
             info!("Ready, waiting for signal...");
         }
     }

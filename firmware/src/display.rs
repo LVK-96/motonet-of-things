@@ -65,13 +65,36 @@ pub trait Display {
     /// # Arguments
     ///
     /// * `rssi` - Last received signal strength in dBm (or None if no signal yet)
-    /// * `snr_threshold` - Configured SNR threshold in dB
+    /// * `detection_threshold` - Configured detection threshold in dB
     ///
     /// # Errors
     ///
     /// Returns `DisplayError` if the operation fails
-    fn show_radio_info(&mut self, rssi: Option<i16>, snr_threshold: u8)
-    -> Result<(), DisplayError>;
+    fn show_radio_info(
+        &mut self,
+        rssi: Option<i16>,
+        detection_threshold: u8,
+    ) -> Result<(), DisplayError>;
+
+    /// Show settings menu
+    ///
+    /// # Arguments
+    ///
+    /// * `nav_index` - Index of currently navigated menu item (0=threshold, 1=magn_target, 2=save)
+    /// * `editing` - Whether we are editing the currently selected item
+    /// * `detection_threshold` - Current detection threshold value in dB
+    /// * `magn_target` - Current magnitude target level (0-7)
+    ///
+    /// # Errors
+    ///
+    /// Returns `DisplayError` if the operation fails
+    fn show_settings_menu(
+        &mut self,
+        nav_index: u8,
+        editing: bool,
+        detection_threshold: u8,
+        magn_target: u8,
+    ) -> Result<(), DisplayError>;
 }
 
 /// SH1106 OLED display driver implementation using mini-oled.
@@ -187,7 +210,7 @@ where
     fn show_radio_info(
         &mut self,
         rssi: Option<i16>,
-        _snr_threshold: u8,
+        _detection_threshold: u8,
     ) -> Result<(), DisplayError> {
         self.clear()?;
 
@@ -283,6 +306,99 @@ where
         .into_styled(style_filled)
         .draw(self.driver.get_mut_canvas())
         .map_err(|_| DisplayError::DrawFailed)?;
+
+        self.flush()
+    }
+
+    fn show_settings_menu(
+        &mut self,
+        nav_index: u8,
+        editing: bool,
+        detection_threshold: u8,
+        magn_target: u8,
+    ) -> Result<(), DisplayError> {
+        self.clear()?;
+
+        let style_header = MonoTextStyle::new(&PROFONT_14_POINT, BinaryColor::On);
+        let style_normal = MonoTextStyle::new(&PROFONT_10_POINT, BinaryColor::On);
+        let style_filled = PrimitiveStyle::with_fill(BinaryColor::On);
+
+        // Header
+        Text::with_alignment(
+            "SETTINGS",
+            Point::new(64, 12),
+            style_header,
+            Alignment::Center,
+        )
+        .draw(self.driver.get_mut_canvas())
+        .map_err(|_| DisplayError::DrawFailed)?;
+
+        // Convert magn_target (0-7) to dB value per CC1101 datasheet
+        let magn_target_db: u8 = match magn_target {
+            0 => 24,
+            1 => 27,
+            2 => 30,
+            3 => 33,
+            4 => 36,
+            5 => 38,
+            6 => 40,
+            _ => 42, // 7 or higher
+        };
+
+        // Menu items: Threshold, Magn Tgt, Save
+        // Store (label, Option<(value, unit)>)
+        let items: [(&str, Option<(u8, &str)>); 3] = [
+            ("Threshold", Some((detection_threshold, "dB"))),
+            ("Magn Tgt", Some((magn_target_db, "dB"))),
+            ("Save", None),
+        ];
+
+        for (i, (label, value_unit)) in items.iter().enumerate() {
+            let y = 28 + (i as i32 * 12);
+            let is_nav = i == nav_index as usize;
+            let is_editing = is_nav && editing && value_unit.is_some();
+
+            // Draw label
+            Text::with_alignment(label, Point::new(8, y), style_normal, Alignment::Left)
+                .draw(self.driver.get_mut_canvas())
+                .map_err(|_| DisplayError::DrawFailed)?;
+
+            // Draw underline under label if navigating to this item (not editing)
+            if is_nav && !editing {
+                let label_width = (label.len() as i32) * 6; // Approximate char width for PROFONT_10
+                Rectangle::new(Point::new(8, y + 2), Size::new(label_width as u32, 1))
+                    .into_styled(style_filled)
+                    .draw(self.driver.get_mut_canvas())
+                    .map_err(|_| DisplayError::DrawFailed)?;
+            }
+
+            // Draw value with unit if present
+            if let Some((val, unit)) = value_unit {
+                let mut value_str: String<12> = String::new();
+                let _ = write!(value_str, "{}{}", val, unit);
+                let value_x = 120;
+                Text::with_alignment(
+                    value_str.as_str(),
+                    Point::new(value_x, y),
+                    style_normal,
+                    Alignment::Right,
+                )
+                .draw(self.driver.get_mut_canvas())
+                .map_err(|_| DisplayError::DrawFailed)?;
+
+                // Draw underline under value if editing this item
+                if is_editing {
+                    let val_width = (value_str.len() as i32) * 6;
+                    Rectangle::new(
+                        Point::new(value_x - val_width, y + 2),
+                        Size::new(val_width as u32, 1),
+                    )
+                    .into_styled(style_filled)
+                    .draw(self.driver.get_mut_canvas())
+                    .map_err(|_| DisplayError::DrawFailed)?;
+                }
+            }
+        }
 
         self.flush()
     }
