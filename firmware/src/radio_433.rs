@@ -32,12 +32,24 @@ pub trait Radio433 {
     type DataPin: InputPin;
 
     /// Get hardware info (part number, version)
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError` if SPI fails
     fn get_hw_info(&mut self) -> impl Future<Output = Result<(u8, u8), RadioError>>;
 
     /// Set the radio to receive mode
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError` if command fails
     fn set_receive_mode(&mut self) -> impl Future<Output = Result<(), RadioError>>;
 
     /// Get current RSSI in dBm
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError` if SPI fails
     fn get_rssi_dbm(&mut self) -> impl Future<Output = Result<i16, RadioError>>;
 
     /// Get the configured detection threshold in dB.
@@ -46,6 +58,10 @@ pub trait Radio433 {
 
     /// Set the detection threshold (decision boundary) for OOK detection.
     /// Valid values: 4, 8, 12, 16 dB
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError` if configuration fails
     fn set_detection_threshold(&mut self, db: u8) -> impl Future<Output = Result<(), RadioError>>;
 
     /// Get the current filter output level (AGC target amplitude).
@@ -54,9 +70,13 @@ pub trait Radio433 {
 
     /// Set the filter output level (AGC target amplitude).
     /// Valid values: 0-7 (corresponding to 24, 27, 30, 33, 36, 38, 40, 42 dB)
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError` if configuration fails
     fn set_filter_level(&mut self, level: u8) -> impl Future<Output = Result<(), RadioError>>;
 
-    /// Take ownership of the data pin for use with PulseCapture.
+    /// Take ownership of the data pin for use with `PulseCapture`.
     /// Returns None if the pin has already been taken.
     fn take_data_pin(&mut self) -> Option<Self::DataPin>;
 }
@@ -76,6 +96,11 @@ impl Cc1101Radio {
     ///
     /// Configures the radio for 433.92 MHz OOK reception suitable for
     /// weather sensors like Rubicson.
+    ///
+    /// # Panics
+    ///
+    /// Panics if SPI or GPIO configuration fails.
+    #[allow(clippy::expect_used)]
     pub fn new(
         spimaster: impl esp_hal::spi::master::Instance + 'static,
         sck: impl OutputPin + 'static,
@@ -84,15 +109,15 @@ impl Cc1101Radio {
         cs: impl OutputPin + 'static,
         gdo0: impl EspInputPin + 'static,
         gdo2: impl EspInputPin + 'static,
-    ) -> Result<Self, RadioError> {
-        // Configure SPI
+    ) -> Self {
+        // Configure SPI (this is internal to the ESP32 and won't fail with these parameters)
         let spi = Spi::new(
             spimaster,
             esp_hal::spi::master::Config::default()
                 .with_frequency(Rate::from_hz(1_000_000))
                 .with_mode(Mode::_0),
         )
-        .map_err(|_| RadioError::Spi)?
+        .expect("SPI configuration failed")
         .with_sck(sck)
         .with_mosi(mosi)
         .with_miso(miso);
@@ -101,57 +126,75 @@ impl Cc1101Radio {
         let cs = Output::new(cs, Level::High, OutputConfig::default());
 
         // Wrap SPI + CS into SpiDevice
-        let spi_device = ExclusiveDevice::new_no_delay(spi, cs).map_err(|_| RadioError::Spi)?;
+        let spi_device = ExclusiveDevice::new_no_delay(spi, cs).expect("SpiDevice creation failed");
 
-        // Create CC1101 driver
-        let mut driver = Cc1101::new(spi_device).map_err(|_| RadioError::NotResponding)?;
-
-        // Reset and configure
-        driver.reset_chip().map_err(|_| RadioError::ConfigError)?;
-        driver.set_defaults().map_err(|_| RadioError::ConfigError)?;
-
-        // Configure for 433 MHz OOK operation
-        driver
-            .set_frequency(433_920_000)
-            .map_err(|_| RadioError::ConfigError)?;
-        driver
-            .set_modulation_format(ModulationFormat::AmplitudeShiftOnOffKeying)
-            .map_err(|_| RadioError::ConfigError)?;
-        driver
-            .set_sync_mode(SyncMode::Disabled)
-            .map_err(|_| RadioError::ConfigError)?;
-        driver
-            .set_packet_length(PacketLength::Infinite)
-            .map_err(|_| RadioError::ConfigError)?;
-
-        // OOK-specific settings for Rubicson reception
-        driver
-            .set_data_rate(4800)
-            .map_err(|_| RadioError::ConfigError)?;
-        driver
-            .set_channel_bandwidth(325_000)
-            .map_err(|_| RadioError::ConfigError)?;
-        driver
-            .set_magn_target(TargetAmplitude::Db42)
-            .map_err(|_| RadioError::ConfigError)?;
-        driver
-            .set_filter_length(FilterLength::AmplitudeModulation(DecisionBoundary::Db16))
-            .map_err(|_| RadioError::ConfigError)?;
-
-        // Enable async serial mode for raw OOK data output
-        driver.set_raw_mode().map_err(|_| RadioError::ConfigError)?;
+        // Create CC1101 driver (this just wraps the SPI device, doesn't communicate)
+        // Note: The library returns Result but new() is actually infallible
+        let driver = Cc1101::new(spi_device).expect("Cc1101::new is infallible");
 
         // Configure GPIO pins
         let gdo0 = Input::new(gdo0, InputConfig::default().with_pull(Pull::Down));
         let gdo2 = Input::new(gdo2, InputConfig::default().with_pull(Pull::Down));
 
-        Ok(Self {
+        Self {
             driver,
             data_pin: Some(gdo0),
             gdo2,
-            detection_threshold_db: 16, // Default from DecisionBoundary::Db16
-            filter_level: 7,            // Default from TargetAmplitude::Db42
-        })
+            detection_threshold_db: 16,
+            filter_level: 7,
+        }
+    }
+
+    /// Initialize and configure the radio hardware.
+    ///
+    /// This performs the actual SPI communication and can be called multiple times.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError::ConfigError` if any configuration command fails.
+    pub fn init(&mut self) -> Result<(), RadioError> {
+        // Reset and configure
+        self.driver
+            .reset_chip()
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_defaults()
+            .map_err(|_| RadioError::ConfigError)?;
+
+        // Configure for 433 MHz OOK operation
+        self.driver
+            .set_frequency(433_920_000)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_modulation_format(ModulationFormat::AmplitudeShiftOnOffKeying)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_sync_mode(SyncMode::Disabled)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_packet_length(PacketLength::Infinite)
+            .map_err(|_| RadioError::ConfigError)?;
+
+        // OOK-specific settings for Rubicson reception
+        self.driver
+            .set_data_rate(4800)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_channel_bandwidth(325_000)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_magn_target(TargetAmplitude::Db42)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_filter_length(FilterLength::AmplitudeModulation(DecisionBoundary::Db16))
+            .map_err(|_| RadioError::ConfigError)?;
+
+        // Enable async serial mode for raw OOK data output
+        self.driver
+            .set_raw_mode()
+            .map_err(|_| RadioError::ConfigError)?;
+
+        Ok(())
     }
 }
 

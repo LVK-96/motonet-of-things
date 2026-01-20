@@ -43,6 +43,7 @@ The system uses `embassy` for async task management on the ESP32.
 2.  **Testing**: Always verify logic changes with `cargo test` in the relevant crate before proposing fixes.
 3.  **Conventions**:
     - Use `cargo fmt` to maintain style.
+    - Run `cargo clippy` to check for lints. Note: Run `cargo clippy` in `firmware/` for the target, and `cargo clippy -p <crate>` for host crates.
     - Commit messages should be "Action: Details" (e.g., "Fix decode logic for negative temps").
 4.  **Known Issues**:
     - **Temperature Encoding**: The `rubicson` crate uses 12-bit two's complement. Be careful with sign extension. Negative temperatures (e.g., -10.5°C) correspond to raw values with high nibbles (e.g., 0xFxx). Always test with negative values.

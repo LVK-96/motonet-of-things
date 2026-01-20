@@ -53,6 +53,7 @@ pub enum SignalQuality {
 
 impl SignalQuality {
     /// Classify signal quality based on RSSI value.
+    #[must_use]
     pub fn from_rssi(rssi: i16) -> Self {
         if rssi > -60 {
             SignalQuality::Excellent
@@ -66,6 +67,7 @@ impl SignalQuality {
     }
 
     /// Get a human-readable label for the signal quality.
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             SignalQuality::Excellent => "Excellent",

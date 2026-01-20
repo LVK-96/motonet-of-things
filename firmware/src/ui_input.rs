@@ -16,17 +16,18 @@ pub trait UiInput {
 }
 
 pub struct EC11RotaryEncoderInput {
-    pin_a: Input<'static>,
-    pin_b: Input<'static>,
-    pin_sw: Input<'static>,
+    a: Input<'static>,
+    b: Input<'static>,
+    sw: Input<'static>,
 }
 
 impl EC11RotaryEncoderInput {
+    #[must_use]
     pub fn new(pin_a: Input<'static>, pin_b: Input<'static>, pin_sw: Input<'static>) -> Self {
         Self {
-            pin_a,
-            pin_b,
-            pin_sw,
+            a: pin_a,
+            b: pin_b,
+            sw: pin_sw,
         }
     }
 }
@@ -38,8 +39,8 @@ impl UiInput for EC11RotaryEncoderInput {
         loop {
             // Wait for either: button press, or rotation (rising edge on A)
             match select3(
-                self.pin_sw.wait_for_falling_edge(),
-                self.pin_a.wait_for_rising_edge(),
+                self.sw.wait_for_falling_edge(),
+                self.a.wait_for_rising_edge(),
                 core::future::pending::<()>(), // placeholder for third arm
             )
             .await
@@ -47,22 +48,22 @@ impl UiInput for EC11RotaryEncoderInput {
                 Either3::First(()) => {
                     // Button pressed (active low)
                     Timer::after(Duration::from_millis(50)).await; // Debounce
-                    if self.pin_sw.is_low() {
+                    if self.sw.is_low() {
                         // Wait for release to avoid repeated triggers
-                        self.pin_sw.wait_for_rising_edge().await;
+                        self.sw.wait_for_rising_edge().await;
                         Timer::after(Duration::from_millis(50)).await; // Debounce release
                         return UiEvent::Select;
                     }
                 }
                 Either3::Second(()) => {
                     // Rotation detected - sample B immediately
-                    let b_at_edge = self.pin_b.is_low();
+                    let b_at_edge = self.b.is_low();
 
                     // Debounce - wait for contacts to settle
                     Timer::after(Duration::from_millis(2)).await;
 
                     // Confirm A is still high (valid edge, not noise)
-                    if !self.pin_a.is_high() {
+                    if !self.a.is_high() {
                         continue;
                     }
 

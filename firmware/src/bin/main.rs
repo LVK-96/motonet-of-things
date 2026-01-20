@@ -37,10 +37,20 @@ use static_cell::StaticCell;
 use esp32_rust_project::display::{Display, Sh1106Display};
 use esp32_rust_project::messages::{RadioReading, RadioSettings};
 use esp32_rust_project::network;
+use esp32_rust_project::pulse_capture::PulseCapture;
 use esp32_rust_project::radio_433::{Cc1101Radio, Radio433};
 use esp32_rust_project::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
 use esp32_rust_project::time_sync::{self, TIME_WATCH};
 use esp32_rust_project::ui_input::{EC11RotaryEncoderInput, UiEvent, UiInput};
+use esp32_rust_project::with_retry;
+
+// Display state for the UI task
+#[derive(Clone, Copy)]
+enum DisplayState {
+    Main,
+    Radio,
+    Settings { nav_index: u8, editing: bool },
+}
 
 /// Watch for sharing readings with multiple consumers (MQTT + display)
 static READING_WATCH: Watch<CriticalSectionRawMutex, RadioReading, 2> = Watch::new();
@@ -56,19 +66,24 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-fn system_setup() -> Result<Peripherals, ()> {
+fn system_setup() -> Peripherals {
     info!("Initializing system...");
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
     info!("Initializing heap...");
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
     info!("System setup complete!");
 
-    Ok(peripherals)
+    peripherals
 }
 
 #[esp_rtos::main]
+#[allow(clippy::expect_used)]
 async fn main(spawner: Spawner) -> ! {
-    let peripherals = system_setup().unwrap();
+    // Statics allocated in main to ensure lifetime
+    static LEDC_TIMER: StaticCell<timer::Timer<'static, LowSpeed>> = StaticCell::new();
+    static RADIO_CONTROLLER: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
+
+    let peripherals = system_setup();
 
     // Initialize async runtime
     esp_rtos::start(TimerGroup::new(peripherals.TIMG0).timer0);
@@ -77,39 +92,51 @@ async fn main(spawner: Spawner) -> ! {
     let mut ledc = Ledc::new(peripherals.LEDC);
     ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
 
-    static LEDC_TIMER: StaticCell<timer::Timer<'static, LowSpeed>> = StaticCell::new();
     let lstimer0 = LEDC_TIMER.init(ledc.timer::<LowSpeed>(timer::Number::Timer0));
-    lstimer0
+    let mut channel0 = ledc.channel(channel::Number::Channel0, peripherals.GPIO2);
+
+    let timer_ok = lstimer0
         .configure(timer::config::Config {
             duty: timer::config::Duty::Duty8Bit,
             clock_source: timer::LSClockSource::APBClk,
             frequency: Rate::from_khz(1),
         })
-        .unwrap();
+        .is_ok();
 
-    let mut channel0 = ledc.channel(channel::Number::Channel0, peripherals.GPIO2);
-    channel0
-        .configure(channel::config::Config {
-            timer: lstimer0,
-            duty_pct: 5,
-            drive_mode: DriveMode::PushPull,
-        })
-        .unwrap();
+    let channel_ok = if timer_ok {
+        channel0
+            .configure(channel::config::Config {
+                timer: lstimer0,
+                duty_pct: 5,
+                drive_mode: DriveMode::PushPull,
+            })
+            .is_ok()
+    } else {
+        false
+    };
 
-    // Spawn LED task
-    spawner.spawn(led_pwm_task(channel0)).unwrap();
+    if channel_ok {
+        info!("LED hardware configured! Spawning task...");
+        if let Err(e) = spawner.spawn(led_pwm_task(channel0)) {
+            error!("Failed to spawn LED task: {}", defmt::Debug2Format(&e));
+        }
+    } else {
+        error!("LED hardware setup failed, skipping LED task.");
+    }
 
     // Initialize Radio controller
     info!("Initializing Radio controller...");
-    static RADIO_CONTROLLER: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
-    let radio_controller = RADIO_CONTROLLER.init(init().unwrap());
+    let radio_controller = with_retry("Radio controller", || {
+        init().map(|controller| RADIO_CONTROLLER.init(controller))
+    })
+    .await;
 
     // Setup WiFi and network stack
-    let stack = network::setup_wifi(radio_controller, peripherals.WIFI, &spawner).await;
+    let network_stack = network::setup_wifi(radio_controller, peripherals.WIFI, &spawner).await;
 
     // Setup 433MHz radio
     info!("Setting up CC1101 radio...");
-    let radio = Cc1101Radio::new(
+    let mut r433 = Cc1101Radio::new(
         peripherals.SPI2,
         peripherals.GPIO18,
         peripherals.GPIO23,
@@ -117,8 +144,9 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO5,
         peripherals.GPIO4,
         peripherals.GPIO15,
-    )
-    .expect("Failed to initialize CC1101");
+    );
+
+    with_retry("CC1101 radio", || r433.init()).await;
     info!("CC1101 setup complete!");
 
     // Setup I2C for display (GPIO21 = SDA, GPIO22 = SCL)
@@ -127,7 +155,7 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.I2C0,
         I2cConfig::default().with_frequency(Rate::from_khz(400)),
     )
-    .unwrap()
+    .expect("Failed to create I2C bus")
     .with_sda(peripherals.GPIO21)
     .with_scl(peripherals.GPIO22);
 
@@ -152,18 +180,29 @@ async fn main(spawner: Spawner) -> ! {
     let ui_input = EC11RotaryEncoderInput::new(rotary_a, rotary_b, rotary_sw);
 
     // Spawn tasks
-    spawner.spawn(radio_433_rx_task(radio)).unwrap();
     spawner
-        .spawn(mqtt_task(stack, READING_WATCH.receiver().unwrap()))
-        .unwrap();
+        .spawn(radio_433_rx_task(r433))
+        .expect("Failed to spawn radio task");
+    spawner
+        .spawn(mqtt_task(
+            network_stack,
+            READING_WATCH
+                .receiver()
+                .expect("Failed to get reading receiver"),
+        ))
+        .expect("Failed to spawn mqtt task");
     spawner
         .spawn(display_task(
             display,
-            READING_WATCH.receiver().unwrap(),
+            READING_WATCH
+                .receiver()
+                .expect("Failed to get reading receiver"),
             ui_input,
         ))
-        .unwrap();
-    spawner.spawn(time_sync_task(stack)).unwrap();
+        .expect("Failed to spawn display task");
+    spawner
+        .spawn(time_sync_task(network_stack))
+        .expect("Failed to spawn time sync task");
 
     loop {
         core::future::pending::<()>().await;
@@ -185,138 +224,132 @@ async fn led_pwm_task(channel: LedcChannel<'static, LowSpeed>) {
     }
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 async fn wait_fade_done(channel: &LedcChannel<'static, LowSpeed>, duration_ms: u16) {
     while channel.is_duty_fade_running() {
-        Timer::after(Duration::from_millis(duration_ms as u64)).await;
+        Timer::after(Duration::from_millis(u64::from(duration_ms))).await;
     }
 }
 
+/// Sets up the MQTT client, including TCP connection and MQTT broker handshake.
+async fn establish_mqtt_session<'a>(
+    network_stack: embassy_net::Stack<'static>,
+    rx_buffer: &'a mut [u8],
+    tx_buffer: &'a mut [u8],
+    client: &mut Client<'a, TcpSocket<'a>, BumpBuffer<'a>, 4, 2, 2>,
+) -> Result<(), ()> {
+    // Wait for network to be up
+    network_stack.wait_config_up().await;
+
+    info!("MQTT: Connecting to broker...");
+
+    let mut socket = TcpSocket::new(network_stack, rx_buffer, tx_buffer);
+    socket.set_timeout(Some(Duration::from_secs(120)));
+    socket.set_nagle_enabled(false);
+
+    let broker_addr = (
+        Ipv4Address::new(
+            MQTT_BROKER_IP[0],
+            MQTT_BROKER_IP[1],
+            MQTT_BROKER_IP[2],
+            MQTT_BROKER_IP[3],
+        ),
+        MQTT_BROKER_PORT,
+    );
+
+    if let Err(e) = socket.connect(broker_addr).await {
+        warn!("MQTT: TCP connect failed: {:?}", e);
+        return Err(());
+    }
+
+    info!("MQTT: TCP connected");
+
+    let lwt = WillOptions {
+        will_qos: QoS::AtMostOnce,
+        will_retain: true,
+        will_topic: MqttString::try_from("sensors/rubicson/status").map_err(|_| ())?,
+        will_payload: MqttBinary::try_from(b"offline" as &[u8]).map_err(|_| ())?,
+        will_delay_interval: 0,
+        is_payload_utf8: true,
+        message_expiry_interval: None,
+        content_type: None,
+        response_topic: None,
+        correlation_data: None,
+    };
+
+    let connect_options = ConnectOptions {
+        clean_start: true,
+        keep_alive: KeepAlive::Seconds(120),
+        session_expiry_interval: SessionExpiryInterval::EndOnDisconnect,
+        user_name: None,
+        password: None,
+        will: Some(lwt),
+    };
+    let client_id = MqttString::try_from(MQTT_CLIENT_ID).ok();
+
+    if let Err(e) = client.connect(socket, &connect_options, client_id).await {
+        warn!("MQTT: Broker connect failed: {:?}", defmt::Debug2Format(&e));
+        return Err(());
+    }
+
+    info!("MQTT: Connected to broker!");
+    unsafe { client.buffer().reset() };
+
+    // Publish "online" status message
+    let status_topic = MqttString::try_from("sensors/rubicson/status").map_err(|_| ())?;
+    let status_topic_name = unsafe { TopicName::new_unchecked(status_topic) };
+    let online_options = PublicationOptions {
+        retain: true,
+        topic: status_topic_name,
+        qos: QoS::AtMostOnce,
+    };
+    if let Err(e) = client
+        .publish(&online_options, Bytes::from(b"online" as &[u8]))
+        .await
+    {
+        warn!(
+            "MQTT: Failed to publish online status: {:?}",
+            defmt::Debug2Format(&e)
+        );
+        return Err(());
+    }
+
+    info!("MQTT: Published online status");
+    Ok(())
+}
+
 #[embassy_executor::task]
+#[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn mqtt_task(
-    stack: &'static embassy_net::Stack<'static>,
+    network_stack: embassy_net::Stack<'static>,
     mut receiver: embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, RadioReading, 2>,
 ) {
     // Backoff parameters
     const MIN_BACKOFF_SECS: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
+    const PING_INTERVAL_SECS: u64 = 90; // Ping every 90s (keepalive is 120s)
     let mut backoff_secs = MIN_BACKOFF_SECS;
 
     loop {
-        // Wait for network to be up
-        stack.wait_config_up().await;
+        // Create buffers on the stack for this session
+        let mut rx_buf = [0u8; 1024];
+        let mut tx_buf = [0u8; 1024];
+        let mut mqtt_buf = [0u8; 1024];
+        let mut mqtt_buffer = BumpBuffer::new(&mut mqtt_buf);
+        let mut client = Client::new(&mut mqtt_buffer);
 
-        info!("MQTT: Connecting to broker...");
-
-        // Create socket buffers
-        let mut rx_buffer = [0u8; 1024];
-        let mut tx_buffer = [0u8; 1024];
-
-        let mut socket = TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_secs(120))); // 2 minute timeout (longer than keepalive)
-        socket.set_nagle_enabled(false); // Disable Nagle for immediate sends
-
-        let broker_addr = (
-            Ipv4Address::new(
-                MQTT_BROKER_IP[0],
-                MQTT_BROKER_IP[1],
-                MQTT_BROKER_IP[2],
-                MQTT_BROKER_IP[3],
-            ),
-            MQTT_BROKER_PORT,
-        );
-
-        if let Err(e) = socket.connect(broker_addr).await {
-            warn!(
-                "MQTT: TCP connect failed: {:?}, retry in {}s",
-                e, backoff_secs
-            );
+        if establish_mqtt_session(network_stack, &mut rx_buf, &mut tx_buf, &mut client)
+            .await
+            .is_err()
+        {
             Timer::after(Duration::from_secs(backoff_secs)).await;
             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
             continue;
         }
 
-        info!("MQTT: TCP connected");
-
-        // Create MQTT client with bump buffer (larger for MQTT v5 packets)
-        let mut mqtt_buffer = [0u8; 1024];
-        let mut buffer = BumpBuffer::new(&mut mqtt_buffer);
-
-        let mut client: Client<'_, _, _, 4, 2, 2> = Client::new(&mut buffer);
-
-        // Connect to broker with Last Will and Testament
-        let lwt = WillOptions {
-            will_qos: QoS::AtMostOnce,
-            will_retain: true,
-            will_topic: MqttString::try_from("sensors/rubicson/status").unwrap(),
-            will_payload: MqttBinary::try_from(b"offline" as &[u8]).unwrap(),
-            will_delay_interval: 0,
-            is_payload_utf8: true,
-            message_expiry_interval: None,
-            content_type: None,
-            response_topic: None,
-            correlation_data: None,
-        };
-
-        let connect_options = ConnectOptions {
-            clean_start: true,
-            keep_alive: KeepAlive::Seconds(120),
-            session_expiry_interval: SessionExpiryInterval::EndOnDisconnect,
-            user_name: None,
-            password: None,
-            will: Some(lwt),
-        };
-        let client_id = MqttString::try_from(MQTT_CLIENT_ID).ok();
-
-        match client.connect(socket, &connect_options, client_id).await {
-            Ok(connect_info) => {
-                info!(
-                    "MQTT: Connected to broker! Session present: {}",
-                    connect_info.session_present
-                );
-                backoff_secs = MIN_BACKOFF_SECS; // Reset backoff on successful connect
-
-                // Reset bump buffer after connect so it can be reused for publish
-                // Safety: connect is complete, buffer contents no longer needed
-                unsafe { client.buffer().reset() };
-            }
-            Err(e) => {
-                warn!(
-                    "MQTT: Broker connect failed: {:?}, retry in {}s",
-                    defmt::Debug2Format(&e),
-                    backoff_secs
-                );
-                Timer::after(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                continue;
-            }
-        }
-
-        // Publish loop with periodic pings
-        const PING_INTERVAL_SECS: u64 = 90; // Ping every 90s (keepalive is 120s)
-        let mut last_activity = Instant::now();
-
-        // Publish "online" status message
-        unsafe { client.buffer().reset() };
-        let status_topic = MqttString::try_from("sensors/rubicson/status").unwrap();
-        let status_topic_name = unsafe { TopicName::new_unchecked(status_topic) };
-        let online_options = PublicationOptions {
-            retain: true,
-            topic: status_topic_name,
-            qos: QoS::AtMostOnce,
-        };
-        if let Err(e) = client
-            .publish(&online_options, Bytes::from(b"online" as &[u8]))
-            .await
-        {
-            warn!(
-                "MQTT: Failed to publish online status: {:?}",
-                defmt::Debug2Format(&e)
-            );
-        } else {
-            info!("MQTT: Published online status");
-        }
-
+        backoff_secs = MIN_BACKOFF_SECS;
         info!("MQTT: Ready");
+        let mut last_activity = Instant::now();
 
         loop {
             // Wait for either a reading or ping timeout
@@ -410,7 +443,7 @@ async fn mqtt_task(
 
                     info!("MQTT: Publish successful!");
                 }
-                Either::Second(_) => {
+                Either::Second(()) => {
                     // Ping timeout - send keepalive
                     info!("MQTT: Sending periodic ping");
                     unsafe { client.buffer().reset() };
@@ -436,12 +469,13 @@ async fn mqtt_task(
 
 /// Time sync task - syncs time from NTP server
 #[embassy_executor::task]
-async fn time_sync_task(stack: &'static embassy_net::Stack<'static>) {
+async fn time_sync_task(stack: embassy_net::Stack<'static>) {
     time_sync::time_sync_loop(stack).await;
 }
 
 /// Display task - updates OLED when new readings arrive
 #[embassy_executor::task]
+#[allow(clippy::too_many_lines, clippy::expect_used)]
 async fn display_task(
     mut display: Sh1106Display<I2c<'static, Blocking>>,
     mut receiver: embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, RadioReading, 2>,
@@ -450,19 +484,13 @@ async fn display_task(
     info!("Display task started");
 
     // Get a receiver for time updates
-    let mut time_receiver = TIME_WATCH.receiver().unwrap();
+    let mut time_receiver = TIME_WATCH.receiver().expect("Failed to get time receiver");
 
     // Show waiting message
     if display.show_status("Waiting...").is_err() {
         error!("Display: Failed to show status");
     }
 
-    #[derive(Clone, Copy)]
-    enum DisplayState {
-        Main,
-        Radio,
-        Settings { nav_index: u8, editing: bool },
-    }
     let mut state = DisplayState::Main;
     let mut last_reading: Option<RadioReading> = None;
 
@@ -493,16 +521,14 @@ async fn display_task(
                 // Handle UI events based on current state
                 state = match state {
                     DisplayState::Main => match event {
-                        UiEvent::NextScreen => DisplayState::Radio,
-                        UiEvent::PrevScreen => DisplayState::Radio,
+                        UiEvent::NextScreen | UiEvent::PrevScreen => DisplayState::Radio,
                         UiEvent::Select => DisplayState::Settings {
                             nav_index: 0,
                             editing: false,
                         },
                     },
                     DisplayState::Radio => match event {
-                        UiEvent::NextScreen => DisplayState::Main,
-                        UiEvent::PrevScreen => DisplayState::Main,
+                        UiEvent::NextScreen | UiEvent::PrevScreen => DisplayState::Main,
                         UiEvent::Select => DisplayState::Settings {
                             nav_index: 0,
                             editing: false,
@@ -637,8 +663,7 @@ async fn display_task(
                 let rssi = last_reading.as_ref().map(|r| r.rssi);
                 let det_threshold = last_reading
                     .as_ref()
-                    .map(|r| r.detection_threshold)
-                    .unwrap_or(pending_threshold);
+                    .map_or(pending_threshold, |r| r.detection_threshold);
                 let _ = display.show_radio_info(rssi, det_threshold);
             }
             DisplayState::Settings { nav_index, editing } => {
@@ -654,6 +679,7 @@ async fn display_task(
 }
 
 #[embassy_executor::task]
+#[allow(clippy::expect_used)]
 async fn radio_433_rx_task(mut radio: Cc1101Radio) {
     info!("Radio 433 RX task started");
 
@@ -676,12 +702,9 @@ async fn radio_433_rx_task(mut radio: Cc1101Radio) {
     }
 
     // Take ownership of the data pin for pulse capture
-    let data_pin = match radio.take_data_pin() {
-        Some(pin) => pin,
-        None => {
-            error!("Data pin already taken");
-            return;
-        }
+    let Some(data_pin) = radio.take_data_pin() else {
+        error!("Data pin already taken");
+        return;
     };
 
     let data_pin_initial = data_pin.is_high();
@@ -712,8 +735,9 @@ async fn radio_433_rx_task(mut radio: Cc1101Radio) {
 
     info!("Starting pulse capture...");
 
-    use esp32_rust_project::pulse_capture::PulseCapture;
-    let settings_receiver = RADIO_SETTINGS_WATCH.receiver().unwrap();
+    let settings_receiver = RADIO_SETTINGS_WATCH
+        .receiver()
+        .expect("Failed to get settings receiver");
     let mut capture = PulseCapture::new(
         data_pin,
         &mut radio,

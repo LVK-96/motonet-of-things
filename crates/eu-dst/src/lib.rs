@@ -72,6 +72,7 @@ impl Timezone {
     #[must_use]
     pub fn to_local_hms(&self, unix_secs: u64) -> (u32, u32, u32) {
         let offset = self.offset_secs(unix_secs);
+        #[allow(clippy::cast_sign_loss)]
         let local_secs = unix_secs.wrapping_add(offset as u64);
         let secs_today = local_secs % 86400;
         let hours = (secs_today / 3600) as u32;

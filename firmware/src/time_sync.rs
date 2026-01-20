@@ -30,6 +30,7 @@ pub struct TimeReference {
 
 impl TimeReference {
     /// Get the current Unix timestamp based on the stored reference
+    #[must_use]
     pub fn now_unix_secs(&self) -> u64 {
         let elapsed = self.captured_at.elapsed().as_secs();
         self.unix_secs + elapsed
@@ -40,7 +41,7 @@ impl TimeReference {
         use core::fmt::Write;
         let secs = self.now_unix_secs();
         let (hours, minutes, seconds) = TIMEZONE.to_local_hms(secs);
-        let _ = write!(buf, "{:02}:{:02}:{:02}", hours, minutes, seconds);
+        let _ = write!(buf, "{hours:02}:{minutes:02}:{seconds:02}");
     }
 }
 
@@ -57,9 +58,11 @@ struct EmbassyTimestampGen {
 impl EmbassyTimestampGen {
     fn new() -> Self {
         let now = Instant::now();
+        #[allow(clippy::cast_possible_truncation)]
+        let start_micros = (now.as_micros() % 1_000_000) as u32;
         Self {
             start_secs: now.as_secs(),
-            start_micros: (now.as_micros() % 1_000_000) as u32,
+            start_micros,
         }
     }
 }
@@ -68,7 +71,9 @@ impl NtpTimestampGenerator for EmbassyTimestampGen {
     fn init(&mut self) {
         let now = Instant::now();
         self.start_secs = now.as_secs();
-        self.start_micros = (now.as_micros() % 1_000_000) as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        let micros = (now.as_micros() % 1_000_000) as u32;
+        self.start_micros = micros;
     }
 
     fn timestamp_sec(&self) -> u64 {
@@ -76,13 +81,14 @@ impl NtpTimestampGenerator for EmbassyTimestampGen {
     }
 
     fn timestamp_subsec_micros(&self) -> u32 {
+        #[allow(clippy::cast_possible_truncation)]
         let now_micros = (Instant::now().as_micros() % 1_000_000) as u32;
         now_micros.wrapping_sub(self.start_micros)
     }
 }
 
 /// Perform a single NTP time sync
-async fn sync_time_once(stack: &Stack<'static>) -> Option<TimeReference> {
+async fn sync_time_once(stack: Stack<'static>) -> Option<TimeReference> {
     // Wait for network to be ready
     stack.wait_config_up().await;
 
@@ -93,7 +99,7 @@ async fn sync_time_once(stack: &Stack<'static>) -> Option<TimeReference> {
     let mut tx_buffer = [0u8; 256];
 
     let mut socket = UdpSocket::new(
-        *stack,
+        stack,
         &mut rx_meta,
         &mut rx_buffer,
         &mut tx_meta,
@@ -118,7 +124,7 @@ async fn sync_time_once(stack: &Stack<'static>) -> Option<TimeReference> {
     match sntpc::get_time(server_addr, &socket_wrapper, context).await {
         Ok(result) => {
             // sntpc returns Unix timestamp directly (seconds since 1970-01-01)
-            let unix_secs = result.seconds as u64;
+            let unix_secs = u64::from(result.seconds);
 
             defmt::info!("NTP: Synced! unix_secs={}", unix_secs);
 
@@ -135,7 +141,7 @@ async fn sync_time_once(stack: &Stack<'static>) -> Option<TimeReference> {
 }
 
 /// NTP time sync task - syncs time periodically
-pub async fn time_sync_loop(stack: &'static Stack<'static>) {
+pub async fn time_sync_loop(stack: Stack<'static>) {
     defmt::info!("NTP: Time sync task started");
 
     let sender = TIME_WATCH.sender();

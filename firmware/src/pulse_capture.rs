@@ -185,7 +185,8 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                 }
 
                 let gap_end = Instant::now();
-                let gap_us = gap_end.duration_since(gap_start).as_micros() as u32;
+                let gap_us = u32::try_from(gap_end.duration_since(gap_start).as_micros())
+                    .unwrap_or(u32::MAX);
 
                 // Store gap if buffer not full
                 if gap_count < gap_buffer.len() {

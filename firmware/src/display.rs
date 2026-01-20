@@ -33,6 +33,10 @@ pub trait Display {
     fn clear(&mut self) -> Result<(), DisplayError>;
 
     /// Show temperature, sensor ID, channel, battery status, and optional timestamp
+    ///
+    /// # Errors
+    ///
+    /// Returns `DisplayError` if the operation fails
     fn show_temperature(
         &mut self,
         temperature_c: f32,
@@ -80,7 +84,7 @@ pub trait Display {
     ///
     /// # Arguments
     ///
-    /// * `nav_index` - Index of currently navigated menu item (0=threshold, 1=magn_target, 2=save)
+    /// * `nav_index` - Index of currently navigated menu item (0=threshold, `1=magn_target`, 2=save)
     /// * `editing` - Whether we are editing the currently selected item
     /// * `detection_threshold` - Current detection threshold value in dB
     /// * `magn_target` - Current magnitude target level (0-7)
@@ -107,6 +111,11 @@ where
     I2C: embedded_hal::i2c::I2c<Error = E>,
     E: core::fmt::Debug,
 {
+    /// Initialize a new SH1106 display
+    ///
+    /// # Errors
+    ///
+    /// Returns `DisplayError` if the I2C operation fails
     pub fn new(i2c: I2C) -> Result<Self, DisplayError> {
         // The display module listens @0x3C
         let i2c_interface = I2cInterface::new(i2c, 0x3C);
@@ -144,7 +153,7 @@ where
 
         // Large temperature display in center
         let mut temp_str: String<16> = String::new();
-        let _ = write!(temp_str, "{:.1}C", temperature_c);
+        let _ = write!(temp_str, "{temperature_c:.1}C");
 
         let style_large = MonoTextStyle::new(&PROFONT_24_POINT, BinaryColor::On);
         Text::with_alignment(
@@ -160,7 +169,7 @@ where
         let style_small = MonoTextStyle::new(&PROFONT_10_POINT, BinaryColor::On);
 
         let mut info_str: String<32> = String::new();
-        let _ = write!(info_str, "S{} Ch{}", sensor_id, channel);
+        let _ = write!(info_str, "S{sensor_id} Ch{channel}");
         Text::with_alignment(
             info_str.as_str(),
             Point::new(4, 10),
@@ -233,7 +242,7 @@ where
 
             // RSSI value (shortened to fit screen)
             let mut rssi_str: String<20> = String::new();
-            let _ = write!(rssi_str, "RSSI: {}dBm", rssi_val);
+            let _ = write!(rssi_str, "RSSI: {rssi_val}dBm");
             Text::with_alignment(
                 rssi_str.as_str(),
                 Point::new(64, 30),
@@ -267,16 +276,21 @@ where
 
         // Hamburger menu icon (settings indicator) - bottom center
         // Draw 3 horizontal lines
-        let menu_center_x = 64;
-        let menu_top_y = 52;
+        let menu_center_x = 64i32;
+        let menu_top_y = 52i32;
         let line_width = 14u32;
         let line_height = 2u32;
         let line_spacing = 4i32;
         let style_filled = PrimitiveStyle::with_fill(BinaryColor::On);
 
+        // Safe: line_width/2 = 7, fits in i32
+        #[allow(clippy::cast_possible_wrap)]
+        let half_width = (line_width / 2) as i32;
+        let menu_x = menu_center_x - half_width;
+
         // Top line
         Rectangle::new(
-            Point::new(menu_center_x - (line_width as i32 / 2), menu_top_y),
+            Point::new(menu_x, menu_top_y),
             Size::new(line_width, line_height),
         )
         .into_styled(style_filled)
@@ -285,10 +299,7 @@ where
 
         // Middle line
         Rectangle::new(
-            Point::new(
-                menu_center_x - (line_width as i32 / 2),
-                menu_top_y + line_spacing,
-            ),
+            Point::new(menu_x, menu_top_y + line_spacing),
             Size::new(line_width, line_height),
         )
         .into_styled(style_filled)
@@ -297,10 +308,7 @@ where
 
         // Bottom line
         Rectangle::new(
-            Point::new(
-                menu_center_x - (line_width as i32 / 2),
-                menu_top_y + line_spacing * 2,
-            ),
+            Point::new(menu_x, menu_top_y + line_spacing * 2),
             Size::new(line_width, line_height),
         )
         .into_styled(style_filled)
@@ -354,6 +362,7 @@ where
         ];
 
         for (i, (label, value_unit)) in items.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let y = 28 + (i as i32 * 12);
             let is_nav = i == nav_index as usize;
             let is_editing = is_nav && editing && value_unit.is_some();
@@ -365,7 +374,9 @@ where
 
             // Draw underline under label if navigating to this item (not editing)
             if is_nav && !editing {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 let label_width = (label.len() as i32) * 6; // Approximate char width for PROFONT_10
+                #[allow(clippy::cast_sign_loss)]
                 Rectangle::new(Point::new(8, y + 2), Size::new(label_width as u32, 1))
                     .into_styled(style_filled)
                     .draw(self.driver.get_mut_canvas())
@@ -375,7 +386,7 @@ where
             // Draw value with unit if present
             if let Some((val, unit)) = value_unit {
                 let mut value_str: String<12> = String::new();
-                let _ = write!(value_str, "{}{}", val, unit);
+                let _ = write!(value_str, "{val}{unit}");
                 let value_x = 120;
                 Text::with_alignment(
                     value_str.as_str(),
@@ -388,7 +399,9 @@ where
 
                 // Draw underline under value if editing this item
                 if is_editing {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     let val_width = (value_str.len() as i32) * 6;
+                    #[allow(clippy::cast_sign_loss)]
                     Rectangle::new(
                         Point::new(value_x - val_width, y + 2),
                         Size::new(val_width as u32, 1),
@@ -404,6 +417,11 @@ where
     }
 }
 
+/// Setup SH1106 display
+///
+/// # Errors
+///
+/// Returns `DisplayError` if initialization fails
 pub fn setup_sh1106_display<I2C>(i2c: I2C) -> Result<Sh1106Display<I2C>, DisplayError>
 where
     I2C: embedded_hal::i2c::I2c,

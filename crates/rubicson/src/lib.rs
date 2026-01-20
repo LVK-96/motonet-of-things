@@ -29,6 +29,11 @@ const BITS_IN_PACKET: usize = 36;
 const BYTES_IN_PACKET: usize = BITS_IN_PACKET.div_ceil(8); // Roundup division
 const MAX_PACKETS: usize = 12; // Support up to 12 packets in burst
 
+#[allow(clippy::cast_possible_wrap)]
+fn sign_extend_nth_bit(value: u16, n: u8) -> i16 {
+    ((value as i16) << (16 - n)) >> (16 - n)
+}
+
 fn decode_gap(gap: u32) -> Result<u8, BreakResetIgnore> {
     // Short pulse ~1000us, the sensor sends a short pulse ~500us right before the break
     const ZERO_LOWER_LIMIT: u32 = 750;
@@ -181,8 +186,8 @@ fn decode_rubicson(bits: &[u8]) -> Result<RubicsonReading, DecodeError> {
     // mask b[1] to get only the lower nibble (temp high bits)
     let temp_hi4 = u16::from(b[1] & 0x0F);
     let combined = (temp_hi4 << 8) | u16::from(b[2]);
-    // Sign-extend from 12 bits to 16 bits
-    let temp_raw = ((combined as i16) << 4) >> 4;
+    // Sign-extend from 12th bit
+    let temp_raw = sign_extend_nth_bit(combined, 12);
     let temp_c = f32::from(temp_raw) / 10.0;
 
     Ok(RubicsonReading {
