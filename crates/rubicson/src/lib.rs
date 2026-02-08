@@ -150,8 +150,9 @@ where
         }
     }
 
-    // Final attempt to decode the last packet if we have 36 bits
-    if bit_index == BITS_IN_PACKET - 1 {
+    // Final attempt to decode the last packet if we have exactly 36 bits.
+    // `bit_index` is incremented after each added bit, so a full packet is 36.
+    if bit_index == BITS_IN_PACKET {
         let row_start_byte = bit_buffer_row * BYTES_IN_PACKET;
         let row_slice = &bit_buffer[row_start_byte..(row_start_byte + BYTES_IN_PACKET)];
         if let Ok(reading) = decode_rubicson(row_slice) {
@@ -456,6 +457,20 @@ mod tests {
         let (_valid_packet_idx, r) =
             decode_gaps_iter(gaps.into_iter()).expect("Decode iterator failed");
         assert_eq!(r.id, 12);
+        assert!((r.temperature_c - (-21.5)).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_decode_gaps_iter_without_trailing_break() {
+        let payload = build_payload(0x0C, 1, true, 0xF29);
+        let mut gaps = payload_to_gaps(&payload);
+        let _ = gaps.pop(); // Remove trailing break separator.
+
+        let (_valid_packet_idx, r) =
+            decode_gaps_iter(gaps.into_iter()).expect("Decode iterator without break failed");
+        assert_eq!(r.id, 12);
+        assert_eq!(r.channel, 1);
+        assert!(r.battery_ok);
         assert!((r.temperature_c - (-21.5)).abs() < 0.1);
     }
 
