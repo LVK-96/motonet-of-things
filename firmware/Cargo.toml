@@ -13,6 +13,11 @@ test = false
 test = false
 doctest = false
 
+[features]
+default = ["pulse_rmt"]
+pulse_sw = []
+pulse_rmt = []
+
 [dependencies]
 rubicson = { path = "../crates/rubicson" }
 eu-dst = { path = "../crates/eu-dst" }

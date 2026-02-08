@@ -5,6 +5,7 @@ extern crate alloc;
 
 use core::fmt::Write;
 use defmt::{error, info, warn};
+
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_net::Ipv4Address;
@@ -12,6 +13,9 @@ use embassy_net::tcp::TcpSocket;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::watch::Watch;
 use embassy_time::{Duration, Instant, Timer};
+
+#[cfg(feature = "pulse_rmt")]
+use esp_hal::Async;
 use esp_hal::Blocking;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{DriveMode, Input, InputConfig, Pull};
@@ -22,8 +26,11 @@ use esp_hal::ledc::{
     timer::{self, TimerIFace},
 };
 use esp_hal::peripherals::Peripherals;
+#[cfg(feature = "pulse_rmt")]
+use esp_hal::rmt::{Channel as RmtChannel, Rmt, Rx, RxChannelConfig, RxChannelCreator};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+
 use esp_println as _;
 use esp_radio::init;
 use rust_mqtt::Bytes;
@@ -149,6 +156,22 @@ async fn main(spawner: Spawner) -> ! {
     with_retry("CC1101 radio", || r433.init()).await;
     info!("CC1101 setup complete!");
 
+    #[cfg(feature = "pulse_rmt")]
+    let rmt_rx = {
+        let data_pin = r433.take_data_pin().expect("Failed to take radio data pin");
+        let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80))
+            .expect("Failed to initialize RMT")
+            .into_async();
+        let rmt_rx_cfg = RxChannelConfig::default()
+            .with_clk_divider(80)
+            .with_filter_threshold(50)
+            .with_idle_threshold(5000)
+            .with_memsize(4);
+        rmt.channel0
+            .configure_rx(data_pin, rmt_rx_cfg)
+            .expect("Failed to configure RMT RX channel")
+    };
+
     // Setup I2C for display (GPIO21 = SDA, GPIO22 = SCL)
     info!("Setting up I2C display...");
     let i2c = I2c::new(
@@ -180,8 +203,13 @@ async fn main(spawner: Spawner) -> ! {
     let ui_input = EC11RotaryEncoderInput::new(rotary_a, rotary_b, rotary_sw);
 
     // Spawn tasks
+    #[cfg(feature = "pulse_sw")]
     spawner
         .spawn(radio_433_rx_task(r433))
+        .expect("Failed to spawn radio task");
+    #[cfg(feature = "pulse_rmt")]
+    spawner
+        .spawn(radio_433_rx_task(r433, rmt_rx))
         .expect("Failed to spawn radio task");
     spawner
         .spawn(mqtt_task(
@@ -473,6 +501,46 @@ async fn time_sync_task(stack: embassy_net::Stack<'static>) {
     time_sync::time_sync_loop(stack).await;
 }
 
+async fn prepare_radio_for_capture(radio: &mut Cc1101Radio) -> Result<(), ()> {
+    info!("Radio 433 RX task started");
+
+    match radio.get_hw_info().await {
+        Ok((part, version)) => {
+            info!(
+                "Radio detected: Part=0x{:02X}, Version=0x{:02X}",
+                part, version
+            );
+        }
+        Err(e) => {
+            error!("Radio not responding: {:?}", e);
+            return Err(());
+        }
+    }
+
+    if let Err(e) = radio.set_receive_mode().await {
+        error!("Failed to set receive mode: {:?}", e);
+        return Err(());
+    }
+
+    info!("Measuring RSSI on 433.92 MHz for 3s...");
+    let mut min_rssi: i16 = 0;
+    let mut max_rssi: i16 = -128;
+    for _ in 0..60 {
+        if let Ok(rssi) = radio.get_rssi_dbm().await {
+            if rssi < min_rssi {
+                min_rssi = rssi;
+            }
+            if rssi > max_rssi {
+                max_rssi = rssi;
+            }
+        }
+        Timer::after(Duration::from_millis(50)).await;
+    }
+    info!("RSSI: min={} max={} dBm", min_rssi, max_rssi);
+    info!("Starting pulse capture...");
+    Ok(())
+}
+
 /// Display task - updates OLED when new readings arrive
 #[embassy_executor::task]
 #[allow(clippy::too_many_lines, clippy::expect_used)]
@@ -678,26 +746,11 @@ async fn display_task(
     }
 }
 
+#[cfg(feature = "pulse_sw")]
 #[embassy_executor::task]
 #[allow(clippy::expect_used)]
 async fn radio_433_rx_task(mut radio: Cc1101Radio) {
-    info!("Radio 433 RX task started");
-
-    match radio.get_hw_info().await {
-        Ok((part, version)) => {
-            info!(
-                "Radio detected: Part=0x{:02X}, Version=0x{:02X}",
-                part, version
-            );
-        }
-        Err(e) => {
-            error!("Radio not responding: {:?}", e);
-            return;
-        }
-    }
-
-    if let Err(e) = radio.set_receive_mode().await {
-        error!("Failed to set receive mode: {:?}", e);
+    if prepare_radio_for_capture(&mut radio).await.is_err() {
         return;
     }
 
@@ -707,39 +760,31 @@ async fn radio_433_rx_task(mut radio: Cc1101Radio) {
         return;
     };
 
-    let data_pin_initial = data_pin.is_high();
-    info!(
-        "Radio in receive mode, data pin initial state: {}",
-        data_pin_initial
-    );
-
-    if data_pin_initial {
-        info!("Note: Data pin is high at startup. This is normal if there is RF noise.");
-    }
-
-    info!("Measuring RSSI on 433.92 MHz for 3s...");
-    let mut min_rssi: i16 = 0;
-    let mut max_rssi: i16 = -128;
-    for _ in 0..60 {
-        if let Ok(rssi) = radio.get_rssi_dbm().await {
-            if rssi < min_rssi {
-                min_rssi = rssi;
-            }
-            if rssi > max_rssi {
-                max_rssi = rssi;
-            }
-        }
-        Timer::after(Duration::from_millis(50)).await;
-    }
-    info!("RSSI: min={} max={} dBm", min_rssi, max_rssi);
-
-    info!("Starting pulse capture...");
-
     let settings_receiver = RADIO_SETTINGS_WATCH
         .receiver()
         .expect("Failed to get settings receiver");
     let mut capture = PulseCapture::new(
         data_pin,
+        &mut radio,
+        READING_WATCH.sender(),
+        settings_receiver,
+    );
+    capture.run().await;
+}
+
+#[cfg(feature = "pulse_rmt")]
+#[embassy_executor::task]
+#[allow(clippy::expect_used)]
+async fn radio_433_rx_task(mut radio: Cc1101Radio, rmt_rx: RmtChannel<'static, Async, Rx>) {
+    if prepare_radio_for_capture(&mut radio).await.is_err() {
+        return;
+    }
+
+    let settings_receiver = RADIO_SETTINGS_WATCH
+        .receiver()
+        .expect("Failed to get settings receiver");
+    let mut capture = PulseCapture::new(
+        rmt_rx,
         &mut radio,
         READING_WATCH.sender(),
         settings_receiver,

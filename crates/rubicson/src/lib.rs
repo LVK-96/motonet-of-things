@@ -90,10 +90,28 @@ fn add_bit(buf: &mut [u8], index: usize, val: u8) {
 pub fn decode_gaps(
     pulses: &[u32],
 ) -> Result<(usize, RubicsonReading), [u8; BYTES_IN_PACKET * MAX_PACKETS]> {
+    decode_gaps_iter(pulses.iter().copied())
+}
+
+/// Decodes gap timings from any iterator into sensor readings.
+///
+/// This variant allows zero-allocation decoding from streaming/adapter-based
+/// gap sources while preserving the same decode behavior as [`decode_gaps`].
+///
+/// # Errors
+///
+/// Returns `Err` if the provided gaps cannot be decoded into a valid Rubicson
+/// packet (invalid structure, CRC mismatch, or buffer/reset conditions).
+pub fn decode_gaps_iter<I>(
+    pulses: I,
+) -> Result<(usize, RubicsonReading), [u8; BYTES_IN_PACKET * MAX_PACKETS]>
+where
+    I: IntoIterator<Item = u32>,
+{
     let mut bit_buffer = [0u8; BYTES_IN_PACKET * MAX_PACKETS]; // Support up to 12 packets of 5 bytes
     let mut bit_index = 0;
     let mut bit_buffer_row = 0;
-    for &gap in pulses {
+    for gap in pulses {
         // Check if we've exceeded the buffer capacity
         if bit_buffer_row >= MAX_PACKETS {
             return Err(bit_buffer);
@@ -426,6 +444,17 @@ mod tests {
         gaps.extend_from_slice(&single_packet);
 
         let (_valid_packet_idx, r) = decode_gaps(&gaps).expect("Decode burst failed");
+        assert_eq!(r.id, 12);
+        assert!((r.temperature_c - (-21.5)).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_decode_gaps_iter() {
+        let payload = build_payload(0x0C, 1, true, 0xF29);
+        let gaps = payload_to_gaps(&payload);
+
+        let (_valid_packet_idx, r) =
+            decode_gaps_iter(gaps.into_iter()).expect("Decode iterator failed");
         assert_eq!(r.id, 12);
         assert!((r.temperature_c - (-21.5)).abs() < 0.1);
     }
