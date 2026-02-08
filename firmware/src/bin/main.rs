@@ -11,6 +11,7 @@ use embassy_futures::select::{Either, select};
 use embassy_net::Ipv4Address;
 use embassy_net::tcp::TcpSocket;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::watch::Watch;
 use embassy_time::{Duration, Instant, Timer};
 
@@ -59,8 +60,10 @@ enum DisplayState {
     Settings { nav_index: u8, editing: bool },
 }
 
-/// Watch for sharing readings with multiple consumers (MQTT + display)
+/// Watch for sharing latest readings with display/UI.
 static READING_WATCH: Watch<CriticalSectionRawMutex, RadioReading, 2> = Watch::new();
+/// Queue for MQTT so bursts don't collapse to only the newest reading.
+static MQTT_READING_CHANNEL: Channel<CriticalSectionRawMutex, RadioReading, 16> = Channel::new();
 
 /// Watch for sharing radio settings with the radio task
 static RADIO_SETTINGS_WATCH: Watch<CriticalSectionRawMutex, RadioSettings, 2> = Watch::new();
@@ -212,12 +215,7 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(radio_433_rx_task(r433, rmt_rx))
         .expect("Failed to spawn radio task");
     spawner
-        .spawn(mqtt_task(
-            network_stack,
-            READING_WATCH
-                .receiver()
-                .expect("Failed to get reading receiver"),
-        ))
+        .spawn(mqtt_task(network_stack, MQTT_READING_CHANNEL.receiver()))
         .expect("Failed to spawn mqtt task");
     spawner
         .spawn(display_task(
@@ -350,7 +348,7 @@ async fn establish_mqtt_session<'a>(
 #[allow(clippy::expect_used, clippy::too_many_lines)]
 async fn mqtt_task(
     network_stack: embassy_net::Stack<'static>,
-    mut receiver: embassy_sync::watch::Receiver<'static, CriticalSectionRawMutex, RadioReading, 2>,
+    receiver: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, RadioReading, 16>,
 ) {
     // Backoff parameters
     const MIN_BACKOFF_SECS: u64 = 1;
@@ -383,7 +381,7 @@ async fn mqtt_task(
             // Wait for either a reading or ping timeout
             let timeout = Duration::from_secs(PING_INTERVAL_SECS);
 
-            match select(receiver.changed(), Timer::after(timeout)).await {
+            match select(receiver.receive(), Timer::after(timeout)).await {
                 Either::First(reading) => {
                     // Got a reading - publish it
                     let time_since_last = last_activity.elapsed().as_secs();
@@ -767,6 +765,7 @@ async fn radio_433_rx_task(mut radio: Cc1101Radio) {
         data_pin,
         &mut radio,
         READING_WATCH.sender(),
+        MQTT_READING_CHANNEL.sender(),
         settings_receiver,
     );
     capture.run().await;
@@ -787,6 +786,7 @@ async fn radio_433_rx_task(mut radio: Cc1101Radio, rmt_rx: RmtChannel<'static, A
         rmt_rx,
         &mut radio,
         READING_WATCH.sender(),
+        MQTT_READING_CHANNEL.sender(),
         settings_receiver,
     );
     capture.run().await;

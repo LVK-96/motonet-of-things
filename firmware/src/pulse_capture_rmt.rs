@@ -1,6 +1,7 @@
 use defmt::{info, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::watch::{Receiver, Sender};
+use embassy_sync::channel::Sender as ChannelSender;
+use embassy_sync::watch::{Receiver, Sender as WatchSender};
 use esp_hal::Async;
 use esp_hal::gpio::Level;
 use esp_hal::rmt::{Channel as RmtChannel, PulseCode, Rx};
@@ -12,7 +13,8 @@ use crate::radio_433::Radio433;
 pub struct PulseCapture<'d, R: Radio433> {
     channel: RmtChannel<'d, Async, Rx>,
     radio: &'d mut R,
-    sender: Sender<'static, CriticalSectionRawMutex, RadioReading, 2>,
+    sender: WatchSender<'static, CriticalSectionRawMutex, RadioReading, 2>,
+    mqtt_sender: ChannelSender<'static, CriticalSectionRawMutex, RadioReading, 16>,
     settings_receiver: Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
 }
 
@@ -75,13 +77,15 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
     pub fn new(
         channel: RmtChannel<'d, Async, Rx>,
         radio: &'d mut R,
-        sender: Sender<'static, CriticalSectionRawMutex, RadioReading, 2>,
+        sender: WatchSender<'static, CriticalSectionRawMutex, RadioReading, 2>,
+        mqtt_sender: ChannelSender<'static, CriticalSectionRawMutex, RadioReading, 16>,
         settings_receiver: Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
     ) -> Self {
         Self {
             channel,
             radio,
             sender,
+            mqtt_sender,
             settings_receiver,
         }
     }
@@ -122,11 +126,13 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
 
                         info!("Decoded: {:?}, RSSI={}dBm", reading, rssi);
 
-                        self.sender.send(RadioReading {
+                        let radio_reading = RadioReading {
                             inner: reading,
                             rssi,
                             detection_threshold,
-                        });
+                        };
+                        self.sender.send(radio_reading);
+                        let _ = self.mqtt_sender.try_send(radio_reading);
                     }
                     Err(e) => {
                         info!("Decode failed: {:?}", e);

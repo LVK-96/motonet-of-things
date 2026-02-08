@@ -1,7 +1,8 @@
 use defmt::info;
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::watch::{Receiver, Sender};
+use embassy_sync::channel::Sender as ChannelSender;
+use embassy_sync::watch::{Receiver, Sender as WatchSender};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Input;
 
@@ -12,7 +13,8 @@ use crate::radio_433::Radio433;
 pub struct PulseCapture<'d, R: Radio433> {
     pin: Input<'d>,
     radio: &'d mut R,
-    sender: Sender<'static, CriticalSectionRawMutex, RadioReading, 2>,
+    sender: WatchSender<'static, CriticalSectionRawMutex, RadioReading, 2>,
+    mqtt_sender: ChannelSender<'static, CriticalSectionRawMutex, RadioReading, 16>,
     settings_receiver: Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
 }
 
@@ -23,13 +25,15 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
     pub fn new(
         pin: Input<'d>,
         radio: &'d mut R,
-        sender: Sender<'static, CriticalSectionRawMutex, RadioReading, 2>,
+        sender: WatchSender<'static, CriticalSectionRawMutex, RadioReading, 2>,
+        mqtt_sender: ChannelSender<'static, CriticalSectionRawMutex, RadioReading, 16>,
         settings_receiver: Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
     ) -> Self {
         Self {
             pin,
             radio,
             sender,
+            mqtt_sender,
             settings_receiver,
         }
     }
@@ -125,6 +129,7 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                             detection_threshold,
                         };
                         self.sender.send(radio_reading);
+                        let _ = self.mqtt_sender.try_send(radio_reading);
                     }
                     Err(e) => {
                         info!("Decode failed: {:?}", e);
