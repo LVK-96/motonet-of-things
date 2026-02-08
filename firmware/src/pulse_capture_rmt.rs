@@ -1,4 +1,4 @@
-use defmt::{info, warn};
+use defmt::{debug, info, trace, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender as ChannelSender;
 use embassy_sync::watch::{Receiver, Sender as WatchSender};
@@ -113,7 +113,7 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                 }),
             );
 
-            info!(
+            debug!(
                 "RMT capture complete: {} symbols -> {} low gaps",
                 symbol_count, gap_count
             );
@@ -124,7 +124,7 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                         let rssi = self.radio.get_rssi_dbm().await.unwrap_or(-128);
                         let detection_threshold = self.radio.get_detection_threshold();
 
-                        info!("Decoded: {:?}, RSSI={}dBm", reading, rssi);
+                        debug!("Decoded: {:?}, RSSI={}dBm", reading, rssi);
 
                         let radio_reading = RadioReading {
                             inner: reading,
@@ -135,11 +135,11 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                         let _ = self.mqtt_sender.try_send(radio_reading);
                     }
                     Err(e) => {
-                        info!("Decode failed: {:?}", e);
+                        trace!("Decode failed: {:?}", e);
                     }
                 }
             } else {
-                info!("Not enough gaps for decoding (need 36, got {})", gap_count);
+                trace!("Not enough gaps for decoding (need 36, got {})", gap_count);
             }
 
             apply_pending_settings(&mut *self.radio, &mut self.settings_receiver).await;

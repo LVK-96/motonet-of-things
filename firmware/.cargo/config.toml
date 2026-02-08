@@ -9,4 +9,6 @@ runner = "espflash flash --monitor --log-format defmt"
 build-std = ["core", "alloc"]
 
 [env]
-DEFMT_LOG = "info"
+# Production-friendly default. Override per run for development:
+# DEFMT_LOG=info|debug|trace cargo run --release
+DEFMT_LOG = "warn"

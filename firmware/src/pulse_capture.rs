@@ -1,4 +1,4 @@
-use defmt::{info, warn};
+use defmt::{debug, info, trace, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::watch::Receiver;
 
@@ -54,12 +54,12 @@ pub(crate) async fn apply_pending_settings<R: Radio433>(
 /// Dump gap buffer to logs for offline analysis.
 #[allow(dead_code)]
 pub(crate) fn dump_gaps(gaps: &[u32]) {
-    info!("=== GAP DUMP START ({} gaps) ===", gaps.len());
+    debug!("=== GAP DUMP START ({} gaps) ===", gaps.len());
     // Print 10 gaps per line for readability
     for chunk_start in (0..gaps.len()).step_by(10) {
         let chunk_end = (chunk_start + 10).min(gaps.len());
         match chunk_end - chunk_start {
-            10 => info!(
+            10 => trace!(
                 "{}: {} {} {} {} {} {} {} {} {} {}",
                 chunk_start,
                 gaps[chunk_start],
@@ -73,7 +73,7 @@ pub(crate) fn dump_gaps(gaps: &[u32]) {
                 gaps[chunk_start + 8],
                 gaps[chunk_start + 9]
             ),
-            9 => info!(
+            9 => trace!(
                 "{}: {} {} {} {} {} {} {} {} {}",
                 chunk_start,
                 gaps[chunk_start],
@@ -86,7 +86,7 @@ pub(crate) fn dump_gaps(gaps: &[u32]) {
                 gaps[chunk_start + 7],
                 gaps[chunk_start + 8]
             ),
-            8 => info!(
+            8 => trace!(
                 "{}: {} {} {} {} {} {} {} {}",
                 chunk_start,
                 gaps[chunk_start],
@@ -98,7 +98,7 @@ pub(crate) fn dump_gaps(gaps: &[u32]) {
                 gaps[chunk_start + 6],
                 gaps[chunk_start + 7]
             ),
-            7 => info!(
+            7 => trace!(
                 "{}: {} {} {} {} {} {} {}",
                 chunk_start,
                 gaps[chunk_start],
@@ -109,7 +109,7 @@ pub(crate) fn dump_gaps(gaps: &[u32]) {
                 gaps[chunk_start + 5],
                 gaps[chunk_start + 6]
             ),
-            6 => info!(
+            6 => trace!(
                 "{}: {} {} {} {} {} {}",
                 chunk_start,
                 gaps[chunk_start],
@@ -119,7 +119,7 @@ pub(crate) fn dump_gaps(gaps: &[u32]) {
                 gaps[chunk_start + 4],
                 gaps[chunk_start + 5]
             ),
-            5 => info!(
+            5 => trace!(
                 "{}: {} {} {} {} {}",
                 chunk_start,
                 gaps[chunk_start],
@@ -128,7 +128,7 @@ pub(crate) fn dump_gaps(gaps: &[u32]) {
                 gaps[chunk_start + 3],
                 gaps[chunk_start + 4]
             ),
-            4 => info!(
+            4 => trace!(
                 "{}: {} {} {} {}",
                 chunk_start,
                 gaps[chunk_start],
@@ -136,24 +136,24 @@ pub(crate) fn dump_gaps(gaps: &[u32]) {
                 gaps[chunk_start + 2],
                 gaps[chunk_start + 3]
             ),
-            3 => info!(
+            3 => trace!(
                 "{}: {} {} {}",
                 chunk_start,
                 gaps[chunk_start],
                 gaps[chunk_start + 1],
                 gaps[chunk_start + 2]
             ),
-            2 => info!(
+            2 => trace!(
                 "{}: {} {}",
                 chunk_start,
                 gaps[chunk_start],
                 gaps[chunk_start + 1]
             ),
-            1 => info!("{}: {}", chunk_start, gaps[chunk_start]),
+            1 => trace!("{}: {}", chunk_start, gaps[chunk_start]),
             _ => {}
         }
     }
-    info!("=== GAP DUMP END ===");
+    debug!("=== GAP DUMP END ===");
 }
 
 pub use backend::PulseCapture;

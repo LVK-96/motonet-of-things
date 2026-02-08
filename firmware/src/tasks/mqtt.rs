@@ -1,6 +1,6 @@
 use core::fmt::Write;
 
-use defmt::{info, warn};
+use defmt::{debug, info, trace, warn};
 use embassy_futures::select::{Either, select};
 use embassy_net::Ipv4Address;
 use embassy_net::tcp::TcpSocket;
@@ -145,11 +145,11 @@ pub async fn mqtt_task(
                 Either::First(reading) => {
                     // Got a reading - publish it
                     let time_since_last = last_activity.elapsed().as_secs();
-                    info!("MQTT: Got reading after {}s idle", time_since_last);
+                    debug!("MQTT: Got reading after {}s idle", time_since_last);
 
                     // Send a ping first if we've been idle for a while
                     if time_since_last > 10 {
-                        info!(
+                        debug!(
                             "MQTT: Sending ping before publish (idle {}s)",
                             time_since_last
                         );
@@ -198,7 +198,7 @@ pub async fn mqtt_task(
                         continue;
                     }
 
-                    info!(
+                    trace!(
                         "MQTT: Publishing to {} : {}",
                         topic.as_str(),
                         payload.as_str()
@@ -227,11 +227,11 @@ pub async fn mqtt_task(
                         break; // Break inner loop to reconnect
                     }
 
-                    info!("MQTT: Publish successful!");
+                    debug!("MQTT: Publish successful!");
                 }
                 Either::Second(()) => {
                     // Ping timeout - send keepalive
-                    info!("MQTT: Sending periodic ping");
+                    debug!("MQTT: Sending periodic ping");
                     unsafe { client.buffer().reset() };
 
                     if let Err(e) = client.ping().await {
@@ -241,7 +241,7 @@ pub async fn mqtt_task(
                         );
                         break;
                     }
-                    info!("MQTT: Ping sent successfully");
+                    debug!("MQTT: Ping sent successfully");
                     last_activity = Instant::now();
                 }
             }
