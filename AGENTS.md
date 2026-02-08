@@ -58,13 +58,13 @@ The system uses `embassy` for async task management on the ESP32.
 When users ask you to perform tasks, check if any of the available skills below can help complete the task more effectively. Skills provide specialized capabilities and domain knowledge.
 
 How to use skills:
-- Invoke: `npx openskills read &lt;skill-name&gt;` (run in your shell)
+- Invoke: `npx openskills read <skill-name>` (run in your shell)
   - For multiple: `npx openskills read skill-one,skill-two`
 - The skill content will load with detailed instructions on how to complete the task
 - Base directory provided in output for resolving bundled resources (references/, scripts/, assets/)
 
 Usage notes:
-- Only use skills listed in &lt;available_skills&gt; below
+- Only use skills listed in <available_skills> below
 - Do not invoke a skill that is already loaded in your context
 - Each skill invocation is stateless
 </usage>
