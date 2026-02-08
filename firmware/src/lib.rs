@@ -4,6 +4,7 @@ use defmt::error;
 use embassy_time::{Duration, Timer};
 
 pub mod display;
+pub mod display_ui;
 pub mod messages;
 pub mod network;
 pub mod pulse_capture;
