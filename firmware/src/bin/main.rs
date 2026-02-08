@@ -3,52 +3,42 @@
 
 extern crate alloc;
 
-use core::fmt::Write;
-use defmt::{error, info, warn};
+use defmt::{error, info};
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
-use embassy_net::Ipv4Address;
-use embassy_net::tcp::TcpSocket;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::watch::Watch;
-use embassy_time::{Duration, Instant, Timer};
 
-#[cfg(feature = "pulse_rmt")]
-use esp_hal::Async;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{DriveMode, Input, InputConfig, Pull};
 use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::ledc::{
     LSGlobalClkSource, Ledc, LowSpeed,
-    channel::{self, Channel as LedcChannel, ChannelIFace},
+    channel::{self, ChannelIFace},
     timer::{self, TimerIFace},
 };
 use esp_hal::peripherals::Peripherals;
 #[cfg(feature = "pulse_rmt")]
-use esp_hal::rmt::{Channel as RmtChannel, Rmt, Rx, RxChannelConfig, RxChannelCreator};
+use esp_hal::rmt::{Rmt, RxChannelConfig, RxChannelCreator};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 
 use esp_println as _;
 use esp_radio::init;
-use rust_mqtt::Bytes;
-use rust_mqtt::buffer::BumpBuffer;
-use rust_mqtt::client::Client;
-use rust_mqtt::client::options::{ConnectOptions, PublicationOptions, WillOptions};
-use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
-use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
 use static_cell::StaticCell;
 
 use esp32_rust_project::display::{Display, Sh1106Display};
 use esp32_rust_project::display_ui;
+use esp32_rust_project::led_pwm_task;
 use esp32_rust_project::messages::{RadioReading, RadioSettings};
+use esp32_rust_project::mqtt_client;
 use esp32_rust_project::network;
-use esp32_rust_project::pulse_capture::PulseCapture;
-use esp32_rust_project::radio_433::{Cc1101Radio, Radio433};
-use esp32_rust_project::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
-use esp32_rust_project::time_sync;
+use esp32_rust_project::radio_433::Cc1101Radio;
+#[cfg(feature = "pulse_rmt")]
+use esp32_rust_project::radio_433::Radio433;
+use esp32_rust_project::radio_433_task;
+use esp32_rust_project::time_sync_task;
 use esp32_rust_project::ui_input::EC11RotaryEncoderInput;
 use esp32_rust_project::with_retry;
 
@@ -119,7 +109,7 @@ async fn main(spawner: Spawner) -> ! {
 
     if channel_ok {
         info!("LED hardware configured! Spawning task...");
-        if let Err(e) = spawner.spawn(led_pwm_task(channel0)) {
+        if let Err(e) = spawner.spawn(led_pwm_task::led_pwm_task(channel0)) {
             error!("Failed to spawn LED task: {}", defmt::Debug2Format(&e));
         }
     } else {
@@ -199,15 +189,39 @@ async fn main(spawner: Spawner) -> ! {
 
     // Spawn tasks
     #[cfg(feature = "pulse_sw")]
-    spawner
-        .spawn(radio_433_rx_task(r433))
-        .expect("Failed to spawn radio task");
+    {
+        let settings_receiver = RADIO_SETTINGS_WATCH
+            .receiver()
+            .expect("Failed to get settings receiver");
+        spawner
+            .spawn(radio_433_task::radio_433_rx_task(
+                r433,
+                READING_WATCH.sender(),
+                MQTT_READING_CHANNEL.sender(),
+                settings_receiver,
+            ))
+            .expect("Failed to spawn radio task");
+    }
     #[cfg(feature = "pulse_rmt")]
+    {
+        let settings_receiver = RADIO_SETTINGS_WATCH
+            .receiver()
+            .expect("Failed to get settings receiver");
+        spawner
+            .spawn(radio_433_task::radio_433_rx_task(
+                r433,
+                rmt_rx,
+                READING_WATCH.sender(),
+                MQTT_READING_CHANNEL.sender(),
+                settings_receiver,
+            ))
+            .expect("Failed to spawn radio task");
+    }
     spawner
-        .spawn(radio_433_rx_task(r433, rmt_rx))
-        .expect("Failed to spawn radio task");
-    spawner
-        .spawn(mqtt_task(network_stack, MQTT_READING_CHANNEL.receiver()))
+        .spawn(mqtt_client::mqtt_task(
+            network_stack,
+            MQTT_READING_CHANNEL.receiver(),
+        ))
         .expect("Failed to spawn mqtt task");
     spawner
         .spawn(display_ui::display_task(
@@ -220,362 +234,10 @@ async fn main(spawner: Spawner) -> ! {
         ))
         .expect("Failed to spawn display task");
     spawner
-        .spawn(time_sync_task(network_stack))
+        .spawn(time_sync_task::time_sync_task(network_stack))
         .expect("Failed to spawn time sync task");
 
     loop {
         core::future::pending::<()>().await;
     }
-}
-
-#[embassy_executor::task]
-async fn led_pwm_task(channel: LedcChannel<'static, LowSpeed>) {
-    let brightness = 15;
-    let duration_ms = 2000;
-    loop {
-        if channel.start_duty_fade(0, brightness, duration_ms).is_ok() {
-            wait_fade_done(&channel, duration_ms).await;
-        }
-
-        if channel.start_duty_fade(brightness, 0, duration_ms).is_ok() {
-            wait_fade_done(&channel, duration_ms).await;
-        }
-    }
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)]
-async fn wait_fade_done(channel: &LedcChannel<'static, LowSpeed>, duration_ms: u16) {
-    while channel.is_duty_fade_running() {
-        Timer::after(Duration::from_millis(u64::from(duration_ms))).await;
-    }
-}
-
-/// Sets up the MQTT client, including TCP connection and MQTT broker handshake.
-async fn establish_mqtt_session<'a>(
-    network_stack: embassy_net::Stack<'static>,
-    rx_buffer: &'a mut [u8],
-    tx_buffer: &'a mut [u8],
-    client: &mut Client<'a, TcpSocket<'a>, BumpBuffer<'a>, 4, 2, 2>,
-) -> Result<(), ()> {
-    // Wait for network to be up
-    network_stack.wait_config_up().await;
-
-    info!("MQTT: Connecting to broker...");
-
-    let mut socket = TcpSocket::new(network_stack, rx_buffer, tx_buffer);
-    socket.set_timeout(Some(Duration::from_secs(120)));
-    socket.set_nagle_enabled(false);
-
-    let broker_addr = (
-        Ipv4Address::new(
-            MQTT_BROKER_IP[0],
-            MQTT_BROKER_IP[1],
-            MQTT_BROKER_IP[2],
-            MQTT_BROKER_IP[3],
-        ),
-        MQTT_BROKER_PORT,
-    );
-
-    if let Err(e) = socket.connect(broker_addr).await {
-        warn!("MQTT: TCP connect failed: {:?}", e);
-        return Err(());
-    }
-
-    info!("MQTT: TCP connected");
-
-    let lwt = WillOptions {
-        will_qos: QoS::AtMostOnce,
-        will_retain: true,
-        will_topic: MqttString::try_from("sensors/rubicson/status").map_err(|_| ())?,
-        will_payload: MqttBinary::try_from(b"offline" as &[u8]).map_err(|_| ())?,
-        will_delay_interval: 0,
-        is_payload_utf8: true,
-        message_expiry_interval: None,
-        content_type: None,
-        response_topic: None,
-        correlation_data: None,
-    };
-
-    let connect_options = ConnectOptions {
-        clean_start: true,
-        keep_alive: KeepAlive::Seconds(120),
-        session_expiry_interval: SessionExpiryInterval::EndOnDisconnect,
-        user_name: None,
-        password: None,
-        will: Some(lwt),
-    };
-    let client_id = MqttString::try_from(MQTT_CLIENT_ID).ok();
-
-    if let Err(e) = client.connect(socket, &connect_options, client_id).await {
-        warn!("MQTT: Broker connect failed: {:?}", defmt::Debug2Format(&e));
-        return Err(());
-    }
-
-    info!("MQTT: Connected to broker!");
-    unsafe { client.buffer().reset() };
-
-    // Publish "online" status message
-    let status_topic = MqttString::try_from("sensors/rubicson/status").map_err(|_| ())?;
-    let status_topic_name = unsafe { TopicName::new_unchecked(status_topic) };
-    let online_options = PublicationOptions {
-        retain: true,
-        topic: status_topic_name,
-        qos: QoS::AtMostOnce,
-    };
-    if let Err(e) = client
-        .publish(&online_options, Bytes::from(b"online" as &[u8]))
-        .await
-    {
-        warn!(
-            "MQTT: Failed to publish online status: {:?}",
-            defmt::Debug2Format(&e)
-        );
-        return Err(());
-    }
-
-    info!("MQTT: Published online status");
-    Ok(())
-}
-
-#[embassy_executor::task]
-#[allow(clippy::expect_used, clippy::too_many_lines)]
-async fn mqtt_task(
-    network_stack: embassy_net::Stack<'static>,
-    receiver: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, RadioReading, 16>,
-) {
-    // Backoff parameters
-    const MIN_BACKOFF_SECS: u64 = 1;
-    const MAX_BACKOFF_SECS: u64 = 60;
-    const PING_INTERVAL_SECS: u64 = 90; // Ping every 90s (keepalive is 120s)
-    let mut backoff_secs = MIN_BACKOFF_SECS;
-
-    loop {
-        // Create buffers on the stack for this session
-        let mut rx_buf = [0u8; 1024];
-        let mut tx_buf = [0u8; 1024];
-        let mut mqtt_buf = [0u8; 1024];
-        let mut mqtt_buffer = BumpBuffer::new(&mut mqtt_buf);
-        let mut client = Client::new(&mut mqtt_buffer);
-
-        if establish_mqtt_session(network_stack, &mut rx_buf, &mut tx_buf, &mut client)
-            .await
-            .is_err()
-        {
-            Timer::after(Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-            continue;
-        }
-
-        backoff_secs = MIN_BACKOFF_SECS;
-        info!("MQTT: Ready");
-        let mut last_activity = Instant::now();
-
-        loop {
-            // Wait for either a reading or ping timeout
-            let timeout = Duration::from_secs(PING_INTERVAL_SECS);
-
-            match select(receiver.receive(), Timer::after(timeout)).await {
-                Either::First(reading) => {
-                    // Got a reading - publish it
-                    let time_since_last = last_activity.elapsed().as_secs();
-                    info!("MQTT: Got reading after {}s idle", time_since_last);
-
-                    // Send a ping first if we've been idle for a while
-                    if time_since_last > 10 {
-                        info!(
-                            "MQTT: Sending ping before publish (idle {}s)",
-                            time_since_last
-                        );
-                        unsafe { client.buffer().reset() };
-                        if let Err(e) = client.ping().await {
-                            warn!(
-                                "MQTT: Pre-publish ping failed: {:?}, reconnecting...",
-                                defmt::Debug2Format(&e)
-                            );
-                            break;
-                        }
-                        // Small delay after ping
-                        Timer::after(Duration::from_millis(100)).await;
-                    }
-
-                    last_activity = Instant::now();
-
-                    // Reset buffer before publish
-                    unsafe { client.buffer().reset() };
-
-                    // Format topic: sensors/rubicson/{id}/temperature
-                    let mut topic: heapless::String<64> = heapless::String::new();
-                    if write!(topic, "sensors/rubicson/{}/temperature", reading.inner.id).is_err() {
-                        continue;
-                    }
-
-                    // Format payload: id={id},ch={channel},temp={temp},batt={ok/low},rssi={rssi},snr={snr}
-                    let mut payload: heapless::String<96> = heapless::String::new();
-                    let batt = if reading.inner.battery_ok {
-                        "ok"
-                    } else {
-                        "low"
-                    };
-                    if write!(
-                        payload,
-                        "id={},ch={},temp={:.1},batt={},rssi={},snr={}",
-                        reading.inner.id,
-                        reading.inner.channel,
-                        reading.inner.temperature_c,
-                        batt,
-                        reading.rssi,
-                        reading.detection_threshold
-                    )
-                    .is_err()
-                    {
-                        continue;
-                    }
-
-                    info!(
-                        "MQTT: Publishing to {} : {}",
-                        topic.as_str(),
-                        payload.as_str()
-                    );
-
-                    // Create TopicName from the topic string
-                    let topic_name = match MqttString::from_slice(topic.as_str()) {
-                        Ok(s) => unsafe { TopicName::new_unchecked(s) },
-                        Err(_) => continue,
-                    };
-
-                    let pub_options = PublicationOptions {
-                        retain: false,
-                        topic: topic_name,
-                        qos: QoS::AtMostOnce,
-                    };
-
-                    if let Err(e) = client
-                        .publish(&pub_options, Bytes::from(payload.as_bytes()))
-                        .await
-                    {
-                        warn!(
-                            "MQTT: Publish failed: {:?}, reconnecting...",
-                            defmt::Debug2Format(&e)
-                        );
-                        break; // Break inner loop to reconnect
-                    }
-
-                    info!("MQTT: Publish successful!");
-                }
-                Either::Second(()) => {
-                    // Ping timeout - send keepalive
-                    info!("MQTT: Sending periodic ping");
-                    unsafe { client.buffer().reset() };
-
-                    if let Err(e) = client.ping().await {
-                        warn!(
-                            "MQTT: Ping failed: {:?}, reconnecting...",
-                            defmt::Debug2Format(&e)
-                        );
-                        break;
-                    }
-                    info!("MQTT: Ping sent successfully");
-                    last_activity = Instant::now();
-                }
-            }
-        }
-
-        // Backoff before reconnecting
-        Timer::after(Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-    }
-}
-
-/// Time sync task - syncs time from NTP server
-#[embassy_executor::task]
-async fn time_sync_task(stack: embassy_net::Stack<'static>) {
-    time_sync::time_sync_loop(stack).await;
-}
-
-async fn prepare_radio_for_capture(radio: &mut Cc1101Radio) -> Result<(), ()> {
-    info!("Radio 433 RX task started");
-
-    match radio.get_hw_info().await {
-        Ok((part, version)) => {
-            info!(
-                "Radio detected: Part=0x{:02X}, Version=0x{:02X}",
-                part, version
-            );
-        }
-        Err(e) => {
-            error!("Radio not responding: {:?}", e);
-            return Err(());
-        }
-    }
-
-    if let Err(e) = radio.set_receive_mode().await {
-        error!("Failed to set receive mode: {:?}", e);
-        return Err(());
-    }
-
-    info!("Measuring RSSI on 433.92 MHz for 3s...");
-    let mut min_rssi: i16 = 0;
-    let mut max_rssi: i16 = -128;
-    for _ in 0..60 {
-        if let Ok(rssi) = radio.get_rssi_dbm().await {
-            if rssi < min_rssi {
-                min_rssi = rssi;
-            }
-            if rssi > max_rssi {
-                max_rssi = rssi;
-            }
-        }
-        Timer::after(Duration::from_millis(50)).await;
-    }
-    info!("RSSI: min={} max={} dBm", min_rssi, max_rssi);
-    info!("Starting pulse capture...");
-    Ok(())
-}
-
-#[cfg(feature = "pulse_sw")]
-#[embassy_executor::task]
-#[allow(clippy::expect_used)]
-async fn radio_433_rx_task(mut radio: Cc1101Radio) {
-    if prepare_radio_for_capture(&mut radio).await.is_err() {
-        return;
-    }
-
-    // Take ownership of the data pin for pulse capture
-    let Some(data_pin) = radio.take_data_pin() else {
-        error!("Data pin already taken");
-        return;
-    };
-
-    let settings_receiver = RADIO_SETTINGS_WATCH
-        .receiver()
-        .expect("Failed to get settings receiver");
-    let mut capture = PulseCapture::new(
-        data_pin,
-        &mut radio,
-        READING_WATCH.sender(),
-        MQTT_READING_CHANNEL.sender(),
-        settings_receiver,
-    );
-    capture.run().await;
-}
-
-#[cfg(feature = "pulse_rmt")]
-#[embassy_executor::task]
-#[allow(clippy::expect_used)]
-async fn radio_433_rx_task(mut radio: Cc1101Radio, rmt_rx: RmtChannel<'static, Async, Rx>) {
-    if prepare_radio_for_capture(&mut radio).await.is_err() {
-        return;
-    }
-
-    let settings_receiver = RADIO_SETTINGS_WATCH
-        .receiver()
-        .expect("Failed to get settings receiver");
-    let mut capture = PulseCapture::new(
-        rmt_rx,
-        &mut radio,
-        READING_WATCH.sender(),
-        MQTT_READING_CHANNEL.sender(),
-        settings_receiver,
-    );
-    capture.run().await;
 }
