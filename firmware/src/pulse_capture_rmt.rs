@@ -1,4 +1,5 @@
 use defmt::{debug, info, trace, warn};
+use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender as ChannelSender;
 use embassy_sync::watch::{Receiver, Sender as WatchSender};
@@ -97,10 +98,19 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
         info!("PulseCapture(RMT): Ready, waiting for signal...");
 
         loop {
-            let symbol_count = match self.channel.receive(&mut symbols).await {
-                Ok(count) => count,
-                Err(e) => {
+            let symbol_count = match select(
+                self.channel.receive(&mut symbols),
+                self.settings_receiver.changed(),
+            )
+            .await
+            {
+                Either::First(Ok(count)) => count,
+                Either::First(Err(e)) => {
                     warn!("RMT receive failed: {:?}", e);
+                    apply_pending_settings(&mut *self.radio, &mut self.settings_receiver).await;
+                    continue;
+                }
+                Either::Second(_) => {
                     apply_pending_settings(&mut *self.radio, &mut self.settings_receiver).await;
                     continue;
                 }

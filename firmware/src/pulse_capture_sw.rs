@@ -39,14 +39,7 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
     }
 
     #[allow(dead_code)]
-    async fn sw_capture(&mut self, gap_buffer: &mut [u32; 512]) -> (Instant, usize) {
-        // Sleep until signal arrives
-        // Wait for first edge (low->high transition = start of pulse)
-        self.pin.wait_for_rising_edge().await;
-        let capture_start = Instant::now();
-
-        debug!("Signal detected, capturing...");
-
+    async fn sw_capture(&mut self, gap_buffer: &mut [u32; 512]) -> usize {
         // Capture all gaps until silence
         let mut gap_count = 0;
 
@@ -88,7 +81,7 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
             }
         }
 
-        (capture_start, gap_count)
+        gap_count
     }
 
     pub async fn run(&mut self) -> ! {
@@ -99,8 +92,23 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
         info!("PulseCapture: Ready, waiting for signal...");
 
         loop {
+            match select(
+                self.pin.wait_for_rising_edge(),
+                self.settings_receiver.changed(),
+            )
+            .await
+            {
+                Either::First(()) => {}
+                Either::Second(_) => {
+                    apply_pending_settings(&mut *self.radio, &mut self.settings_receiver).await;
+                    continue;
+                }
+            }
+
             // Capture raw radio frame
-            let (capture_start, gap_count) = self.sw_capture(&mut gap_buffer).await;
+            let capture_start = Instant::now();
+            debug!("Signal detected, capturing...");
+            let gap_count = self.sw_capture(&mut gap_buffer).await;
 
             // Decode captured data
             let capture_duration = Instant::now().duration_since(capture_start);
