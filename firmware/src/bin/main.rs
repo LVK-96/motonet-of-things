@@ -29,16 +29,15 @@ use esp_radio::init;
 use static_cell::StaticCell;
 
 use esp32_rust_project::display::{Display, Sh1106Display};
-use esp32_rust_project::display_ui;
-use esp32_rust_project::led_pwm_task;
 use esp32_rust_project::messages::{RadioReading, RadioSettings};
-use esp32_rust_project::mqtt_client;
 use esp32_rust_project::network;
 use esp32_rust_project::radio_433::Cc1101Radio;
 #[cfg(feature = "pulse_rmt")]
 use esp32_rust_project::radio_433::Radio433;
-use esp32_rust_project::radio_433_task;
-use esp32_rust_project::time_sync_task;
+use esp32_rust_project::tasks::{
+    display as display_task, led_pwm as led_pwm_task, mqtt as mqtt_task,
+    radio_433 as radio_433_task, time_sync as time_sync_task,
+};
 use esp32_rust_project::ui_input::EC11RotaryEncoderInput;
 use esp32_rust_project::with_retry;
 
@@ -218,13 +217,13 @@ async fn main(spawner: Spawner) -> ! {
             .expect("Failed to spawn radio task");
     }
     spawner
-        .spawn(mqtt_client::mqtt_task(
+        .spawn(mqtt_task::mqtt_task(
             network_stack,
             MQTT_READING_CHANNEL.receiver(),
         ))
         .expect("Failed to spawn mqtt task");
     spawner
-        .spawn(display_ui::display_task(
+        .spawn(display_task::display_task(
             display,
             READING_WATCH
                 .receiver()
