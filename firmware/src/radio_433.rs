@@ -91,10 +91,7 @@ pub trait Radio433 {
     /// # Errors
     ///
     /// Returns `RadioError` if configuration fails.
-    fn set_channel_bandwidth_index(
-        &mut self,
-        index: u8,
-    ) -> Result<(), RadioError>;
+    fn set_channel_bandwidth_index(&mut self, index: u8) -> Result<(), RadioError>;
 
     /// Get the current carrier sense threshold (0-7).
     /// 0 = at `MAGN_TARGET`, 1 = +1 dB above, ..., 7 = +7 dB above
@@ -269,7 +266,8 @@ impl Cc1101Radio {
             .set_carrier_sense_threshold(self.carrier_sense_threshold)
             .map_err(|_| RadioError::ConfigError)?;
 
-        self.driver.set_gdo0_config(GdoCfg::SERIAL_DATA_OUT)
+        self.driver
+            .set_gdo0_config(GdoCfg::SERIAL_DATA_OUT)
             .map_err(|_| RadioError::ConfigError)?;
 
         // Enable async serial mode for raw OOK data output
@@ -394,9 +392,9 @@ impl Radio433 for Cc1101Radio {
                 decision_boundary_for_threshold(db),
             ))
             .map_err(|_| RadioError::ConfigError)?;
-        self.driver.
-            set_radio_mode(RadioMode::Receive).
-            map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_radio_mode(RadioMode::Receive)
+            .map_err(|_| RadioError::ConfigError)?;
 
         self.detection_threshold_db = db;
         Ok(())
@@ -414,9 +412,9 @@ impl Radio433 for Cc1101Radio {
         self.driver
             .set_magn_target(target_amplitude_for_level(clamped_level))
             .map_err(|_| RadioError::ConfigError)?;
-        self.driver.
-            set_radio_mode(RadioMode::Receive).
-            map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_radio_mode(RadioMode::Receive)
+            .map_err(|_| RadioError::ConfigError)?;
 
         self.filter_level = clamped_level;
         Ok(())
@@ -426,10 +424,7 @@ impl Radio433 for Cc1101Radio {
         self.channel_bandwidth_index
     }
 
-    fn set_channel_bandwidth_index(
-        &mut self,
-        index: u8,
-    ) -> Result<(), RadioError> {
+    fn set_channel_bandwidth_index(&mut self, index: u8) -> Result<(), RadioError> {
         let clamped_index = index.min(CHANNEL_BANDWIDTH_MAX_INDEX);
         self.driver
             .set_radio_mode(RadioMode::Idle)

@@ -5,7 +5,7 @@ use embassy_sync::mutex::Mutex;
 use embassy_sync::watch::Sender as WatchSender;
 use esp_hal::Async;
 use esp_hal::gpio::Level;
-use esp_hal::rmt::{Channel as RmtChannel, PulseCode, Rx, Error};
+use esp_hal::rmt::{Channel as RmtChannel, Error, PulseCode, Rx};
 
 use crate::messages::RadioReading;
 use crate::radio_433::Radio433;
@@ -100,7 +100,10 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
                 Err(Error::ReceiverError) => {
                     // ReceiverError, just return the number of symbols received so far
                     info!("RMT ReceiverError, treating as end of capture...");
-                    symbols.iter().position(|code| code.is_end_marker()).unwrap_or(symbols.len())
+                    symbols
+                        .iter()
+                        .position(|code| code.is_end_marker())
+                        .unwrap_or(symbols.len())
                 }
                 Err(e) => {
                     warn!("RMT error: {:?}", e);
@@ -108,19 +111,20 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
                 }
             };
 
-            let mut gap_count = 0usize;
-            let decode_result = rubicson::decode_gaps_iter(
-                PulseDistanceIter::new(&symbols, symbol_count).inspect(|_| {
-                    gap_count += 1;
-                }),
-            );
+            if symbol_count >= (12 * 36) {
+                // Valid messages consist of 12 packets of 36 bits (symbols)
+                let mut gap_count = 0usize;
+                let decode_result = rubicson::decode_gaps_iter(
+                    PulseDistanceIter::new(&symbols, symbol_count).inspect(|_| {
+                        gap_count += 1;
+                    }),
+                );
 
-            info!(
-                "RMT capture complete: {} symbols -> {} low gaps",
-                symbol_count, gap_count
-            );
+                info!(
+                    "RMT capture complete: {} symbols -> {} low gaps",
+                    symbol_count, gap_count
+                );
 
-            if gap_count >= 36 {
                 match decode_result {
                     Ok((_row, reading)) => {
                         let (rssi, detection_threshold) = {
@@ -144,8 +148,6 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
                         info!("Decode failed: {:?}", e);
                     }
                 }
-            } else {
-                info!("Not enough gaps for decoding (need 36, got {})", gap_count);
             }
         }
     }

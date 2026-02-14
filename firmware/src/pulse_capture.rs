@@ -30,9 +30,7 @@ pub(crate) async fn apply_pending_settings<R: Radio433>(
                 "Applying new detection threshold: {} dB (was {} dB)",
                 settings.detection_threshold_db, current_threshold
             );
-            if let Err(e) = radio
-                .set_detection_threshold(settings.detection_threshold_db)
-            {
+            if let Err(e) = radio.set_detection_threshold(settings.detection_threshold_db) {
                 warn!("Failed to set detection threshold: {:?}", e);
             }
         }
@@ -56,9 +54,7 @@ pub(crate) async fn apply_pending_settings<R: Radio433>(
                 "Applying new channel bandwidth: {} kHz (was {} kHz)",
                 new_bandwidth, old_bandwidth
             );
-            if let Err(e) = radio
-                .set_channel_bandwidth_index(settings.channel_bandwidth_index)
-            {
+            if let Err(e) = radio.set_channel_bandwidth_index(settings.channel_bandwidth_index) {
                 warn!("Failed to set channel bandwidth: {:?}", e);
             }
         }
