@@ -3,6 +3,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender as ChannelSender;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::watch::Sender as WatchSender;
+use embassy_time::{Duration, Timer};
 use esp_hal::Async;
 use esp_hal::gpio::Level;
 use esp_hal::rmt::{Channel as RmtChannel, Error, PulseCode, Rx};
@@ -94,7 +95,6 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
         info!("PulseCapture(RMT): Ready, waiting for signal...");
 
         loop {
-            info!("PulseCapture(RMT): receiving...");
             let symbol_count = match self.channel.receive(&mut symbols).await {
                 Ok(count) => count,
                 Err(Error::ReceiverError) => {
@@ -143,6 +143,12 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
                         };
                         self.sender.send(radio_reading);
                         let _ = self.mqtt_sender.try_send(radio_reading);
+                        // Delay 1s before accepting the next signal
+                        // The pulse decode is early exit on a valid packet
+                        // Since the sensor sends 12 packets in a burst
+                        // we want to avoid capturing the next packet in the same burst
+                        // which would cause duplicate readings
+                        Timer::after(Duration::from_millis(1000)).await;
                     }
                     Err(e) => {
                         info!("Decode failed: {:?}", e);
