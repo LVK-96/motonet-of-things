@@ -2,7 +2,7 @@ use defmt::{debug, info, trace, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::watch::Receiver;
 
-use crate::messages::RadioSettings;
+use crate::messages::{RadioSettings, channel_bandwidth_hz};
 use crate::radio_433::Radio433;
 
 #[cfg(all(feature = "pulse_sw", feature = "pulse_rmt"))]
@@ -32,7 +32,6 @@ pub(crate) async fn apply_pending_settings<R: Radio433>(
             );
             if let Err(e) = radio
                 .set_detection_threshold(settings.detection_threshold_db)
-                .await
             {
                 warn!("Failed to set detection threshold: {:?}", e);
             }
@@ -44,8 +43,34 @@ pub(crate) async fn apply_pending_settings<R: Radio433>(
                 "Applying new magn target: {} (was {})",
                 settings.magn_target, current_magn_target
             );
-            if let Err(e) = radio.set_filter_level(settings.magn_target).await {
+            if let Err(e) = radio.set_filter_level(settings.magn_target) {
                 warn!("Failed to set filter level: {:?}", e);
+            }
+        }
+
+        let current_bandwidth_index = radio.get_channel_bandwidth_index();
+        if settings.channel_bandwidth_index != current_bandwidth_index {
+            let new_bandwidth = channel_bandwidth_hz(settings.channel_bandwidth_index) / 1000;
+            let old_bandwidth = channel_bandwidth_hz(current_bandwidth_index) / 1000;
+            info!(
+                "Applying new channel bandwidth: {} kHz (was {} kHz)",
+                new_bandwidth, old_bandwidth
+            );
+            if let Err(e) = radio
+                .set_channel_bandwidth_index(settings.channel_bandwidth_index)
+            {
+                warn!("Failed to set channel bandwidth: {:?}", e);
+            }
+        }
+
+        let current_carrier_sense = radio.get_carrier_sense_threshold();
+        if settings.carrier_sense_threshold != current_carrier_sense {
+            info!(
+                "Applying new carrier sense threshold: {} dB (was {} dB)",
+                settings.carrier_sense_threshold, current_carrier_sense
+            );
+            if let Err(e) = radio.set_carrier_sense_threshold(settings.carrier_sense_threshold) {
+                warn!("Failed to set carrier sense threshold: {:?}", e);
             }
         }
     }

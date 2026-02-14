@@ -27,14 +27,56 @@ pub struct RadioSettings {
     pub detection_threshold_db: u8,
     /// AGC target amplitude level (0-7, corresponding to 24-42 dB)
     pub magn_target: u8,
+    /// CC1101 channel bandwidth option index (0-3).
+    pub channel_bandwidth_index: u8,
+    /// Carrier sense absolute threshold (0-7, relative to MAGN_TARGET)
+    /// 0 = at MAGN_TARGET, 1 = +1 dB above, ..., 7 = +7 dB above
+    pub carrier_sense_threshold: u8,
 }
+
+pub const DEFAULT_RADIO_SETTINGS: RadioSettings = RadioSettings {
+    detection_threshold_db: 16,
+    magn_target: 7, // 42 dB - matches CC1101 default
+    channel_bandwidth_index: DEFAULT_CHANNEL_BANDWIDTH_INDEX,
+    carrier_sense_threshold: 0, // At MAGN_TARGET level
+};
+
+pub const DETECTION_THRESHOLD_MIN_DB: u8 = 4;
+pub const DETECTION_THRESHOLD_MAX_DB: u8 = 16;
+pub const DETECTION_THRESHOLD_STEP_DB: u8 = 4;
+pub const MAGN_TARGET_MIN: u8 = 0;
+pub const MAGN_TARGET_MAX: u8 = 7;
+pub const CHANNEL_BANDWIDTH_MIN_INDEX: u8 = 0;
+pub const CHANNEL_BANDWIDTH_MAX_INDEX: u8 = 3;
+pub const DEFAULT_CHANNEL_BANDWIDTH_INDEX: u8 = 1; // 203 kHz
+pub const CARRIER_SENSE_MIN: u8 = 0;
+pub const CARRIER_SENSE_MAX: u8 = 7;
 
 impl Default for RadioSettings {
     fn default() -> Self {
-        Self {
-            detection_threshold_db: 16,
-            magn_target: 7, // 42 dB - matches CC1101 default
-        }
+        DEFAULT_RADIO_SETTINGS
+    }
+}
+
+#[must_use]
+pub const fn channel_bandwidth_hz(index: u8) -> u32 {
+    match index {
+        0 => 325_000,
+        1 => 203_000,
+        2 => 162_000,
+        3 => 135_000,
+        _ => 203_000,
+    }
+}
+
+#[must_use]
+pub const fn channel_bandwidth_index(bandwidth_hz: u32) -> u8 {
+    match bandwidth_hz {
+        325_000 => 0,
+        203_000 => 1,
+        162_000 => 2,
+        135_000 => 3,
+        _ => DEFAULT_CHANNEL_BANDWIDTH_INDEX,
     }
 }
 

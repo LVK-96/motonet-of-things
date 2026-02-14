@@ -156,7 +156,7 @@ async fn main(spawner: Spawner) -> ! {
         let rmt_rx_cfg = RxChannelConfig::default()
             .with_clk_divider(80)
             .with_filter_threshold(50)
-            .with_idle_threshold(5000)
+            .with_idle_threshold(10000)
             .with_memsize(8);
         rmt.channel0
             .configure_rx(data_pin, rmt_rx_cfg)

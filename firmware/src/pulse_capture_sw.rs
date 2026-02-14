@@ -1,4 +1,4 @@
-use defmt::{debug, info, trace};
+use defmt::info;
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender as ChannelSender;
@@ -19,7 +19,7 @@ pub struct PulseCapture<'d, R: Radio433> {
 }
 
 /// Timeout for considering a transmission ended
-const TRANSMISSION_END_TIMEOUT_US: u64 = 4500;
+const TRANSMISSION_END_TIMEOUT_US: u64 = 10000;
 
 impl<'d, R: Radio433> PulseCapture<'d, R> {
     pub fn new(
@@ -107,12 +107,12 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
 
             // Capture raw radio frame
             let capture_start = Instant::now();
-            debug!("Signal detected, capturing...");
+            info!("Signal detected, capturing...");
             let gap_count = self.sw_capture(&mut gap_buffer).await;
 
             // Decode captured data
             let capture_duration = Instant::now().duration_since(capture_start);
-            debug!(
+            info!(
                 "Capture complete: {} gaps in {} ms",
                 gap_count,
                 capture_duration.as_millis()
@@ -129,7 +129,7 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                         let rssi = self.radio.get_rssi_dbm().await.unwrap_or(-128);
                         let detection_threshold = self.radio.get_detection_threshold();
 
-                        debug!("Decoded: {:?}, RSSI={}dBm", reading, rssi);
+                        info!("Decoded: {:?}, RSSI={}dBm", reading, rssi);
 
                         let radio_reading = RadioReading {
                             inner: reading,
@@ -140,11 +140,11 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                         let _ = self.mqtt_sender.try_send(radio_reading);
                     }
                     Err(e) => {
-                        trace!("Decode failed: {:?}", e);
+                        info!("Decode failed: {:?}", e);
                     }
                 }
             } else {
-                trace!("Not enough gaps for decoding (need 36, got {})", gap_count);
+                info!("Not enough gaps for decoding (need 36, got {})", gap_count);
             }
 
             // Delay 1s before listening again (debounce)
@@ -153,7 +153,7 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
 
             apply_pending_settings(&mut *self.radio, &mut self.settings_receiver).await;
 
-            debug!("Ready, waiting for signal...");
+            info!("Ready, waiting for signal...");
         }
     }
 }

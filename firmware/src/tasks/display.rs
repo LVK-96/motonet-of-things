@@ -7,7 +7,12 @@ use esp_hal::Blocking;
 use esp_hal::i2c::master::I2c;
 
 use crate::display::{Display, Sh1106Display};
-use crate::messages::{RadioReading, RadioSettings};
+use crate::messages::{
+    CARRIER_SENSE_MAX, CARRIER_SENSE_MIN, CHANNEL_BANDWIDTH_MAX_INDEX, CHANNEL_BANDWIDTH_MIN_INDEX,
+    DEFAULT_RADIO_SETTINGS, DETECTION_THRESHOLD_MAX_DB, DETECTION_THRESHOLD_MIN_DB,
+    DETECTION_THRESHOLD_STEP_DB, MAGN_TARGET_MAX, MAGN_TARGET_MIN, RadioReading, RadioSettings,
+    channel_bandwidth_hz,
+};
 use crate::time_sync::TIME_WATCH;
 use crate::ui_input::{EC11RotaryEncoderInput, UiEvent, UiInput};
 
@@ -50,6 +55,8 @@ enum FrameKey {
         editing: bool,
         threshold: u8,
         magn: u8,
+        bandwidth_index: u8,
+        carrier_sense: u8,
     },
 }
 
@@ -82,13 +89,17 @@ pub async fn display_task(
     let mut last_reading: Option<RadioReading> = None;
 
     // Settings values (pending values, not yet applied)
-    let mut pending_threshold: u8 = 16; // Default from CC1101 config
-    let mut pending_magn_target: u8 = 7; // Default (42 dB)
+    let mut pending_threshold: u8 = DEFAULT_RADIO_SETTINGS.detection_threshold_db;
+    let mut pending_magn_target: u8 = DEFAULT_RADIO_SETTINGS.magn_target;
+    let mut pending_bandwidth_index: u8 = DEFAULT_RADIO_SETTINGS.channel_bandwidth_index;
+    let mut pending_carrier_sense: u8 = DEFAULT_RADIO_SETTINGS.carrier_sense_threshold;
 
     // Send initial settings
     settings_sender.send(RadioSettings {
         detection_threshold_db: pending_threshold,
         magn_target: pending_magn_target,
+        channel_bandwidth_index: pending_bandwidth_index,
+        carrier_sense_threshold: pending_carrier_sense,
     });
 
     // Skip full redraws when nothing visual has changed.
@@ -130,15 +141,19 @@ pub async fn display_task(
                                     nav_index,
                                     editing: false,
                                 }
-                            } else if nav_index == 2 {
+                            } else if nav_index == 4 {
                                 // Save selected - apply settings and exit
                                 settings_sender.send(RadioSettings {
                                     detection_threshold_db: pending_threshold,
                                     magn_target: pending_magn_target,
+                                    channel_bandwidth_index: pending_bandwidth_index,
+                                    carrier_sense_threshold: pending_carrier_sense,
                                 });
+                                let bandwidth_khz =
+                                    channel_bandwidth_hz(pending_bandwidth_index) / 1000;
                                 info!(
-                                    "Settings saved: threshold={} dB, magn_target={}",
-                                    pending_threshold, pending_magn_target
+                                    "Settings saved: threshold={} dB, magn_target={}, bandwidth={} kHz, carrier_sense={}",
+                                    pending_threshold, pending_magn_target, bandwidth_khz, pending_carrier_sense
                                 );
                                 DisplayState::Radio
                             } else {
@@ -155,26 +170,47 @@ pub async fn display_task(
                                 match nav_index {
                                     0 => {
                                         // Detection threshold: 4, 8, 12, 16 dB
-                                        pending_threshold = if pending_threshold >= 16 {
-                                            4
-                                        } else {
-                                            pending_threshold + 4
-                                        };
+                                        pending_threshold =
+                                            if pending_threshold >= DETECTION_THRESHOLD_MAX_DB {
+                                                DETECTION_THRESHOLD_MAX_DB
+                                            } else {
+                                                pending_threshold + DETECTION_THRESHOLD_STEP_DB
+                                            };
                                     }
                                     1 => {
                                         // Magn target: 0-7
-                                        pending_magn_target = if pending_magn_target >= 7 {
-                                            0
+                                        pending_magn_target =
+                                            if pending_magn_target >= MAGN_TARGET_MAX {
+                                                MAGN_TARGET_MAX
+                                            } else {
+                                                pending_magn_target + 1
+                                            };
+                                    }
+                                    2 => {
+                                        // Channel bandwidth: 0-3 (325/203/162/135 kHz)
+                                        pending_bandwidth_index = if pending_bandwidth_index
+                                            >= CHANNEL_BANDWIDTH_MAX_INDEX
+                                        {
+                                            CHANNEL_BANDWIDTH_MAX_INDEX
                                         } else {
-                                            pending_magn_target + 1
+                                            pending_bandwidth_index + 1
                                         };
+                                    }
+                                    3 => {
+                                        // Carrier sense threshold: 0-7
+                                        pending_carrier_sense =
+                                            if pending_carrier_sense >= CARRIER_SENSE_MAX {
+                                                CARRIER_SENSE_MAX
+                                            } else {
+                                                pending_carrier_sense + 1
+                                            };
                                     }
                                     _ => {}
                                 }
                                 DisplayState::Settings { nav_index, editing }
                             } else {
                                 // Navigate to next item (wrap around)
-                                let next = if nav_index >= 2 { 0 } else { nav_index + 1 };
+                                let next = if nav_index >= 4 { 0 } else { nav_index + 1 };
                                 DisplayState::Settings {
                                     nav_index: next,
                                     editing: false,
@@ -186,25 +222,45 @@ pub async fn display_task(
                                 // Adjust value down
                                 match nav_index {
                                     0 => {
-                                        pending_threshold = if pending_threshold <= 4 {
-                                            16
-                                        } else {
-                                            pending_threshold - 4
-                                        };
+                                        pending_threshold =
+                                            if pending_threshold <= DETECTION_THRESHOLD_MIN_DB {
+                                                DETECTION_THRESHOLD_MIN_DB
+                                            } else {
+                                                pending_threshold - DETECTION_THRESHOLD_STEP_DB
+                                            };
                                     }
                                     1 => {
-                                        pending_magn_target = if pending_magn_target == 0 {
-                                            7
+                                        pending_magn_target =
+                                            if pending_magn_target == MAGN_TARGET_MIN {
+                                                MAGN_TARGET_MIN
+                                            } else {
+                                                pending_magn_target - 1
+                                            };
+                                    }
+                                    2 => {
+                                        pending_bandwidth_index = if pending_bandwidth_index
+                                            <= CHANNEL_BANDWIDTH_MIN_INDEX
+                                        {
+                                            CHANNEL_BANDWIDTH_MIN_INDEX
                                         } else {
-                                            pending_magn_target - 1
+                                            pending_bandwidth_index - 1
                                         };
+                                    }
+                                    3 => {
+                                        // Carrier sense threshold: 0-7
+                                        pending_carrier_sense =
+                                            if pending_carrier_sense <= CARRIER_SENSE_MIN {
+                                                CARRIER_SENSE_MIN
+                                            } else {
+                                                pending_carrier_sense - 1
+                                            };
                                     }
                                     _ => {}
                                 }
                                 DisplayState::Settings { nav_index, editing }
                             } else {
                                 // Navigate to previous item (wrap around)
-                                let prev = if nav_index == 0 { 2 } else { nav_index - 1 };
+                                let prev = if nav_index == 0 { 4 } else { nav_index - 1 };
                                 DisplayState::Settings {
                                     nav_index: prev,
                                     editing: false,
@@ -244,6 +300,8 @@ pub async fn display_task(
                 editing,
                 threshold: pending_threshold,
                 magn: pending_magn_target,
+                bandwidth_index: pending_bandwidth_index,
+                carrier_sense: pending_carrier_sense,
             },
         };
 
@@ -296,6 +354,8 @@ pub async fn display_task(
                     editing,
                     pending_threshold,
                     pending_magn_target,
+                    pending_bandwidth_index,
+                    pending_carrier_sense,
                 ) {
                     error!("Display: Failed to show settings: {:?}", e);
                     false

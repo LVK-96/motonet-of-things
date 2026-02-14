@@ -1,0 +1,17 @@
+[package]
+name = "cc1101"
+version = "0.1.3"
+authors = ["Daniel Svensson <dsvensson@gmail.com>", "Ferdia McKeogh <chocol4te@users.noreply.github.com>"]
+categories = ["embedded", "hardware-support", "no-std"]
+keywords = ["embedded-hal-driver", "radio", "transceiver", "embedded-hal", "cc1101"]
+description = "A platform agnostic driver to interface with the CC1101 (Sub-1GHz RF Transceiver)"
+documentation = "https://docs.rs/cc1101"
+license = "Apache-2.0"
+repository = "https://github.com/dsvensson/cc1101"
+edition = "2021"
+
+[dependencies]
+embedded-hal = "1.0.0"
+
+[features]
+std = []

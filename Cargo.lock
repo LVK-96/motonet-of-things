@@ -112,7 +112,6 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 [[package]]
 name = "cc1101"
 version = "0.1.3"
-source = "git+https://github.com/dsvensson/cc1101.git?branch=main#11a24c471188493d6815d3ea35f27979ef405f55"
 dependencies = [
  "embedded-hal 1.0.0",
 ]

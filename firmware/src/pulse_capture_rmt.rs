@@ -1,11 +1,11 @@
-use defmt::{debug, info, trace, warn};
+use defmt::{info, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender as ChannelSender;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::watch::Sender as WatchSender;
 use esp_hal::Async;
 use esp_hal::gpio::Level;
-use esp_hal::rmt::{Channel as RmtChannel, PulseCode, Rx};
+use esp_hal::rmt::{Channel as RmtChannel, PulseCode, Rx, Error};
 
 use crate::messages::RadioReading;
 use crate::radio_433::Radio433;
@@ -89,15 +89,21 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
 
     pub async fn run(&mut self) -> ! {
         // Each symbol encodes two level-duration entries.
-        let mut symbols = [PulseCode::default(); 256];
+        let mut symbols = [PulseCode::default(); 512];
 
         info!("PulseCapture(RMT): Ready, waiting for signal...");
 
         loop {
+            info!("PulseCapture(RMT): receiving...");
             let symbol_count = match self.channel.receive(&mut symbols).await {
                 Ok(count) => count,
+                Err(Error::ReceiverError) => {
+                    // ReceiverError, just return the number of symbols received so far
+                    info!("RMT ReceiverError, treating as end of capture...");
+                    symbols.iter().position(|code| code.is_end_marker()).unwrap_or(symbols.len())
+                }
                 Err(e) => {
-                    warn!("RMT receive failed: {:?}", e);
+                    warn!("RMT error: {:?}", e);
                     continue;
                 }
             };
@@ -109,7 +115,7 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
                 }),
             );
 
-            debug!(
+            info!(
                 "RMT capture complete: {} symbols -> {} low gaps",
                 symbol_count, gap_count
             );
@@ -124,7 +130,7 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
                             (rssi, detection_threshold)
                         };
 
-                        debug!("Decoded: {:?}, RSSI={}dBm", reading, rssi);
+                        info!("Decoded: {:?}, RSSI={}dBm", reading, rssi);
 
                         let radio_reading = RadioReading {
                             inner: reading,
@@ -135,11 +141,11 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
                         let _ = self.mqtt_sender.try_send(radio_reading);
                     }
                     Err(e) => {
-                        trace!("Decode failed: {:?}", e);
+                        info!("Decode failed: {:?}", e);
                     }
                 }
             } else {
-                trace!("Not enough gaps for decoding (need 36, got {})", gap_count);
+                info!("Not enough gaps for decoding (need 36, got {})", gap_count);
             }
         }
     }

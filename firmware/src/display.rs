@@ -11,7 +11,7 @@ use heapless::String;
 use mini_oled::prelude::*;
 use profont::{PROFONT_10_POINT, PROFONT_14_POINT, PROFONT_24_POINT};
 
-use crate::messages::SignalQuality;
+use crate::messages::{channel_bandwidth_hz, SignalQuality};
 
 /// Error type for display operations
 #[derive(Debug, defmt::Format)]
@@ -84,10 +84,12 @@ pub trait Display {
     ///
     /// # Arguments
     ///
-    /// * `nav_index` - Index of currently navigated menu item (0=threshold, `1=magn_target`, 2=save)
+    /// * `nav_index` - Index of currently navigated item
     /// * `editing` - Whether we are editing the currently selected item
     /// * `detection_threshold` - Current detection threshold value in dB
     /// * `magn_target` - Current magnitude target level (0-7)
+    /// * `channel_bandwidth_index` - Current channel bandwidth option index (0-3)
+    /// * `carrier_sense` - Current carrier sense threshold (0-7)
     ///
     /// # Errors
     ///
@@ -98,6 +100,8 @@ pub trait Display {
         editing: bool,
         detection_threshold: u8,
         magn_target: u8,
+        channel_bandwidth_index: u8,
+        carrier_sense: u8,
     ) -> Result<(), DisplayError>;
 }
 
@@ -324,6 +328,8 @@ where
         editing: bool,
         detection_threshold: u8,
         magn_target: u8,
+        channel_bandwidth_index: u8,
+        carrier_sense: u8,
     ) -> Result<(), DisplayError> {
         self.clear()?;
 
@@ -352,18 +358,21 @@ where
             6 => 40,
             _ => 42, // 7 or higher
         };
+        let bandwidth_khz = channel_bandwidth_hz(channel_bandwidth_index) / 1000;
 
-        // Menu items: Threshold, Magn Tgt, Save
+        // Menu items: Threshold, Magn Tgt, Bandwidth, Carrier Sense, Save
         // Store (label, Option<(value, unit)>)
-        let items: [(&str, Option<(u8, &str)>); 3] = [
-            ("Threshold", Some((detection_threshold, "dB"))),
-            ("Magn Tgt", Some((magn_target_db, "dB"))),
+        let items: [(&str, Option<(u32, &str)>); 5] = [
+            ("Threshold", Some((u32::from(detection_threshold), "dB"))),
+            ("Magn Tgt", Some((u32::from(magn_target_db), "dB"))),
+            ("Bandwidth", Some((bandwidth_khz, "kHz"))),
+            ("CS Thrsh", Some((u32::from(carrier_sense), "dB"))),
             ("Save", None),
         ];
 
         for (i, (label, value_unit)) in items.iter().enumerate() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let y = 28 + (i as i32 * 12);
+            let y = 24 + (i as i32 * 10);
             let is_nav = i == nav_index as usize;
             let is_editing = is_nav && editing && value_unit.is_some();
 

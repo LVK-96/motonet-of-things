@@ -1,9 +1,11 @@
 use core::future::Future;
 
 use cc1101::{
-    Cc1101, DecisionBoundary, FilterLength, ModulationFormat, PacketLength, RadioMode, SyncMode,
-    TargetAmplitude,
+    Cc1101, DecisionBoundary, FilterLength, GdoCfg, ModulationFormat, PacketLength, RadioMode,
+    SyncMode, TargetAmplitude,
 };
+use embassy_futures::select::{Either, select};
+use embassy_time::{Duration, Timer};
 use embedded_hal::digital::InputPin;
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use esp_hal::Blocking;
@@ -11,6 +13,11 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::gpio::{InputPin as EspInputPin, OutputPin};
 use esp_hal::spi::{Mode, master::Spi};
 use esp_hal::time::Rate;
+
+use crate::messages::{
+    CARRIER_SENSE_MAX, CHANNEL_BANDWIDTH_MAX_INDEX, DEFAULT_RADIO_SETTINGS, MAGN_TARGET_MAX,
+    channel_bandwidth_hz, channel_bandwidth_index,
+};
 
 /// Error type for radio operations
 #[derive(Debug, defmt::Format)]
@@ -62,7 +69,7 @@ pub trait Radio433 {
     /// # Errors
     ///
     /// Returns `RadioError` if configuration fails
-    fn set_detection_threshold(&mut self, db: u8) -> impl Future<Output = Result<(), RadioError>>;
+    fn set_detection_threshold(&mut self, db: u8) -> Result<(), RadioError>;
 
     /// Get the current filter output level (AGC target amplitude).
     /// Returns 0-7, corresponding to 24-42 dB.
@@ -74,7 +81,33 @@ pub trait Radio433 {
     /// # Errors
     ///
     /// Returns `RadioError` if configuration fails
-    fn set_filter_level(&mut self, level: u8) -> impl Future<Output = Result<(), RadioError>>;
+    fn set_filter_level(&mut self, level: u8) -> Result<(), RadioError>;
+
+    /// Get the current channel bandwidth option index (0-3).
+    fn get_channel_bandwidth_index(&self) -> u8;
+
+    /// Set the channel bandwidth option index (0-3).
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError` if configuration fails.
+    fn set_channel_bandwidth_index(
+        &mut self,
+        index: u8,
+    ) -> Result<(), RadioError>;
+
+    /// Get the current carrier sense threshold (0-7).
+    /// 0 = at MAGN_TARGET, 1 = +1 dB above, ..., 7 = +7 dB above
+    fn get_carrier_sense_threshold(&self) -> u8;
+
+    /// Set the carrier sense threshold (0-7).
+    /// 0 = at MAGN_TARGET, 1 = +1 dB above, ..., 7 = +7 dB above
+    /// Higher values require stronger signals to trigger carrier sense.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError` if configuration fails.
+    fn set_carrier_sense_threshold(&mut self, threshold: u8) -> Result<(), RadioError>;
 
     /// Take ownership of the data pin for use with `PulseCapture`.
     /// Returns None if the pin has already been taken.
@@ -89,6 +122,40 @@ pub struct Cc1101Radio {
     gdo2: Input<'static>,
     detection_threshold_db: u8,
     filter_level: u8,
+    channel_bandwidth_index: u8,
+    carrier_sense_threshold: u8,
+}
+
+#[derive(Clone, Copy, Debug, defmt::Format)]
+pub struct SignalSnapshot {
+    pub carrier_sense: bool,
+    pub preamble_quality_reached: bool,
+    pub pktstatus_gdo0: bool,
+    pub pktstatus_gdo2: bool,
+    pub pin_gdo0: bool,
+    pub pin_gdo2: bool,
+}
+
+fn decision_boundary_for_threshold(db: u8) -> DecisionBoundary {
+    match db {
+        0..=6 => DecisionBoundary::Db4,
+        7..=10 => DecisionBoundary::Db8,
+        11..=14 => DecisionBoundary::Db12,
+        _ => DecisionBoundary::Db16, // 15+ dB, default to max
+    }
+}
+
+fn target_amplitude_for_level(level: u8) -> TargetAmplitude {
+    match level {
+        0 => TargetAmplitude::Db24,
+        1 => TargetAmplitude::Db27,
+        2 => TargetAmplitude::Db30,
+        3 => TargetAmplitude::Db33,
+        4 => TargetAmplitude::Db36,
+        5 => TargetAmplitude::Db38,
+        6 => TargetAmplitude::Db40,
+        _ => TargetAmplitude::Db42, // 7 or higher
+    }
 }
 
 impl Cc1101Radio {
@@ -135,13 +202,16 @@ impl Cc1101Radio {
         // Configure GPIO pins
         let gdo0 = Input::new(gdo0, InputConfig::default().with_pull(Pull::Down));
         let gdo2 = Input::new(gdo2, InputConfig::default().with_pull(Pull::Down));
+        let default_settings = DEFAULT_RADIO_SETTINGS;
 
         Self {
             driver,
             data_pin: Some(gdo0),
             gdo2,
-            detection_threshold_db: 16,
-            filter_level: 7,
+            detection_threshold_db: default_settings.detection_threshold_db,
+            filter_level: default_settings.magn_target,
+            channel_bandwidth_index: default_settings.channel_bandwidth_index,
+            carrier_sense_threshold: default_settings.carrier_sense_threshold,
         }
     }
 
@@ -180,13 +250,25 @@ impl Cc1101Radio {
             .set_data_rate(4800)
             .map_err(|_| RadioError::ConfigError)?;
         self.driver
-            .set_channel_bandwidth(325_000)
+            .set_channel_bandwidth(u64::from(channel_bandwidth_hz(
+                self.channel_bandwidth_index,
+            )))
             .map_err(|_| RadioError::ConfigError)?;
         self.driver
-            .set_magn_target(TargetAmplitude::Db42)
+            .set_magn_target(target_amplitude_for_level(self.filter_level))
             .map_err(|_| RadioError::ConfigError)?;
         self.driver
-            .set_filter_length(FilterLength::AmplitudeModulation(DecisionBoundary::Db16))
+            .set_filter_length(FilterLength::AmplitudeModulation(
+                decision_boundary_for_threshold(self.detection_threshold_db),
+            ))
+            .map_err(|_| RadioError::ConfigError)?;
+
+        // Configure carrier sense threshold to filter noise
+        self.driver
+            .set_carrier_sense_threshold(self.carrier_sense_threshold)
+            .map_err(|_| RadioError::ConfigError)?;
+
+        self.driver.set_gdo0_config(GdoCfg::SERIAL_DATA_OUT)
             .map_err(|_| RadioError::ConfigError)?;
 
         // Enable async serial mode for raw OOK data output
@@ -195,6 +277,70 @@ impl Cc1101Radio {
             .map_err(|_| RadioError::ConfigError)?;
 
         Ok(())
+    }
+
+    /// Read CC1101 packet-status bits together with current GPIO pin levels.
+    pub fn signal_snapshot(&mut self) -> Result<SignalSnapshot, RadioError> {
+        let status = self
+            .driver
+            .get_packet_status()
+            .map_err(|_| RadioError::Spi)?;
+
+        Ok(SignalSnapshot {
+            carrier_sense: status.carrier_sense,
+            preamble_quality_reached: status.preamble_quality_reached,
+            pktstatus_gdo0: status.gdo0,
+            pktstatus_gdo2: status.gdo2,
+            pin_gdo0: self.data_pin.as_ref().is_some_and(Input::is_high),
+            pin_gdo2: self.gdo2.is_high(),
+        })
+    }
+
+    /// Apply a frequency/bandwidth profile and return to RX mode.
+    pub fn apply_rf_profile(&mut self, freq_hz: u32, bandwidth_hz: u32) -> Result<(), RadioError> {
+        self.driver
+            .set_radio_mode(RadioMode::Idle)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_frequency(u64::from(freq_hz))
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_channel_bandwidth(u64::from(bandwidth_hz))
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_radio_mode(RadioMode::Receive)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.channel_bandwidth_index = channel_bandwidth_index(bandwidth_hz);
+        Ok(())
+    }
+
+    /// Route a clock to GDO0 and verify that the MCU sees at least one edge.
+    pub async fn probe_gdo0_edge_path(&mut self) -> Result<bool, RadioError> {
+        self.driver
+            .set_gdo0_config(GdoCfg::CLK_XOSC_192)
+            .map_err(|_| RadioError::ConfigError)?;
+
+        // Let the new GDO0 function settle before waiting for an interrupt edge.
+        Timer::after(Duration::from_micros(100)).await;
+
+        let edge_seen = if let Some(pin) = self.data_pin.as_mut() {
+            matches!(
+                select(
+                    pin.wait_for_any_edge(),
+                    Timer::after(Duration::from_millis(20))
+                )
+                .await,
+                Either::First(())
+            )
+        } else {
+            false
+        };
+
+        self.driver
+            .set_gdo0_config(GdoCfg::SERIAL_DATA_OUT)
+            .map_err(|_| RadioError::ConfigError)?;
+
+        Ok(edge_seen)
     }
 }
 
@@ -226,54 +372,84 @@ impl Radio433 for Cc1101Radio {
         self.detection_threshold_db
     }
 
-    fn set_detection_threshold(&mut self, db: u8) -> impl Future<Output = Result<(), RadioError>> {
-        // Map dB value to DecisionBoundary enum
-        let boundary = match db {
-            0..=6 => DecisionBoundary::Db4,
-            7..=10 => DecisionBoundary::Db8,
-            11..=14 => DecisionBoundary::Db12,
-            _ => DecisionBoundary::Db16, // 15+ dB, default to max
-        };
+    fn set_detection_threshold(&mut self, db: u8) -> Result<(), RadioError> {
+        self.driver
+            .set_radio_mode(RadioMode::Idle)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_filter_length(FilterLength::AmplitudeModulation(
+                decision_boundary_for_threshold(db),
+            ))
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver.
+            set_radio_mode(RadioMode::Receive).
+            map_err(|_| RadioError::ConfigError)?;
 
-        let result = self
-            .driver
-            .set_filter_length(FilterLength::AmplitudeModulation(boundary))
-            .map_err(|_| RadioError::ConfigError);
-
-        if result.is_ok() {
-            self.detection_threshold_db = db;
-        }
-
-        async move { result }
+        self.detection_threshold_db = db;
+        Ok(())
     }
 
     fn get_filter_level(&self) -> u8 {
         self.filter_level
     }
 
-    fn set_filter_level(&mut self, level: u8) -> impl Future<Output = Result<(), RadioError>> {
-        // Map 0-7 to TargetAmplitude enum (24-42 dB)
-        let target = match level {
-            0 => TargetAmplitude::Db24,
-            1 => TargetAmplitude::Db27,
-            2 => TargetAmplitude::Db30,
-            3 => TargetAmplitude::Db33,
-            4 => TargetAmplitude::Db36,
-            5 => TargetAmplitude::Db38,
-            6 => TargetAmplitude::Db40,
-            _ => TargetAmplitude::Db42, // 7 or higher
-        };
+    fn set_filter_level(&mut self, level: u8) -> Result<(), RadioError> {
+        let clamped_level = level.min(MAGN_TARGET_MAX);
+        self.driver
+            .set_radio_mode(RadioMode::Idle)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_magn_target(target_amplitude_for_level(clamped_level))
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver.
+            set_radio_mode(RadioMode::Receive).
+            map_err(|_| RadioError::ConfigError)?;
 
-        let result = self
-            .driver
-            .set_magn_target(target)
-            .map_err(|_| RadioError::ConfigError);
+        self.filter_level = clamped_level;
+        Ok(())
+    }
 
-        if result.is_ok() {
-            self.filter_level = level.min(7);
-        }
+    fn get_channel_bandwidth_index(&self) -> u8 {
+        self.channel_bandwidth_index
+    }
 
-        async move { result }
+    fn set_channel_bandwidth_index(
+        &mut self,
+        index: u8,
+    ) -> Result<(), RadioError> {
+        let clamped_index = index.min(CHANNEL_BANDWIDTH_MAX_INDEX);
+        self.driver
+            .set_radio_mode(RadioMode::Idle)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_channel_bandwidth(u64::from(channel_bandwidth_hz(clamped_index)))
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_radio_mode(RadioMode::Receive)
+            .map_err(|_| RadioError::ConfigError)?;
+
+        self.channel_bandwidth_index = clamped_index;
+        Ok(())
+    }
+
+    fn get_carrier_sense_threshold(&self) -> u8 {
+        self.carrier_sense_threshold
+    }
+
+    fn set_carrier_sense_threshold(&mut self, threshold: u8) -> Result<(), RadioError> {
+        let clamped_threshold = threshold.min(CARRIER_SENSE_MAX);
+        self.driver
+            .set_radio_mode(RadioMode::Idle)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_carrier_sense_threshold(clamped_threshold)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_radio_mode(RadioMode::Receive)
+            .map_err(|_| RadioError::ConfigError)?;
+
+        self.carrier_sense_threshold = clamped_threshold;
+        Ok(())
     }
 
     fn take_data_pin(&mut self) -> Option<Self::DataPin> {
