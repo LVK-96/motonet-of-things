@@ -97,11 +97,11 @@ pub trait Radio433 {
     ) -> Result<(), RadioError>;
 
     /// Get the current carrier sense threshold (0-7).
-    /// 0 = at MAGN_TARGET, 1 = +1 dB above, ..., 7 = +7 dB above
+    /// 0 = at `MAGN_TARGET`, 1 = +1 dB above, ..., 7 = +7 dB above
     fn get_carrier_sense_threshold(&self) -> u8;
 
     /// Set the carrier sense threshold (0-7).
-    /// 0 = at MAGN_TARGET, 1 = +1 dB above, ..., 7 = +7 dB above
+    /// 0 = at `MAGN_TARGET`, 1 = +1 dB above, ..., 7 = +7 dB above
     /// Higher values require stronger signals to trigger carrier sense.
     ///
     /// # Errors
@@ -127,6 +127,7 @@ pub struct Cc1101Radio {
 }
 
 #[derive(Clone, Copy, Debug, defmt::Format)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SignalSnapshot {
     pub carrier_sense: bool,
     pub preamble_quality_reached: bool,
@@ -280,6 +281,10 @@ impl Cc1101Radio {
     }
 
     /// Read CC1101 packet-status bits together with current GPIO pin levels.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError::Spi` if SPI communcation to CC1101 fails
     pub fn signal_snapshot(&mut self) -> Result<SignalSnapshot, RadioError> {
         let status = self
             .driver
@@ -297,6 +302,10 @@ impl Cc1101Radio {
     }
 
     /// Apply a frequency/bandwidth profile and return to RX mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError::ConfigError` if any configuration command fails
     pub fn apply_rf_profile(&mut self, freq_hz: u32, bandwidth_hz: u32) -> Result<(), RadioError> {
         self.driver
             .set_radio_mode(RadioMode::Idle)
@@ -315,6 +324,10 @@ impl Cc1101Radio {
     }
 
     /// Route a clock to GDO0 and verify that the MCU sees at least one edge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError::ConfigError` if configurging CC1101 to output the clock fails
     pub async fn probe_gdo0_edge_path(&mut self) -> Result<bool, RadioError> {
         self.driver
             .set_gdo0_config(GdoCfg::CLK_XOSC_192)

@@ -239,7 +239,7 @@ pub async fn display_task(
                                     }
                                     2 => {
                                         pending_bandwidth_index = if pending_bandwidth_index
-                                            <= CHANNEL_BANDWIDTH_MIN_INDEX
+                                            == CHANNEL_BANDWIDTH_MIN_INDEX
                                         {
                                             CHANNEL_BANDWIDTH_MIN_INDEX
                                         } else {
@@ -249,7 +249,7 @@ pub async fn display_task(
                                     3 => {
                                         // Carrier sense threshold: 0-7
                                         pending_carrier_sense =
-                                            if pending_carrier_sense <= CARRIER_SENSE_MIN {
+                                            if pending_carrier_sense == CARRIER_SENSE_MIN {
                                                 CARRIER_SENSE_MIN
                                             } else {
                                                 pending_carrier_sense - 1
