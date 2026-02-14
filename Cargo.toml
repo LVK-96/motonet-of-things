@@ -1,5 +1,5 @@
 [workspace]
-members = ["firmware", "crates/rubicson", "crates/eu-dst"]
+members = ["firmware", "crates/rubicson", "crates/eu-dst", "crates/karu-menu"]
 resolver = "2"
 
 [patch."https://github.com/dsvensson/cc1101.git"]

@@ -1,3 +1,5 @@
+use core::fmt::Write;
+
 use defmt::{error, info};
 use embassy_futures::select::{Either3, select3};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -5,6 +7,11 @@ use embassy_sync::{channel, watch};
 use embassy_time::{Duration, Timer};
 use esp_hal::Blocking;
 use esp_hal::i2c::master::I2c;
+use heapless::String;
+use karu_menu::{
+    ActionItem, Menu, MenuEntry, MenuEvent, MenuRenderer, NumericItem, ScrollableViewport,
+    UiEvent as MenuUiEvent,
+};
 
 use crate::display::{Display, Sh1106Display};
 use crate::messages::{
@@ -33,7 +40,7 @@ pub async fn ui_input_task(
 enum DisplayState {
     Main,
     Radio,
-    Settings { nav_index: u8, editing: bool },
+    Settings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -58,6 +65,142 @@ enum FrameKey {
         bandwidth_index: u8,
         carrier_sense: u8,
     },
+}
+
+const SETTINGS_MENU_CAPACITY: usize = 5;
+const THRESHOLD_ITEM_INDEX: usize = 0;
+const MAGN_ITEM_INDEX: usize = 1;
+const BANDWIDTH_ITEM_INDEX: usize = 2;
+const CARRIER_SENSE_ITEM_INDEX: usize = 3;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsAction {
+    Save,
+}
+
+type SettingsMenu = Menu<MenuEntry<u8, SettingsAction>, SETTINGS_MENU_CAPACITY>;
+
+fn format_db(value: u8) -> String<32> {
+    let mut out = String::new();
+    let _ = write!(out, "{value}dB");
+    out
+}
+
+fn format_magn_target(value: u8) -> String<32> {
+    let mut out = String::new();
+    let magnitude_db = match value {
+        0 => 24,
+        1 => 27,
+        2 => 30,
+        3 => 33,
+        4 => 36,
+        5 => 38,
+        6 => 40,
+        _ => 42,
+    };
+    let _ = write!(out, "{magnitude_db}dB");
+    out
+}
+
+fn format_bandwidth(value: u8) -> String<32> {
+    let mut out = String::new();
+    let bandwidth_khz = channel_bandwidth_hz(value) / 1000;
+    let _ = write!(out, "{bandwidth_khz}kHz");
+    out
+}
+
+fn menu_event_from_ui_event(event: UiEvent) -> MenuUiEvent {
+    match event {
+        UiEvent::NextScreen => MenuUiEvent::NextScreen,
+        UiEvent::PrevScreen => MenuUiEvent::PrevScreen,
+        UiEvent::Select => MenuUiEvent::Select,
+    }
+}
+
+fn reset_settings_menu_for_entry(menu: &mut SettingsMenu) {
+    if menu.is_editing() {
+        let _ = menu.handle_event(MenuUiEvent::Select);
+    }
+    let _ = menu.set_selected(0);
+}
+
+fn add_menu_item(menu: &mut SettingsMenu, item: MenuEntry<u8, SettingsAction>, item_label: &str) {
+    if menu.add(item).is_err() {
+        error!("Settings menu full while adding {}", item_label);
+    }
+}
+
+fn build_settings_menu(initial: RadioSettings) -> SettingsMenu {
+    let mut menu = Menu::new(ScrollableViewport::new(128, 64));
+
+    add_menu_item(
+        &mut menu,
+        MenuEntry::numeric(NumericItem::new(
+            "Threshold",
+            initial.detection_threshold_db,
+            DETECTION_THRESHOLD_MIN_DB..=DETECTION_THRESHOLD_MAX_DB,
+            DETECTION_THRESHOLD_STEP_DB,
+            format_db,
+        )),
+        "Threshold",
+    );
+    add_menu_item(
+        &mut menu,
+        MenuEntry::numeric(NumericItem::new(
+            "Magn Tgt",
+            initial.magn_target,
+            MAGN_TARGET_MIN..=MAGN_TARGET_MAX,
+            1,
+            format_magn_target,
+        )),
+        "Magn Tgt",
+    );
+    add_menu_item(
+        &mut menu,
+        MenuEntry::numeric(NumericItem::new(
+            "Bandwidth",
+            initial.channel_bandwidth_index,
+            CHANNEL_BANDWIDTH_MIN_INDEX..=CHANNEL_BANDWIDTH_MAX_INDEX,
+            1,
+            format_bandwidth,
+        )),
+        "Bandwidth",
+    );
+    add_menu_item(
+        &mut menu,
+        MenuEntry::numeric(NumericItem::new(
+            "CS Thrsh",
+            initial.carrier_sense_threshold,
+            CARRIER_SENSE_MIN..=CARRIER_SENSE_MAX,
+            1,
+            format_db,
+        )),
+        "CS Thrsh",
+    );
+    add_menu_item(
+        &mut menu,
+        MenuEntry::action(ActionItem::new("Save", SettingsAction::Save)),
+        "Save",
+    );
+
+    menu
+}
+
+fn numeric_value_at(menu: &SettingsMenu, index: usize) -> Option<u8> {
+    menu.items().get(index).and_then(|entry| match entry {
+        MenuEntry::Numeric(item) => Some(item.pending()),
+        MenuEntry::Command(_) => None,
+    })
+}
+
+fn sync_pending_from_menu(menu: &SettingsMenu, pending: &mut RadioSettings) {
+    pending.detection_threshold_db =
+        numeric_value_at(menu, THRESHOLD_ITEM_INDEX).unwrap_or(pending.detection_threshold_db);
+    pending.magn_target = numeric_value_at(menu, MAGN_ITEM_INDEX).unwrap_or(pending.magn_target);
+    pending.channel_bandwidth_index =
+        numeric_value_at(menu, BANDWIDTH_ITEM_INDEX).unwrap_or(pending.channel_bandwidth_index);
+    pending.carrier_sense_threshold =
+        numeric_value_at(menu, CARRIER_SENSE_ITEM_INDEX).unwrap_or(pending.carrier_sense_threshold);
 }
 
 fn temp_to_deci(temp_c: f32) -> i16 {
@@ -88,19 +231,12 @@ pub async fn display_task(
     let mut state = DisplayState::Main;
     let mut last_reading: Option<RadioReading> = None;
 
-    // Settings values (pending values, not yet applied)
-    let mut pending_threshold: u8 = DEFAULT_RADIO_SETTINGS.detection_threshold_db;
-    let mut pending_magn_target: u8 = DEFAULT_RADIO_SETTINGS.magn_target;
-    let mut pending_bandwidth_index: u8 = DEFAULT_RADIO_SETTINGS.channel_bandwidth_index;
-    let mut pending_carrier_sense: u8 = DEFAULT_RADIO_SETTINGS.carrier_sense_threshold;
+    let mut pending_settings = DEFAULT_RADIO_SETTINGS;
+    let mut settings_menu = build_settings_menu(pending_settings);
+    sync_pending_from_menu(&settings_menu, &mut pending_settings);
 
     // Send initial settings
-    settings_sender.send(RadioSettings {
-        detection_threshold_db: pending_threshold,
-        magn_target: pending_magn_target,
-        channel_bandwidth_index: pending_bandwidth_index,
-        carrier_sense_threshold: pending_carrier_sense,
-    });
+    settings_sender.send(pending_settings);
 
     // Skip full redraws when nothing visual has changed.
     let mut last_frame: Option<FrameKey> = None;
@@ -121,153 +257,48 @@ pub async fn display_task(
                 state = match state {
                     DisplayState::Main => match event {
                         UiEvent::NextScreen | UiEvent::PrevScreen => DisplayState::Radio,
-                        UiEvent::Select => DisplayState::Settings {
-                            nav_index: 0,
-                            editing: false,
-                        },
+                        UiEvent::Select => {
+                            reset_settings_menu_for_entry(&mut settings_menu);
+                            DisplayState::Settings
+                        }
                     },
                     DisplayState::Radio => match event {
                         UiEvent::NextScreen | UiEvent::PrevScreen => DisplayState::Main,
-                        UiEvent::Select => DisplayState::Settings {
-                            nav_index: 0,
-                            editing: false,
-                        },
-                    },
-                    DisplayState::Settings { nav_index, editing } => match event {
                         UiEvent::Select => {
-                            if editing {
-                                // Exit editing mode, go back to navigation
-                                DisplayState::Settings {
-                                    nav_index,
-                                    editing: false,
-                                }
-                            } else if nav_index == 4 {
-                                // Save selected - apply settings and exit
-                                settings_sender.send(RadioSettings {
-                                    detection_threshold_db: pending_threshold,
-                                    magn_target: pending_magn_target,
-                                    channel_bandwidth_index: pending_bandwidth_index,
-                                    carrier_sense_threshold: pending_carrier_sense,
-                                });
+                            reset_settings_menu_for_entry(&mut settings_menu);
+                            DisplayState::Settings
+                        }
+                    },
+                    DisplayState::Settings => {
+                        let menu_event =
+                            settings_menu.handle_event(menu_event_from_ui_event(event));
+                        if matches!(menu_event, MenuEvent::ValueChanged(_)) {
+                            sync_pending_from_menu(&settings_menu, &mut pending_settings);
+                        }
+
+                        match menu_event {
+                            MenuEvent::ActionSelected {
+                                action: SettingsAction::Save,
+                                ..
+                            } => {
+                                sync_pending_from_menu(&settings_menu, &mut pending_settings);
+                                settings_menu.commit_all();
+                                settings_sender.send(pending_settings);
                                 let bandwidth_khz =
-                                    channel_bandwidth_hz(pending_bandwidth_index) / 1000;
+                                    channel_bandwidth_hz(pending_settings.channel_bandwidth_index)
+                                        / 1000;
                                 info!(
                                     "Settings saved: threshold={} dB, magn_target={}, bandwidth={} kHz, carrier_sense={}",
-                                    pending_threshold, pending_magn_target, bandwidth_khz, pending_carrier_sense
+                                    pending_settings.detection_threshold_db,
+                                    pending_settings.magn_target,
+                                    bandwidth_khz,
+                                    pending_settings.carrier_sense_threshold
                                 );
                                 DisplayState::Radio
-                            } else {
-                                // Enter editing mode for current item
-                                DisplayState::Settings {
-                                    nav_index,
-                                    editing: true,
-                                }
                             }
+                            _ => DisplayState::Settings,
                         }
-                        UiEvent::NextScreen => {
-                            if editing {
-                                // Adjust value up
-                                match nav_index {
-                                    0 => {
-                                        // Detection threshold: 4, 8, 12, 16 dB
-                                        pending_threshold =
-                                            if pending_threshold >= DETECTION_THRESHOLD_MAX_DB {
-                                                DETECTION_THRESHOLD_MAX_DB
-                                            } else {
-                                                pending_threshold + DETECTION_THRESHOLD_STEP_DB
-                                            };
-                                    }
-                                    1 => {
-                                        // Magn target: 0-7
-                                        pending_magn_target =
-                                            if pending_magn_target >= MAGN_TARGET_MAX {
-                                                MAGN_TARGET_MAX
-                                            } else {
-                                                pending_magn_target + 1
-                                            };
-                                    }
-                                    2 => {
-                                        // Channel bandwidth: 0-3 (325/203/162/135 kHz)
-                                        pending_bandwidth_index = if pending_bandwidth_index
-                                            >= CHANNEL_BANDWIDTH_MAX_INDEX
-                                        {
-                                            CHANNEL_BANDWIDTH_MAX_INDEX
-                                        } else {
-                                            pending_bandwidth_index + 1
-                                        };
-                                    }
-                                    3 => {
-                                        // Carrier sense threshold: 0-7
-                                        pending_carrier_sense =
-                                            if pending_carrier_sense >= CARRIER_SENSE_MAX {
-                                                CARRIER_SENSE_MAX
-                                            } else {
-                                                pending_carrier_sense + 1
-                                            };
-                                    }
-                                    _ => {}
-                                }
-                                DisplayState::Settings { nav_index, editing }
-                            } else {
-                                // Navigate to next item (wrap around)
-                                let next = if nav_index >= 4 { 0 } else { nav_index + 1 };
-                                DisplayState::Settings {
-                                    nav_index: next,
-                                    editing: false,
-                                }
-                            }
-                        }
-                        UiEvent::PrevScreen => {
-                            if editing {
-                                // Adjust value down
-                                match nav_index {
-                                    0 => {
-                                        pending_threshold =
-                                            if pending_threshold <= DETECTION_THRESHOLD_MIN_DB {
-                                                DETECTION_THRESHOLD_MIN_DB
-                                            } else {
-                                                pending_threshold - DETECTION_THRESHOLD_STEP_DB
-                                            };
-                                    }
-                                    1 => {
-                                        pending_magn_target =
-                                            if pending_magn_target == MAGN_TARGET_MIN {
-                                                MAGN_TARGET_MIN
-                                            } else {
-                                                pending_magn_target - 1
-                                            };
-                                    }
-                                    2 => {
-                                        pending_bandwidth_index = if pending_bandwidth_index
-                                            == CHANNEL_BANDWIDTH_MIN_INDEX
-                                        {
-                                            CHANNEL_BANDWIDTH_MIN_INDEX
-                                        } else {
-                                            pending_bandwidth_index - 1
-                                        };
-                                    }
-                                    3 => {
-                                        // Carrier sense threshold: 0-7
-                                        pending_carrier_sense =
-                                            if pending_carrier_sense == CARRIER_SENSE_MIN {
-                                                CARRIER_SENSE_MIN
-                                            } else {
-                                                pending_carrier_sense - 1
-                                            };
-                                    }
-                                    _ => {}
-                                }
-                                DisplayState::Settings { nav_index, editing }
-                            } else {
-                                // Navigate to previous item (wrap around)
-                                let prev = if nav_index == 0 { 4 } else { nav_index - 1 };
-                                DisplayState::Settings {
-                                    nav_index: prev,
-                                    editing: false,
-                                }
-                            }
-                        }
-                    },
+                    }
                 };
             }
             Either3::Third(()) => {
@@ -288,20 +319,22 @@ pub async fn display_task(
             }
             DisplayState::Radio => {
                 let rssi = last_reading.map(|r| r.rssi);
-                let detection_threshold =
-                    last_reading.map_or(pending_threshold, |r| r.detection_threshold);
+                let detection_threshold = last_reading
+                    .map_or(pending_settings.detection_threshold_db, |r| {
+                        r.detection_threshold
+                    });
                 FrameKey::Radio {
                     rssi,
                     detection_threshold,
                 }
             }
-            DisplayState::Settings { nav_index, editing } => FrameKey::Settings {
-                nav_index,
-                editing,
-                threshold: pending_threshold,
-                magn: pending_magn_target,
-                bandwidth_index: pending_bandwidth_index,
-                carrier_sense: pending_carrier_sense,
+            DisplayState::Settings => FrameKey::Settings {
+                nav_index: u8::try_from(settings_menu.selected_index()).map_or(u8::MAX, |v| v),
+                editing: settings_menu.is_editing(),
+                threshold: pending_settings.detection_threshold_db,
+                magn: pending_settings.magn_target,
+                bandwidth_index: pending_settings.channel_bandwidth_index,
+                carrier_sense: pending_settings.carrier_sense_threshold,
             },
         };
 
@@ -339,8 +372,10 @@ pub async fn display_task(
             }
             DisplayState::Radio => {
                 let rssi = last_reading.map(|r| r.rssi);
-                let det_threshold =
-                    last_reading.map_or(pending_threshold, |r| r.detection_threshold);
+                let det_threshold = last_reading
+                    .map_or(pending_settings.detection_threshold_db, |r| {
+                        r.detection_threshold
+                    });
                 if let Err(e) = display.show_radio_info(rssi, det_threshold) {
                     error!("Display: Failed to show radio info: {:?}", e);
                     false
@@ -348,21 +383,27 @@ pub async fn display_task(
                     true
                 }
             }
-            DisplayState::Settings { nav_index, editing } => {
-                if let Err(e) = display.show_settings_menu(
-                    nav_index,
-                    editing,
-                    pending_threshold,
-                    pending_magn_target,
-                    pending_bandwidth_index,
-                    pending_carrier_sense,
-                ) {
-                    error!("Display: Failed to show settings: {:?}", e);
-                    false
-                } else {
-                    true
-                }
-            }
+            DisplayState::Settings => display
+                .clear()
+                .and_then(|()| display.draw_header("SETTINGS"))
+                .and_then(|()| {
+                    let renderer = MenuRenderer::new(&settings_menu);
+                    renderer
+                        .render_items()
+                        .iter()
+                        .try_for_each(|item| display.draw_menu_item(item))?;
+                    if let Some(indicator) = renderer.scroll_indicator() {
+                        display.draw_scroll_indicator(indicator)?;
+                    }
+                    display.flush()
+                })
+                .map_or_else(
+                    |e| {
+                        error!("Display: Failed to show settings: {:?}", e);
+                        false
+                    },
+                    |()| true,
+                ),
         };
 
         if render_ok {

@@ -8,10 +8,11 @@ use embedded_graphics::{
     text::{Alignment, Text},
 };
 use heapless::String;
+use karu_menu::{RenderItem, ScrollIndicator};
 use mini_oled::prelude::*;
 use profont::{PROFONT_10_POINT, PROFONT_14_POINT, PROFONT_24_POINT};
 
-use crate::messages::{channel_bandwidth_hz, SignalQuality};
+use crate::messages::SignalQuality;
 
 /// Error type for display operations
 #[derive(Debug, defmt::Format)]
@@ -80,29 +81,26 @@ pub trait Display {
         detection_threshold: u8,
     ) -> Result<(), DisplayError>;
 
-    /// Show settings menu
-    ///
-    /// # Arguments
-    ///
-    /// * `nav_index` - Index of currently navigated item
-    /// * `editing` - Whether we are editing the currently selected item
-    /// * `detection_threshold` - Current detection threshold value in dB
-    /// * `magn_target` - Current magnitude target level (0-7)
-    /// * `channel_bandwidth_index` - Current channel bandwidth option index (0-3)
-    /// * `carrier_sense` - Current carrier sense threshold (0-7)
+    /// Draw a section header.
     ///
     /// # Errors
     ///
     /// Returns `DisplayError` if the operation fails
-    fn show_settings_menu(
-        &mut self,
-        nav_index: u8,
-        editing: bool,
-        detection_threshold: u8,
-        magn_target: u8,
-        channel_bandwidth_index: u8,
-        carrier_sense: u8,
-    ) -> Result<(), DisplayError>;
+    fn draw_header(&mut self, title: &str) -> Result<(), DisplayError>;
+
+    /// Draw a single menu item.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DisplayError` if the operation fails
+    fn draw_menu_item(&mut self, item: &RenderItem<'_>) -> Result<(), DisplayError>;
+
+    /// Draw menu overflow indicator.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DisplayError` if the operation fails
+    fn draw_scroll_indicator(&mut self, indicator: ScrollIndicator) -> Result<(), DisplayError>;
 }
 
 /// SH1106 OLED display driver implementation using mini-oled.
@@ -322,107 +320,79 @@ where
         self.flush()
     }
 
-    fn show_settings_menu(
-        &mut self,
-        nav_index: u8,
-        editing: bool,
-        detection_threshold: u8,
-        magn_target: u8,
-        channel_bandwidth_index: u8,
-        carrier_sense: u8,
-    ) -> Result<(), DisplayError> {
-        self.clear()?;
-
+    fn draw_header(&mut self, title: &str) -> Result<(), DisplayError> {
         let style_header = MonoTextStyle::new(&PROFONT_14_POINT, BinaryColor::On);
+        Text::with_alignment(title, Point::new(64, 12), style_header, Alignment::Center)
+            .draw(self.driver.get_mut_canvas())
+            .map(|_| ())
+            .map_err(|_| DisplayError::DrawFailed)
+    }
+
+    fn draw_menu_item(&mut self, item: &RenderItem<'_>) -> Result<(), DisplayError> {
         let style_normal = MonoTextStyle::new(&PROFONT_10_POINT, BinaryColor::On);
         let style_filled = PrimitiveStyle::with_fill(BinaryColor::On);
 
-        // Header
         Text::with_alignment(
-            "SETTINGS",
-            Point::new(64, 12),
-            style_header,
-            Alignment::Center,
+            item.label,
+            Point::new(8, item.y),
+            style_normal,
+            Alignment::Left,
         )
         .draw(self.driver.get_mut_canvas())
         .map_err(|_| DisplayError::DrawFailed)?;
 
-        // Convert magn_target (0-7) to dB value per CC1101 datasheet
-        let magn_target_db: u8 = match magn_target {
-            0 => 24,
-            1 => 27,
-            2 => 30,
-            3 => 33,
-            4 => 36,
-            5 => 38,
-            6 => 40,
-            _ => 42, // 7 or higher
-        };
-        let bandwidth_khz = channel_bandwidth_hz(channel_bandwidth_index) / 1000;
-
-        // Menu items: Threshold, Magn Tgt, Bandwidth, Carrier Sense, Save
-        // Store (label, Option<(value, unit)>)
-        let items: [(&str, Option<(u32, &str)>); 5] = [
-            ("Threshold", Some((u32::from(detection_threshold), "dB"))),
-            ("Magn Tgt", Some((u32::from(magn_target_db), "dB"))),
-            ("Bandwidth", Some((bandwidth_khz, "kHz"))),
-            ("CS Thrsh", Some((u32::from(carrier_sense), "dB"))),
-            ("Save", None),
-        ];
-
-        for (i, (label, value_unit)) in items.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let y = 24 + (i as i32 * 10);
-            let is_nav = i == nav_index as usize;
-            let is_editing = is_nav && editing && value_unit.is_some();
-
-            // Draw label
-            Text::with_alignment(label, Point::new(8, y), style_normal, Alignment::Left)
+        if item.is_selected && !item.is_editing {
+            let label_chars =
+                i32::try_from(item.label.len()).map_or(i32::MAX / 6, core::convert::identity);
+            let label_width = u32::try_from(label_chars.saturating_mul(6))
+                .map_or(u32::MAX, core::convert::identity);
+            Rectangle::new(Point::new(8, item.y + 2), Size::new(label_width, 1))
+                .into_styled(style_filled)
                 .draw(self.driver.get_mut_canvas())
                 .map_err(|_| DisplayError::DrawFailed)?;
+        }
 
-            // Draw underline under label if navigating to this item (not editing)
-            if is_nav && !editing {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                let label_width = (label.len() as i32) * 6; // Approximate char width for PROFONT_10
-                #[allow(clippy::cast_sign_loss)]
-                Rectangle::new(Point::new(8, y + 2), Size::new(label_width as u32, 1))
-                    .into_styled(style_filled)
-                    .draw(self.driver.get_mut_canvas())
-                    .map_err(|_| DisplayError::DrawFailed)?;
-            }
+        if !item.value.is_empty() {
+            let value_x = 120;
+            Text::with_alignment(
+                item.value.as_str(),
+                Point::new(value_x, item.y),
+                style_normal,
+                Alignment::Right,
+            )
+            .draw(self.driver.get_mut_canvas())
+            .map_err(|_| DisplayError::DrawFailed)?;
 
-            // Draw value with unit if present
-            if let Some((val, unit)) = value_unit {
-                let mut value_str: String<12> = String::new();
-                let _ = write!(value_str, "{val}{unit}");
-                let value_x = 120;
-                Text::with_alignment(
-                    value_str.as_str(),
-                    Point::new(value_x, y),
-                    style_normal,
-                    Alignment::Right,
+            if item.is_editing {
+                let value_chars =
+                    i32::try_from(item.value.len()).map_or(i32::MAX / 6, core::convert::identity);
+                let value_width = u32::try_from(value_chars.saturating_mul(6))
+                    .map_or(u32::MAX, core::convert::identity);
+                let value_width_i32 =
+                    i32::try_from(value_width).map_or(i32::MAX, core::convert::identity);
+                Rectangle::new(
+                    Point::new(value_x - value_width_i32, item.y + 2),
+                    Size::new(value_width, 1),
                 )
+                .into_styled(style_filled)
                 .draw(self.driver.get_mut_canvas())
                 .map_err(|_| DisplayError::DrawFailed)?;
-
-                // Draw underline under value if editing this item
-                if is_editing {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    let val_width = (value_str.len() as i32) * 6;
-                    #[allow(clippy::cast_sign_loss)]
-                    Rectangle::new(
-                        Point::new(value_x - val_width, y + 2),
-                        Size::new(val_width as u32, 1),
-                    )
-                    .into_styled(style_filled)
-                    .draw(self.driver.get_mut_canvas())
-                    .map_err(|_| DisplayError::DrawFailed)?;
-                }
             }
         }
 
-        self.flush()
+        Ok(())
+    }
+
+    fn draw_scroll_indicator(&mut self, indicator: ScrollIndicator) -> Result<(), DisplayError> {
+        let style = MonoTextStyle::new(&PROFONT_10_POINT, BinaryColor::On);
+        let symbol = match indicator {
+            ScrollIndicator::UpArrow => "^",
+            ScrollIndicator::DownArrow => "v",
+        };
+        Text::with_alignment(symbol, Point::new(124, 60), style, Alignment::Right)
+            .draw(self.driver.get_mut_canvas())
+            .map(|_| ())
+            .map_err(|_| DisplayError::DrawFailed)
     }
 }
 
