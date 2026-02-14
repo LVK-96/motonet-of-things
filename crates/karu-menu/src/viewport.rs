@@ -15,7 +15,8 @@ pub struct ScrollableViewport {
 impl ScrollableViewport {
     #[must_use]
     pub fn new(width: u8, height: u8) -> Self {
-        Self::with_metrics(width, height, 14, 10)
+        // Reserve enough vertical space for a 14px title plus breathing room.
+        Self::with_metrics(width, height, 22, 10)
     }
 
     #[must_use]
@@ -183,5 +184,12 @@ mod tests {
         let _ = viewport.select(5);
         assert!(viewport.has_more_above());
         assert!(!viewport.has_more_below());
+    }
+
+    #[test]
+    fn default_layout_keeps_first_item_below_title_band() {
+        let mut viewport = ScrollableViewport::new(128, 64);
+        viewport.set_total_items(1);
+        assert_eq!(viewport.item_y(0), 24);
     }
 }
