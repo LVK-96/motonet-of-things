@@ -21,7 +21,7 @@ pub struct RadioReading {
 }
 
 /// Radio settings that can be changed at runtime.
-#[derive(Debug, Clone, Copy, defmt::Format)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub struct RadioSettings {
     /// Detection threshold in dB (valid values: 4, 8, 12, 16)
     pub detection_threshold_db: u8,

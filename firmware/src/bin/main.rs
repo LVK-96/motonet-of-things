@@ -204,6 +204,7 @@ async fn main(spawner: Spawner) -> ! {
                 r433,
                 READING_WATCH.sender(),
                 MQTT_READING_CHANNEL.sender(),
+                RADIO_SETTINGS_WATCH.sender(),
                 settings_receiver,
             ))
             .expect("Failed to spawn radio task");
@@ -226,6 +227,7 @@ async fn main(spawner: Spawner) -> ! {
                 rmt_rx,
                 READING_WATCH.sender(),
                 MQTT_READING_CHANNEL.sender(),
+                RADIO_SETTINGS_WATCH.sender(),
             ))
             .expect("Failed to spawn radio task");
     }
@@ -248,6 +250,9 @@ async fn main(spawner: Spawner) -> ! {
                 .receiver()
                 .expect("Failed to get reading receiver"),
             UI_EVENT_CHANNEL.receiver(),
+            RADIO_SETTINGS_WATCH
+                .receiver()
+                .expect("Failed to get settings receiver for display"),
             RADIO_SETTINGS_WATCH.sender(),
         ))
         .expect("Failed to spawn display task");

@@ -216,6 +216,7 @@ pub async fn display_task(
     mut display: Sh1106Display<I2c<'static, Blocking>>,
     mut receiver: watch::Receiver<'static, CriticalSectionRawMutex, RadioReading, 2>,
     ui_event_receiver: channel::Receiver<'static, CriticalSectionRawMutex, UiEvent, 8>,
+    mut settings_receiver: watch::Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
     settings_sender: watch::Sender<'static, CriticalSectionRawMutex, RadioSettings, 2>,
 ) {
     info!("Display task started");
@@ -231,12 +232,11 @@ pub async fn display_task(
     let mut state = DisplayState::Main;
     let mut last_reading: Option<RadioReading> = None;
 
-    let mut pending_settings = DEFAULT_RADIO_SETTINGS;
+    let mut pending_settings = settings_receiver
+        .try_get()
+        .unwrap_or(DEFAULT_RADIO_SETTINGS);
     let mut settings_menu = build_settings_menu(pending_settings);
     sync_pending_from_menu(&settings_menu, &mut pending_settings);
-
-    // Send initial settings
-    settings_sender.send(pending_settings);
 
     // Skip full redraws when nothing visual has changed.
     let mut last_frame: Option<FrameKey> = None;
@@ -304,6 +304,14 @@ pub async fn display_task(
             Either3::Third(()) => {
                 // Tick to allow clock-driven updates on the main screen.
             }
+        }
+
+        if let Some(current_settings) = settings_receiver.try_get()
+            && current_settings != pending_settings
+            && !matches!(state, DisplayState::Settings)
+        {
+            pending_settings = current_settings;
+            settings_menu = build_settings_menu(pending_settings);
         }
 
         let current_time = time_receiver.try_get().flatten();

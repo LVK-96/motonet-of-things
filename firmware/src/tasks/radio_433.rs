@@ -18,6 +18,7 @@ use crate::radio_433::{Cc1101Radio, Radio433};
 
 type ReadingSender = watch::Sender<'static, CriticalSectionRawMutex, RadioReading, 2>;
 type MqttSender = channel::Sender<'static, CriticalSectionRawMutex, RadioReading, 16>;
+type SettingsSender = watch::Sender<'static, CriticalSectionRawMutex, RadioSettings, 2>;
 type SettingsReceiver = watch::Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>;
 #[cfg(feature = "pulse_rmt")]
 type SharedRadio = &'static Mutex<CriticalSectionRawMutex, Cc1101Radio>;
@@ -215,7 +216,16 @@ async fn run_rf_sweep(radio: &mut Cc1101Radio) {
     }
 }
 
-async fn prepare_radio_for_capture(radio: &mut Cc1101Radio) -> Result<(), ()> {
+fn current_radio_settings(radio: &Cc1101Radio) -> RadioSettings {
+    RadioSettings {
+        detection_threshold_db: radio.get_detection_threshold(),
+        magn_target: radio.get_filter_level(),
+        channel_bandwidth_index: radio.get_channel_bandwidth_index(),
+        carrier_sense_threshold: radio.get_carrier_sense_threshold(),
+    }
+}
+
+async fn prepare_radio_for_capture(radio: &mut Cc1101Radio) -> Result<RadioSettings, ()> {
     info!("Radio 433 RX task started");
 
     match radio.get_hw_info().await {
@@ -251,12 +261,8 @@ async fn prepare_radio_for_capture(radio: &mut Cc1101Radio) -> Result<(), ()> {
         stats.pkt_gdo2_high_samples,
         stats.pin_gdo2_high_samples
     );
-    match radio.probe_gdo0_edge_path().await {
-        Ok(edge_seen) => info!("GDO0 edge probe (clock mode): edge_seen={}", edge_seen),
-        Err(e) => warn!("GDO0 edge probe failed: {:?}", e),
-    }
     info!("Starting pulse capture...");
-    Ok(())
+    Ok(current_radio_settings(radio))
 }
 
 #[cfg(feature = "pulse_sw")]
@@ -265,11 +271,13 @@ pub async fn radio_433_rx_task(
     mut radio: Cc1101Radio,
     reading_sender: ReadingSender,
     mqtt_sender: MqttSender,
+    settings_sender: SettingsSender,
     settings_receiver: SettingsReceiver,
 ) {
-    if prepare_radio_for_capture(&mut radio).await.is_err() {
+    let Ok(current_settings) = prepare_radio_for_capture(&mut radio).await else {
         return;
-    }
+    };
+    settings_sender.send(current_settings);
 
     // Take ownership of the data pin for pulse capture
     let Some(data_pin) = radio.take_data_pin() else {
@@ -294,13 +302,16 @@ pub async fn radio_433_rx_task(
     rmt_rx: RmtChannel<'static, Async, Rx>,
     reading_sender: ReadingSender,
     mqtt_sender: MqttSender,
+    settings_sender: SettingsSender,
 ) {
-    {
+    let current_settings = {
         let mut radio = shared_radio.lock().await;
-        if prepare_radio_for_capture(&mut radio).await.is_err() {
+        let Ok(settings) = prepare_radio_for_capture(&mut radio).await else {
             return;
-        }
-    }
+        };
+        settings
+    };
+    settings_sender.send(current_settings);
 
     let mut capture = PulseCapture::new(rmt_rx, shared_radio, reading_sender, mqtt_sender);
     capture.run().await;
