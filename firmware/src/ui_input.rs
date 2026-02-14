@@ -4,7 +4,7 @@ use core::future::Future;
 use embassy_time::{Duration, Timer};
 use esp_hal::gpio::Input;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub enum UiEvent {
     NextScreen,
     PrevScreen,

@@ -1,22 +1,20 @@
 use defmt::{debug, info, trace, warn};
-use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender as ChannelSender;
-use embassy_sync::watch::{Receiver, Sender as WatchSender};
+use embassy_sync::mutex::Mutex;
+use embassy_sync::watch::Sender as WatchSender;
 use esp_hal::Async;
 use esp_hal::gpio::Level;
 use esp_hal::rmt::{Channel as RmtChannel, PulseCode, Rx};
 
-use crate::messages::{RadioReading, RadioSettings};
-use crate::pulse_capture::apply_pending_settings;
+use crate::messages::RadioReading;
 use crate::radio_433::Radio433;
 
-pub struct PulseCapture<'d, R: Radio433> {
+pub struct PulseCapture<'d, R: Radio433 + 'static> {
     channel: RmtChannel<'d, Async, Rx>,
-    radio: &'d mut R,
+    radio: &'static Mutex<CriticalSectionRawMutex, R>,
     sender: WatchSender<'static, CriticalSectionRawMutex, RadioReading, 2>,
     mqtt_sender: ChannelSender<'static, CriticalSectionRawMutex, RadioReading, 16>,
-    settings_receiver: Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
 }
 
 struct PulseDistanceIter<'a> {
@@ -74,20 +72,18 @@ impl Iterator for PulseDistanceIter<'_> {
     }
 }
 
-impl<'d, R: Radio433> PulseCapture<'d, R> {
+impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
     pub fn new(
         channel: RmtChannel<'d, Async, Rx>,
-        radio: &'d mut R,
+        radio: &'static Mutex<CriticalSectionRawMutex, R>,
         sender: WatchSender<'static, CriticalSectionRawMutex, RadioReading, 2>,
         mqtt_sender: ChannelSender<'static, CriticalSectionRawMutex, RadioReading, 16>,
-        settings_receiver: Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
     ) -> Self {
         Self {
             channel,
             radio,
             sender,
             mqtt_sender,
-            settings_receiver,
         }
     }
 
@@ -98,20 +94,10 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
         info!("PulseCapture(RMT): Ready, waiting for signal...");
 
         loop {
-            let symbol_count = match select(
-                self.channel.receive(&mut symbols),
-                self.settings_receiver.changed(),
-            )
-            .await
-            {
-                Either::First(Ok(count)) => count,
-                Either::First(Err(e)) => {
+            let symbol_count = match self.channel.receive(&mut symbols).await {
+                Ok(count) => count,
+                Err(e) => {
                     warn!("RMT receive failed: {:?}", e);
-                    apply_pending_settings(&mut *self.radio, &mut self.settings_receiver).await;
-                    continue;
-                }
-                Either::Second(_) => {
-                    apply_pending_settings(&mut *self.radio, &mut self.settings_receiver).await;
                     continue;
                 }
             };
@@ -131,8 +117,12 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
             if gap_count >= 36 {
                 match decode_result {
                     Ok((_row, reading)) => {
-                        let rssi = self.radio.get_rssi_dbm().await.unwrap_or(-128);
-                        let detection_threshold = self.radio.get_detection_threshold();
+                        let (rssi, detection_threshold) = {
+                            let mut radio = self.radio.lock().await;
+                            let rssi = radio.get_rssi_dbm().await.unwrap_or(-128);
+                            let detection_threshold = radio.get_detection_threshold();
+                            (rssi, detection_threshold)
+                        };
 
                         debug!("Decoded: {:?}, RSSI={}dBm", reading, rssi);
 
@@ -151,8 +141,6 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
             } else {
                 trace!("Not enough gaps for decoding (need 36, got {})", gap_count);
             }
-
-            apply_pending_settings(&mut *self.radio, &mut self.settings_receiver).await;
         }
     }
 }

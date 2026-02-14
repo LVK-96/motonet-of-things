@@ -1,5 +1,7 @@
 use defmt::{error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+#[cfg(feature = "pulse_rmt")]
+use embassy_sync::mutex::Mutex;
 use embassy_sync::{channel, watch};
 use embassy_time::{Duration, Timer};
 
@@ -10,11 +12,15 @@ use esp_hal::rmt::{Channel as RmtChannel, Rx};
 
 use crate::messages::{RadioReading, RadioSettings};
 use crate::pulse_capture::PulseCapture;
+#[cfg(feature = "pulse_rmt")]
+use crate::pulse_capture::apply_pending_settings;
 use crate::radio_433::{Cc1101Radio, Radio433};
 
 type ReadingSender = watch::Sender<'static, CriticalSectionRawMutex, RadioReading, 2>;
 type MqttSender = channel::Sender<'static, CriticalSectionRawMutex, RadioReading, 16>;
 type SettingsReceiver = watch::Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>;
+#[cfg(feature = "pulse_rmt")]
+type SharedRadio = &'static Mutex<CriticalSectionRawMutex, Cc1101Radio>;
 
 async fn prepare_radio_for_capture(radio: &mut Cc1101Radio) -> Result<(), ()> {
     info!("Radio 433 RX task started");
@@ -87,22 +93,31 @@ pub async fn radio_433_rx_task(
 #[cfg(feature = "pulse_rmt")]
 #[embassy_executor::task]
 pub async fn radio_433_rx_task(
-    mut radio: Cc1101Radio,
+    shared_radio: SharedRadio,
     rmt_rx: RmtChannel<'static, Async, Rx>,
     reading_sender: ReadingSender,
     mqtt_sender: MqttSender,
-    settings_receiver: SettingsReceiver,
 ) {
-    if prepare_radio_for_capture(&mut radio).await.is_err() {
-        return;
+    {
+        let mut radio = shared_radio.lock().await;
+        if prepare_radio_for_capture(&mut radio).await.is_err() {
+            return;
+        }
     }
 
-    let mut capture = PulseCapture::new(
-        rmt_rx,
-        &mut radio,
-        reading_sender,
-        mqtt_sender,
-        settings_receiver,
-    );
+    let mut capture = PulseCapture::new(rmt_rx, shared_radio, reading_sender, mqtt_sender);
     capture.run().await;
+}
+
+#[cfg(feature = "pulse_rmt")]
+#[embassy_executor::task]
+pub async fn radio_433_settings_task(
+    shared_radio: SharedRadio,
+    mut settings_receiver: SettingsReceiver,
+) {
+    loop {
+        settings_receiver.changed().await;
+        let mut radio = shared_radio.lock().await;
+        apply_pending_settings(&mut *radio, &mut settings_receiver).await;
+    }
 }

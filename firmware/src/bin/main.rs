@@ -8,6 +8,8 @@ use defmt::{error, info};
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+#[cfg(feature = "pulse_rmt")]
+use embassy_sync::mutex::Mutex;
 use embassy_sync::watch::Watch;
 
 use esp_hal::clock::CpuClock;
@@ -38,7 +40,7 @@ use esp32_rust_project::tasks::{
     display as display_task, led_pwm as led_pwm_task, mqtt as mqtt_task,
     radio_433 as radio_433_task, time_sync as time_sync_task,
 };
-use esp32_rust_project::ui_input::EC11RotaryEncoderInput;
+use esp32_rust_project::ui_input::{EC11RotaryEncoderInput, UiEvent};
 use esp32_rust_project::with_retry;
 
 /// Watch for sharing latest readings with display/UI.
@@ -48,6 +50,8 @@ static MQTT_READING_CHANNEL: Channel<CriticalSectionRawMutex, RadioReading, 16> 
 
 /// Watch for sharing radio settings with the radio task
 static RADIO_SETTINGS_WATCH: Watch<CriticalSectionRawMutex, RadioSettings, 2> = Watch::new();
+/// Queue for UI events so display task does not cancel GPIO edge waits.
+static UI_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, UiEvent, 8> = Channel::new();
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -73,6 +77,9 @@ async fn main(spawner: Spawner) -> ! {
     // Statics allocated in main to ensure lifetime
     static LEDC_TIMER: StaticCell<timer::Timer<'static, LowSpeed>> = StaticCell::new();
     static RADIO_CONTROLLER: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
+    #[cfg(feature = "pulse_rmt")]
+    static SHARED_RADIO: StaticCell<Mutex<CriticalSectionRawMutex, Cc1101Radio>> =
+        StaticCell::new();
 
     let peripherals = system_setup();
 
@@ -150,7 +157,7 @@ async fn main(spawner: Spawner) -> ! {
             .with_clk_divider(80)
             .with_filter_threshold(50)
             .with_idle_threshold(5000)
-            .with_memsize(4);
+            .with_memsize(8);
         rmt.channel0
             .configure_rx(data_pin, rmt_rx_cfg)
             .expect("Failed to configure RMT RX channel")
@@ -203,16 +210,22 @@ async fn main(spawner: Spawner) -> ! {
     }
     #[cfg(feature = "pulse_rmt")]
     {
+        let shared_radio = SHARED_RADIO.init(Mutex::new(r433));
         let settings_receiver = RADIO_SETTINGS_WATCH
             .receiver()
             .expect("Failed to get settings receiver");
         spawner
+            .spawn(radio_433_task::radio_433_settings_task(
+                shared_radio,
+                settings_receiver,
+            ))
+            .expect("Failed to spawn radio settings task");
+        spawner
             .spawn(radio_433_task::radio_433_rx_task(
-                r433,
+                shared_radio,
                 rmt_rx,
                 READING_WATCH.sender(),
                 MQTT_READING_CHANNEL.sender(),
-                settings_receiver,
             ))
             .expect("Failed to spawn radio task");
     }
@@ -223,12 +236,18 @@ async fn main(spawner: Spawner) -> ! {
         ))
         .expect("Failed to spawn mqtt task");
     spawner
+        .spawn(display_task::ui_input_task(
+            ui_input,
+            UI_EVENT_CHANNEL.sender(),
+        ))
+        .expect("Failed to spawn ui input task");
+    spawner
         .spawn(display_task::display_task(
             display,
             READING_WATCH
                 .receiver()
                 .expect("Failed to get reading receiver"),
-            ui_input,
+            UI_EVENT_CHANNEL.receiver(),
             RADIO_SETTINGS_WATCH.sender(),
         ))
         .expect("Failed to spawn display task");

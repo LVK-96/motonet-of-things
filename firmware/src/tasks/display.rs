@@ -1,7 +1,7 @@
 use defmt::{error, info};
 use embassy_futures::select::{Either3, select3};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::watch;
+use embassy_sync::{channel, watch};
 use embassy_time::{Duration, Timer};
 use esp_hal::Blocking;
 use esp_hal::i2c::master::I2c;
@@ -10,6 +10,19 @@ use crate::display::{Display, Sh1106Display};
 use crate::messages::{RadioReading, RadioSettings};
 use crate::time_sync::TIME_WATCH;
 use crate::ui_input::{EC11RotaryEncoderInput, UiEvent, UiInput};
+
+#[embassy_executor::task]
+pub async fn ui_input_task(
+    mut ui: EC11RotaryEncoderInput,
+    ui_event_sender: channel::Sender<'static, CriticalSectionRawMutex, UiEvent, 8>,
+) {
+    loop {
+        let event = ui
+            .next_event(UiEvent::NextScreen, UiEvent::PrevScreen)
+            .await;
+        ui_event_sender.send(event).await;
+    }
+}
 
 #[derive(Clone, Copy)]
 enum DisplayState {
@@ -52,7 +65,7 @@ fn temp_to_deci(temp_c: f32) -> i16 {
 pub async fn display_task(
     mut display: Sh1106Display<I2c<'static, Blocking>>,
     mut receiver: watch::Receiver<'static, CriticalSectionRawMutex, RadioReading, 2>,
-    mut ui: EC11RotaryEncoderInput,
+    ui_event_receiver: channel::Receiver<'static, CriticalSectionRawMutex, UiEvent, 8>,
     settings_sender: watch::Sender<'static, CriticalSectionRawMutex, RadioSettings, 2>,
 ) {
     info!("Display task started");
@@ -84,7 +97,7 @@ pub async fn display_task(
     loop {
         match select3(
             receiver.changed(),
-            ui.next_event(UiEvent::NextScreen, UiEvent::PrevScreen),
+            ui_event_receiver.receive(),
             Timer::after(Duration::from_millis(250)),
         )
         .await
