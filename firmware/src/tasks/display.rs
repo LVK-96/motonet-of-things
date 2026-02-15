@@ -39,32 +39,48 @@ pub async fn ui_input_task(
 #[derive(Clone, Copy)]
 enum DisplayState {
     Main,
-    Radio,
+    Radio(RadioState),
+}
+
+#[derive(Clone, Copy)]
+enum RadioState {
+    Overview,
     Settings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FrameKey {
     Waiting,
-    Main {
-        temp_deci: i16,
-        sensor_id: u8,
-        channel: u8,
-        battery_ok: bool,
-        time_secs: Option<u64>,
-    },
-    Radio {
+    Main(MainFrameKey),
+    Radio(RadioFrameKey),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MainFrameKey {
+    temp_deci: i16,
+    sensor_id: u8,
+    channel: u8,
+    battery_ok: bool,
+    time_secs: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RadioFrameKey {
+    Overview {
         rssi: Option<i16>,
         detection_threshold: u8,
     },
-    Settings {
-        nav_index: u8,
-        editing: bool,
-        threshold: u8,
-        magn: u8,
-        bandwidth_index: u8,
-        carrier_sense: u8,
-    },
+    Settings(SettingsFrameKey),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SettingsFrameKey {
+    nav_index: u8,
+    editing: bool,
+    threshold: u8,
+    magn: u8,
+    bandwidth_index: u8,
+    carrier_sense: u8,
 }
 
 const SETTINGS_MENU_CAPACITY: usize = 5;
@@ -256,20 +272,20 @@ pub async fn display_task(
                 // Handle UI events based on current state
                 state = match state {
                     DisplayState::Main => match event {
-                        UiEvent::NextScreen | UiEvent::PrevScreen => DisplayState::Radio,
+                        UiEvent::NextScreen | UiEvent::PrevScreen => DisplayState::Radio(RadioState::Overview),
                         UiEvent::Select => {
                             reset_settings_menu_for_entry(&mut settings_menu);
-                            DisplayState::Settings
+                            DisplayState::Radio(RadioState::Settings)
                         }
                     },
-                    DisplayState::Radio => match event {
+                    DisplayState::Radio(RadioState::Overview) => match event {
                         UiEvent::NextScreen | UiEvent::PrevScreen => DisplayState::Main,
                         UiEvent::Select => {
                             reset_settings_menu_for_entry(&mut settings_menu);
-                            DisplayState::Settings
+                            DisplayState::Radio(RadioState::Settings)
                         }
                     },
-                    DisplayState::Settings => {
+                    DisplayState::Radio(RadioState::Settings) => {
                         let menu_event =
                             settings_menu.handle_event(menu_event_from_ui_event(event));
                         if matches!(menu_event, MenuEvent::ValueChanged(_)) {
@@ -294,9 +310,9 @@ pub async fn display_task(
                                     bandwidth_khz,
                                     pending_settings.carrier_sense_threshold
                                 );
-                                DisplayState::Radio
+                                DisplayState::Radio(RadioState::Overview)
                             }
-                            _ => DisplayState::Settings,
+                            _ => DisplayState::Radio(RadioState::Settings),
                         }
                     }
                 };
@@ -308,7 +324,7 @@ pub async fn display_task(
 
         if let Some(current_settings) = settings_receiver.try_get()
             && current_settings != pending_settings
-            && !matches!(state, DisplayState::Settings)
+            && !matches!(state, DisplayState::Radio(RadioState::Settings))
         {
             pending_settings = current_settings;
             settings_menu = build_settings_menu(pending_settings);
@@ -317,33 +333,35 @@ pub async fn display_task(
         let current_time = time_receiver.try_get().flatten();
         let frame = match state {
             DisplayState::Main => {
-                last_reading.map_or(FrameKey::Waiting, |reading| FrameKey::Main {
-                    temp_deci: temp_to_deci(reading.inner.temperature_c),
-                    sensor_id: reading.inner.id,
-                    channel: reading.inner.channel,
-                    battery_ok: reading.inner.battery_ok,
-                    time_secs: current_time.map(|t| t.now_unix_secs()),
+                last_reading.map_or(FrameKey::Waiting, |reading| {
+                    FrameKey::Main(MainFrameKey {
+                        temp_deci: temp_to_deci(reading.inner.temperature_c),
+                        sensor_id: reading.inner.id,
+                        channel: reading.inner.channel,
+                        battery_ok: reading.inner.battery_ok,
+                        time_secs: current_time.map(|t| t.now_unix_secs()),
+                    })
                 })
             }
-            DisplayState::Radio => {
+            DisplayState::Radio(RadioState::Overview) => {
                 let rssi = last_reading.map(|r| r.rssi);
                 let detection_threshold = last_reading
                     .map_or(pending_settings.detection_threshold_db, |r| {
                         r.detection_threshold
                     });
-                FrameKey::Radio {
+                FrameKey::Radio(RadioFrameKey::Overview {
                     rssi,
                     detection_threshold,
-                }
+                })
             }
-            DisplayState::Settings => FrameKey::Settings {
+            DisplayState::Radio(RadioState::Settings) => FrameKey::Radio(RadioFrameKey::Settings(SettingsFrameKey {
                 nav_index: u8::try_from(settings_menu.selected_index()).map_or(u8::MAX, |v| v),
                 editing: settings_menu.is_editing(),
                 threshold: pending_settings.detection_threshold_db,
                 magn: pending_settings.magn_target,
                 bandwidth_index: pending_settings.channel_bandwidth_index,
                 carrier_sense: pending_settings.carrier_sense_threshold,
-            },
+            })),
         };
 
         if Some(frame) == last_frame {
@@ -378,7 +396,7 @@ pub async fn display_task(
                     true
                 }
             }
-            DisplayState::Radio => {
+            DisplayState::Radio(RadioState::Overview) => {
                 let rssi = last_reading.map(|r| r.rssi);
                 let det_threshold = last_reading
                     .map_or(pending_settings.detection_threshold_db, |r| {
@@ -391,7 +409,7 @@ pub async fn display_task(
                     true
                 }
             }
-            DisplayState::Settings => display
+            DisplayState::Radio(RadioState::Settings) => display
                 .clear()
                 .and_then(|()| display.draw_header("SETTINGS"))
                 .and_then(|()| {
