@@ -120,9 +120,9 @@ just verify
 
 Verification matrix:
 
-| Command | Validates | Latest run |
-| --- | --- | --- |
-| `just test-host` | host `fmt`, host `clippy`, and host tests for `rubicson`, `eu-dst`, and `karu-menu` | PASS |
-| `just check-firmware` | firmware `cargo check` for `xtensa-esp32-none-elf` | PASS |
-| `just verify` | full host + firmware verification bundle | PASS |
-| `cargo test -p karu-menu --target x86_64-unknown-linux-gnu` | root-level host sanity test command | PASS |
+| Command | Validates |
+| --- | --- |
+| `just test-host` | host `fmt`, host `clippy`, and host tests for `rubicson`, `eu-dst`, and `karu-menu` |
+| `just check-firmware` | firmware `cargo check` for `xtensa-esp32-none-elf` |
+| `just verify` | full host + firmware verification bundle |
+| `cargo test -p karu-menu --target x86_64-unknown-linux-gnu` | root-level host sanity test command |
