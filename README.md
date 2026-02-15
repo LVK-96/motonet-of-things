@@ -7,6 +7,8 @@ Receive 433 MHz data from cheap wireless temperature sensors (Rubicson protocol)
 - CC1101
 - Sensor example (Motonet / MTX Basic): https://www.motonet.fi/tuote/mtx-basic-langaton-lampomittari-sisa-ja-ulkokayttoon?product=86-01355
 
+This is also a little experiment to see how agentic AI workflows work in firmware development.
+
 ## Build And Flash
 
 Run firmware commands from `firmware/` so the local target config is used.
