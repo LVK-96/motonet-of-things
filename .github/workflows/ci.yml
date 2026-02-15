@@ -36,10 +36,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install ESP toolchain
-        uses: esp-rs/xtensa-toolchain@v1
-        with:
-          default: true
-          ldproxy: false
+        run: |
+          cargo install espup --locked
+          espup install --targets esp32 --std
 
       - name: Install just
         uses: extractions/setup-just@v2
@@ -48,4 +47,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Firmware verification
-        run: just check-firmware
+        run: |
+          source "$HOME/export-esp.sh"
+          just check-firmware
