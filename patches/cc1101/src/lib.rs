@@ -292,6 +292,31 @@ where
         Ok(())
     }
 
+    /// Sets AGC gain-reduction priority between `LNA` and `LNA2`.
+    ///
+    /// `AgcLnaPriority::LnaFirst` decreases `LNA` gain first.
+    /// `AgcLnaPriority::Lna2First` decreases `LNA2` gain to minimum first.
+    pub fn set_agc_lna_priority(&mut self, priority: AgcLnaPriority) -> Result<(), Error<SpiE>> {
+        self.0.modify_register(Config::AGCCTRL1, |r| {
+            AGCCTRL1(r).modify().agc_lna_priority(priority.into()).bits()
+        })?;
+        Ok(())
+    }
+
+    /// Sets the relative RSSI increase threshold for asserting carrier sense.
+    pub fn set_carrier_sense_relative_threshold(
+        &mut self,
+        threshold: CarrierSenseRelativeThreshold,
+    ) -> Result<(), Error<SpiE>> {
+        self.0.modify_register(Config::AGCCTRL1, |r| {
+            AGCCTRL1(r)
+                .modify()
+                .carrier_sense_rel_thr(threshold.into())
+                .bits()
+        })?;
+        Ok(())
+    }
+
     /// Sets the absolute RSSI threshold for asserting carrier sense.
     ///
     /// The field value is written directly to `AGCCTRL1.CARRIER_SENSE_ABS_THR`.

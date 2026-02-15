@@ -1,20 +1,50 @@
-From 4509142252836d3025b37b64085c4fcfd682f641 Mon Sep 17 00:00:00 2001
+From e9766a575c3424af0eb5f0772d623b1e0ece04dc Mon Sep 17 00:00:00 2001
 From: motonet-bot <motonet@example.com>
-Date: Sun, 15 Feb 2026 21:59:50 +0200
-Subject: [PATCH] Add absolute carrier sense threshold setter
+Date: Sun, 15 Feb 2026 22:02:19 +0200
+Subject: [PATCH] Add AGCCTRL1 helper APIs
 
 ---
- src/lib.rs | 15 +++++++++++++++
- 1 file changed, 15 insertions(+)
+ src/lib.rs                                    | 40 +++++++++++++++++++
+ src/lowlevel/types.rs                         |  4 ++
+ src/lowlevel/types/agc_lna_priority.rs        | 15 +++++++
+ .../types/carrier_sense_relative_threshold.rs | 19 +++++++++
+ 4 files changed, 78 insertions(+)
+ create mode 100644 src/lowlevel/types/agc_lna_priority.rs
+ create mode 100644 src/lowlevel/types/carrier_sense_relative_threshold.rs
 
 diff --git a/src/lib.rs b/src/lib.rs
-index 4db9ba0..2262057 100644
+index 4db9ba0..0c9d5e8 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -292,6 +292,21 @@ where
+@@ -292,6 +292,46 @@ where
          Ok(())
      }
  
++    /// Sets AGC gain-reduction priority between `LNA` and `LNA2`.
++    ///
++    /// `AgcLnaPriority::LnaFirst` decreases `LNA` gain first.
++    /// `AgcLnaPriority::Lna2First` decreases `LNA2` gain to minimum first.
++    pub fn set_agc_lna_priority(&mut self, priority: AgcLnaPriority) -> Result<(), Error<SpiE>> {
++        self.0.modify_register(Config::AGCCTRL1, |r| {
++            AGCCTRL1(r).modify().agc_lna_priority(priority.into()).bits()
++        })?;
++        Ok(())
++    }
++
++    /// Sets the relative RSSI increase threshold for asserting carrier sense.
++    pub fn set_carrier_sense_relative_threshold(
++        &mut self,
++        threshold: CarrierSenseRelativeThreshold,
++    ) -> Result<(), Error<SpiE>> {
++        self.0.modify_register(Config::AGCCTRL1, |r| {
++            AGCCTRL1(r)
++                .modify()
++                .carrier_sense_rel_thr(threshold.into())
++                .bits()
++        })?;
++        Ok(())
++    }
++
 +    /// Sets the absolute RSSI threshold for asserting carrier sense.
 +    ///
 +    /// The field value is written directly to `AGCCTRL1.CARRIER_SENSE_ABS_THR`.
@@ -33,6 +63,74 @@ index 4db9ba0..2262057 100644
      /// Sets the filter length (in FSK/MSK mode) or decision boundary (in OOK/ASK mode) for the AGC.
      pub fn set_filter_length(&mut self, filter_length: FilterLength) -> Result<(), Error<SpiE>> {
          self.0.modify_register(Config::AGCCTRL0, |r| {
+diff --git a/src/lowlevel/types.rs b/src/lowlevel/types.rs
+index c93193f..3377372 100644
+--- a/src/lowlevel/types.rs
++++ b/src/lowlevel/types.rs
+@@ -1,5 +1,7 @@
+ mod address_check;
++mod agc_lna_priority;
+ mod auto_calibration;
++mod carrier_sense_relative_threshold;
+ mod cca_mode;
+ mod fifo_threshold;
+ mod filter_length;
+@@ -14,7 +16,9 @@ mod sync_check;
+ mod target_amplitude;
+ 
+ pub use self::address_check::*;
++pub use self::agc_lna_priority::*;
+ pub use self::auto_calibration::*;
++pub use self::carrier_sense_relative_threshold::*;
+ pub use self::cca_mode::*;
+ pub use self::fifo_threshold::*;
+ pub use self::filter_length::*;
+diff --git a/src/lowlevel/types/agc_lna_priority.rs b/src/lowlevel/types/agc_lna_priority.rs
+new file mode 100644
+index 0000000..a58c2d5
+--- /dev/null
++++ b/src/lowlevel/types/agc_lna_priority.rs
+@@ -0,0 +1,15 @@
++/// LNA/LNA2 gain reduction strategy for AGC.
++#[derive(Copy, Clone, Debug, Eq, PartialEq)]
++#[repr(u8)]
++pub enum AgcLnaPriority {
++    /// Decrease `LNA2` gain to minimum before decreasing `LNA` gain.
++    Lna2First = 0,
++    /// Decrease `LNA` gain before decreasing `LNA2` gain.
++    LnaFirst = 1,
++}
++
++impl From<AgcLnaPriority> for u8 {
++    fn from(value: AgcLnaPriority) -> Self {
++        value as Self
++    }
++}
+diff --git a/src/lowlevel/types/carrier_sense_relative_threshold.rs b/src/lowlevel/types/carrier_sense_relative_threshold.rs
+new file mode 100644
+index 0000000..b962569
+--- /dev/null
++++ b/src/lowlevel/types/carrier_sense_relative_threshold.rs
+@@ -0,0 +1,19 @@
++/// Relative RSSI increase threshold for asserting carrier sense.
++#[derive(Copy, Clone, Debug, Eq, PartialEq)]
++#[repr(u8)]
++pub enum CarrierSenseRelativeThreshold {
++    /// Relative carrier sense threshold disabled.
++    Disabled = 0,
++    /// Assert on 6 dB RSSI increase.
++    Db6 = 1,
++    /// Assert on 10 dB RSSI increase.
++    Db10 = 2,
++    /// Assert on 14 dB RSSI increase.
++    Db14 = 3,
++}
++
++impl From<CarrierSenseRelativeThreshold> for u8 {
++    fn from(value: CarrierSenseRelativeThreshold) -> Self {
++        value as Self
++    }
++}
 -- 
 2.53.0
 
