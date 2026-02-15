@@ -1,14 +1,2 @@
-[build]
-target = "xtensa-esp32-none-elf"
-rustflags = ["-C", "link-arg=-nostartfiles"]
-
-[target.xtensa-esp32-none-elf]
-runner = "espflash flash --monitor --log-format defmt"
-
-[unstable]
-build-std = ["core", "alloc"]
-
-[env]
-# Production-friendly default. Override per run for development:
-# DEFMT_LOG=info|debug|trace cargo run --release
-DEFMT_LOG = "warn"
+# Host-friendly workspace defaults.
+# Embedded target defaults are scoped to `firmware/.cargo/config.toml`.

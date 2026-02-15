@@ -1,4 +1,5 @@
 [build]
+# Firmware crate default target/toolchain configuration.
 target = "xtensa-esp32-none-elf"
 rustflags = ["-C", "link-arg=-nostartfiles"]
 
