@@ -37,9 +37,10 @@ pub fn clamp_power_config(settings: PowerConfigView) -> PowerConfigView {
         sleep_duration_secs: settings
             .sleep_duration_secs
             .clamp(POWER_SLEEP_DURATION_MIN_SECS, POWER_SLEEP_DURATION_MAX_SECS),
-        ui_idle_timeout_secs: settings
-            .ui_idle_timeout_secs
-            .clamp(POWER_UI_IDLE_TIMEOUT_MIN_SECS, POWER_UI_IDLE_TIMEOUT_MAX_SECS),
+        ui_idle_timeout_secs: settings.ui_idle_timeout_secs.clamp(
+            POWER_UI_IDLE_TIMEOUT_MIN_SECS,
+            POWER_UI_IDLE_TIMEOUT_MAX_SECS,
+        ),
     }
 }
 
@@ -65,10 +66,7 @@ mod tests {
 
         assert_eq!(clamped.detection_threshold_db, DETECTION_THRESHOLD_MIN_DB);
         assert_eq!(clamped.magn_target, MAGN_TARGET_MAX);
-        assert_eq!(
-            clamped.channel_bandwidth_index,
-            CHANNEL_BANDWIDTH_MAX_INDEX
-        );
+        assert_eq!(clamped.channel_bandwidth_index, CHANNEL_BANDWIDTH_MAX_INDEX);
         assert_eq!(clamped.carrier_sense_threshold, CARRIER_SENSE_MAX);
 
         let clamped_min = clamp_radio_config(RadioConfigView {
@@ -78,7 +76,10 @@ mod tests {
             carrier_sense_threshold: CARRIER_SENSE_MIN,
         });
 
-        assert_eq!(clamped_min.detection_threshold_db, DETECTION_THRESHOLD_MIN_DB);
+        assert_eq!(
+            clamped_min.detection_threshold_db,
+            DETECTION_THRESHOLD_MIN_DB
+        );
     }
 
     #[test]
@@ -90,10 +91,7 @@ mod tests {
         });
 
         assert_eq!(clamped.sleep_duration_secs, POWER_SLEEP_DURATION_MIN_SECS);
-        assert_eq!(
-            clamped.ui_idle_timeout_secs,
-            POWER_UI_IDLE_TIMEOUT_MAX_SECS
-        );
+        assert_eq!(clamped.ui_idle_timeout_secs, POWER_UI_IDLE_TIMEOUT_MAX_SECS);
 
         let clamped_max = clamp_power_config(PowerConfigView {
             predictive_sleep_enabled: false,
@@ -101,7 +99,10 @@ mod tests {
             ui_idle_timeout_secs: 1,
         });
 
-        assert_eq!(clamped_max.sleep_duration_secs, POWER_SLEEP_DURATION_MAX_SECS);
+        assert_eq!(
+            clamped_max.sleep_duration_secs,
+            POWER_SLEEP_DURATION_MAX_SECS
+        );
         assert_eq!(
             clamped_max.ui_idle_timeout_secs,
             POWER_UI_IDLE_TIMEOUT_MIN_SECS

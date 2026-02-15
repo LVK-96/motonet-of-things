@@ -404,12 +404,14 @@ pub async fn display_task(
                                     &mut pending_radio_settings,
                                     &mut pending_power_settings,
                                 );
-                                pending_radio_settings = from_radio_config_view(clamp_radio_config(
-                                    to_radio_config_view(pending_radio_settings),
-                                ));
-                                pending_power_settings = from_power_config_view(clamp_power_config(
-                                    to_power_config_view(pending_power_settings),
-                                ));
+                                pending_radio_settings =
+                                    from_radio_config_view(clamp_radio_config(
+                                        to_radio_config_view(pending_radio_settings),
+                                    ));
+                                pending_power_settings =
+                                    from_power_config_view(clamp_power_config(
+                                        to_power_config_view(pending_power_settings),
+                                    ));
                                 settings_menu.commit_all();
                                 radio_settings_sender.send(pending_radio_settings);
                                 power_settings_sender.send(pending_power_settings);

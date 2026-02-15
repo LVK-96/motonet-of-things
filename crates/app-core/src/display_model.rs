@@ -64,21 +64,25 @@ pub fn derive_frame(input: DisplayFrameInput) -> FrameKey {
         }),
         UiScreenState::RadioOverview => FrameKey::Radio(RadioFrameKey::Overview {
             rssi: input.reading.map(|r| r.rssi_dbm),
-            detection_threshold: input.reading.map_or(input.radio.detection_threshold_db, |r| {
-                r.detection_threshold_db
-            }),
+            detection_threshold: input
+                .reading
+                .map_or(input.radio.detection_threshold_db, |r| {
+                    r.detection_threshold_db
+                }),
         }),
-        UiScreenState::RadioSettings => FrameKey::Radio(RadioFrameKey::Settings(SettingsFrameKey {
-            nav_index: input.settings_nav_index,
-            editing: input.settings_editing,
-            threshold: input.radio.detection_threshold_db,
-            magn: input.radio.magn_target,
-            bandwidth_index: input.radio.channel_bandwidth_index,
-            carrier_sense: input.radio.carrier_sense_threshold,
-            predictive_sleep_enabled: input.power.predictive_sleep_enabled,
-            sleep_duration_secs: input.power.sleep_duration_secs,
-            ui_idle_timeout_secs: input.power.ui_idle_timeout_secs,
-        })),
+        UiScreenState::RadioSettings => {
+            FrameKey::Radio(RadioFrameKey::Settings(SettingsFrameKey {
+                nav_index: input.settings_nav_index,
+                editing: input.settings_editing,
+                threshold: input.radio.detection_threshold_db,
+                magn: input.radio.magn_target,
+                bandwidth_index: input.radio.channel_bandwidth_index,
+                carrier_sense: input.radio.carrier_sense_threshold,
+                predictive_sleep_enabled: input.power.predictive_sleep_enabled,
+                sleep_duration_secs: input.power.sleep_duration_secs,
+                ui_idle_timeout_secs: input.power.ui_idle_timeout_secs,
+            }))
+        }
     }
 }
 
@@ -91,7 +95,9 @@ fn temp_to_deci(temp_c: f32) -> i16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DisplayFrameInput, FrameKey, MainFrameKey, RadioFrameKey, SettingsFrameKey, derive_frame};
+    use super::{
+        DisplayFrameInput, FrameKey, MainFrameKey, RadioFrameKey, SettingsFrameKey, derive_frame,
+    };
     use crate::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
 
     fn sample_radio() -> RadioConfigView {
