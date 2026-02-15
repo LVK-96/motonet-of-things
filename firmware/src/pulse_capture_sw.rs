@@ -138,6 +138,7 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                         };
                         self.sender.send(radio_reading);
                         let _ = self.mqtt_sender.try_send(radio_reading);
+                        Timer::after(Duration::from_secs(45)).await;
                     }
                     Err(e) => {
                         info!("Decode failed: {:?}", e);

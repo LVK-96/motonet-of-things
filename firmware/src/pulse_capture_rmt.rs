@@ -98,12 +98,10 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
             let symbol_count = match self.channel.receive(&mut symbols).await {
                 Ok(count) => count,
                 Err(Error::ReceiverError) => {
-                    // ReceiverError, just return the number of symbols received so far
+                    // ReceiverError, assume buffer overflow and treat as end of capture
+                    // Even if the error was something else, we'll just try to decode what we got
                     info!("RMT ReceiverError, treating as end of capture...");
-                    symbols
-                        .iter()
-                        .position(|code| code.is_end_marker())
-                        .unwrap_or(symbols.len())
+                    symbols.len()
                 }
                 Err(e) => {
                     warn!("RMT error: {:?}", e);
@@ -143,12 +141,14 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
                         };
                         self.sender.send(radio_reading);
                         let _ = self.mqtt_sender.try_send(radio_reading);
-                        // Delay 1s before accepting the next signal
-                        // The pulse decode is early exit on a valid packet
+                        // Delay 45s before accepting the next signal
+                        // The rubicson sensor sends once a minute, so it should be safe to
+                        // have a long inactive period here.
+                        // Also the pulse decode is early exit on a valid packet
                         // Since the sensor sends 12 packets in a burst
                         // we want to avoid capturing the next packet in the same burst
                         // which would cause duplicate readings
-                        Timer::after(Duration::from_millis(1000)).await;
+                        Timer::after(Duration::from_secs(45)).await;
                     }
                     Err(e) => {
                         info!("Decode failed: {:?}", e);
