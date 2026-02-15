@@ -1,5 +1,6 @@
 use core::fmt::Write;
 
+use app_core::config_rules::{clamp_power_config, clamp_radio_config};
 use app_core::display_model::{DisplayFrameInput, FrameKey, derive_frame};
 use app_core::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
 use defmt::{error, info};
@@ -102,6 +103,23 @@ fn to_power_config_view(settings: PowerSettings) -> PowerConfigView {
         predictive_sleep_enabled: settings.predictive_sleep_enabled,
         sleep_duration_secs: settings.sleep_duration_secs,
         ui_idle_timeout_secs: settings.ui_idle_timeout_secs,
+    }
+}
+
+fn from_radio_config_view(config: RadioConfigView) -> RadioSettings {
+    RadioSettings {
+        detection_threshold_db: config.detection_threshold_db,
+        magn_target: config.magn_target,
+        channel_bandwidth_index: config.channel_bandwidth_index,
+        carrier_sense_threshold: config.carrier_sense_threshold,
+    }
+}
+
+fn from_power_config_view(config: PowerConfigView) -> PowerSettings {
+    PowerSettings {
+        predictive_sleep_enabled: config.predictive_sleep_enabled,
+        sleep_duration_secs: config.sleep_duration_secs,
+        ui_idle_timeout_secs: config.ui_idle_timeout_secs,
     }
 }
 
@@ -386,6 +404,12 @@ pub async fn display_task(
                                     &mut pending_radio_settings,
                                     &mut pending_power_settings,
                                 );
+                                pending_radio_settings = from_radio_config_view(clamp_radio_config(
+                                    to_radio_config_view(pending_radio_settings),
+                                ));
+                                pending_power_settings = from_power_config_view(clamp_power_config(
+                                    to_power_config_view(pending_power_settings),
+                                ));
                                 settings_menu.commit_all();
                                 radio_settings_sender.send(pending_radio_settings);
                                 power_settings_sender.send(pending_power_settings);

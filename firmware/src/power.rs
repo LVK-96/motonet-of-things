@@ -1,6 +1,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use core::time::Duration;
 
+use app_core::config_rules::clamp_power_config;
+use app_core::domain::PowerConfigView;
 use defmt::{Debug2Format, info, warn};
 use embassy_time::Instant;
 use esp_hal::rtc_cntl::{
@@ -26,6 +28,22 @@ const DEEP_SLEEP_LOG_FLUSH_DELAY_US: u32 = 20_000;
 #[esp_hal::ram(unstable(rtc_slow, persistent))]
 static mut PERSISTED_POWER_WORD: u32 = 0;
 
+fn to_power_config_view(settings: PowerSettings) -> PowerConfigView {
+    PowerConfigView {
+        predictive_sleep_enabled: settings.predictive_sleep_enabled,
+        sleep_duration_secs: settings.sleep_duration_secs,
+        ui_idle_timeout_secs: settings.ui_idle_timeout_secs,
+    }
+}
+
+fn from_power_config_view(view: PowerConfigView) -> PowerSettings {
+    PowerSettings {
+        predictive_sleep_enabled: view.predictive_sleep_enabled,
+        sleep_duration_secs: view.sleep_duration_secs,
+        ui_idle_timeout_secs: view.ui_idle_timeout_secs,
+    }
+}
+
 fn ui_idle_timeout_secs() -> u8 {
     UI_IDLE_TIMEOUT_SECS.load(Ordering::Relaxed).clamp(
         POWER_UI_IDLE_TIMEOUT_MIN_SECS,
@@ -50,16 +68,7 @@ fn rearm_ui_idle_deadline() {
 }
 
 fn clamp_settings(settings: PowerSettings) -> PowerSettings {
-    PowerSettings {
-        predictive_sleep_enabled: settings.predictive_sleep_enabled,
-        sleep_duration_secs: settings
-            .sleep_duration_secs
-            .clamp(POWER_SLEEP_DURATION_MIN_SECS, POWER_SLEEP_DURATION_MAX_SECS),
-        ui_idle_timeout_secs: settings.ui_idle_timeout_secs.clamp(
-            POWER_UI_IDLE_TIMEOUT_MIN_SECS,
-            POWER_UI_IDLE_TIMEOUT_MAX_SECS,
-        ),
-    }
+    from_power_config_view(clamp_power_config(to_power_config_view(settings)))
 }
 
 fn persist_checksum(payload: &[u8]) -> u8 {
