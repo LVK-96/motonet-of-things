@@ -31,8 +31,9 @@ use esp_radio::init;
 use static_cell::StaticCell;
 
 use esp32_rust_project::display::{Display, Sh1106Display};
-use esp32_rust_project::messages::{RadioReading, RadioSettings};
+use esp32_rust_project::messages::{PowerSettings, RadioReading, RadioSettings};
 use esp32_rust_project::network;
+use esp32_rust_project::power;
 use esp32_rust_project::radio_433::Cc1101Radio;
 #[cfg(feature = "pulse_rmt")]
 use esp32_rust_project::radio_433::Radio433;
@@ -50,6 +51,8 @@ static MQTT_READING_CHANNEL: Channel<CriticalSectionRawMutex, RadioReading, 16> 
 
 /// Watch for sharing radio settings with the radio task
 static RADIO_SETTINGS_WATCH: Watch<CriticalSectionRawMutex, RadioSettings, 2> = Watch::new();
+/// Watch for sharing power settings with UI + runtime power policy.
+static POWER_SETTINGS_WATCH: Watch<CriticalSectionRawMutex, PowerSettings, 2> = Watch::new();
 /// Queue for UI events so display task does not cancel GPIO edge waits.
 static UI_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, UiEvent, 8> = Channel::new();
 
@@ -82,6 +85,10 @@ async fn main(spawner: Spawner) -> ! {
         StaticCell::new();
 
     let peripherals = system_setup();
+    power::log_wakeup_cause();
+    let initial_power_settings = power::load_settings_or_default();
+    power::restore_settings_after_reset(initial_power_settings);
+    POWER_SETTINGS_WATCH.sender().send(initial_power_settings);
 
     // Initialize async runtime
     esp_rtos::start(TimerGroup::new(peripherals.TIMG0).timer0);
@@ -254,6 +261,10 @@ async fn main(spawner: Spawner) -> ! {
                 .receiver()
                 .expect("Failed to get settings receiver for display"),
             RADIO_SETTINGS_WATCH.sender(),
+            POWER_SETTINGS_WATCH
+                .receiver()
+                .expect("Failed to get power settings receiver for display"),
+            POWER_SETTINGS_WATCH.sender(),
         ))
         .expect("Failed to spawn display task");
     spawner

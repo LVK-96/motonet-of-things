@@ -15,6 +15,7 @@ use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
 use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
 
 use crate::messages::RadioReading;
+use crate::power;
 use crate::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
 
 /// Sets up the MQTT client, including TCP connection and MQTT broker handshake.
@@ -24,13 +25,18 @@ async fn establish_mqtt_session<'a>(
     tx_buffer: &'a mut [u8],
     client: &mut Client<'a, TcpSocket<'a>, BumpBuffer<'a>, 4, 2, 2>,
 ) -> Result<(), ()> {
+    const MQTT_SOCKET_TIMEOUT_SECS: u64 = 30;
+
     // Wait for network to be up
     network_stack.wait_config_up().await;
 
-    info!("MQTT: Connecting to broker...");
+    info!(
+        "MQTT[{}]: Connecting to broker...",
+        power::wake_reason_class()
+    );
 
     let mut socket = TcpSocket::new(network_stack, rx_buffer, tx_buffer);
-    socket.set_timeout(Some(Duration::from_secs(120)));
+    socket.set_timeout(Some(Duration::from_secs(MQTT_SOCKET_TIMEOUT_SECS)));
     socket.set_nagle_enabled(false);
 
     let broker_addr = (
@@ -43,12 +49,22 @@ async fn establish_mqtt_session<'a>(
         MQTT_BROKER_PORT,
     );
 
+    let tcp_connect_at = Instant::now();
     if let Err(e) = socket.connect(broker_addr).await {
-        warn!("MQTT: TCP connect failed: {:?}", e);
+        warn!(
+            "MQTT[{}]: TCP connect failed after {}ms: {:?}",
+            power::wake_reason_class(),
+            tcp_connect_at.elapsed().as_millis(),
+            e
+        );
         return Err(());
     }
 
-    info!("MQTT: TCP connected");
+    info!(
+        "MQTT[{}]: TCP connected in {}ms",
+        power::wake_reason_class(),
+        tcp_connect_at.elapsed().as_millis()
+    );
 
     let lwt = WillOptions {
         will_qos: QoS::AtMostOnce,
@@ -73,12 +89,22 @@ async fn establish_mqtt_session<'a>(
     };
     let client_id = MqttString::try_from(MQTT_CLIENT_ID).ok();
 
+    let mqtt_connect_at = Instant::now();
     if let Err(e) = client.connect(socket, &connect_options, client_id).await {
-        warn!("MQTT: Broker connect failed: {:?}", defmt::Debug2Format(&e));
+        warn!(
+            "MQTT[{}]: Broker connect failed after {}ms: {:?}",
+            power::wake_reason_class(),
+            mqtt_connect_at.elapsed().as_millis(),
+            defmt::Debug2Format(&e)
+        );
         return Err(());
     }
 
-    info!("MQTT: Connected to broker!");
+    info!(
+        "MQTT[{}]: Connected to broker in {}ms",
+        power::wake_reason_class(),
+        mqtt_connect_at.elapsed().as_millis()
+    );
     unsafe { client.buffer().reset() };
 
     // Publish "online" status message
@@ -89,18 +115,25 @@ async fn establish_mqtt_session<'a>(
         topic: status_topic_name,
         qos: QoS::AtMostOnce,
     };
+    let online_publish_at = Instant::now();
     if let Err(e) = client
         .publish(&online_options, Bytes::from(b"online" as &[u8]))
         .await
     {
         warn!(
-            "MQTT: Failed to publish online status: {:?}",
+            "MQTT[{}]: Failed to publish online status after {}ms: {:?}",
+            power::wake_reason_class(),
+            online_publish_at.elapsed().as_millis(),
             defmt::Debug2Format(&e)
         );
         return Err(());
     }
 
-    info!("MQTT: Published online status");
+    info!(
+        "MQTT[{}]: Published online status in {}ms",
+        power::wake_reason_class(),
+        online_publish_at.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -114,7 +147,11 @@ pub async fn mqtt_task(
     const MIN_BACKOFF_SECS: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
     const PING_INTERVAL_SECS: u64 = 90; // Ping every 90s (keepalive is 120s)
+    // For minute-level sensor cadence, prefer a fresh session when the link has been idle
+    // for a while. This avoids a first publish attempt on a stale TCP connection.
+    const RECONNECT_BEFORE_PUBLISH_IDLE_SECS: u64 = 20;
     let mut backoff_secs = MIN_BACKOFF_SECS;
+    let mut pending_reading: Option<RadioReading> = None;
 
     loop {
         // Create buffers on the stack for this session
@@ -138,34 +175,36 @@ pub async fn mqtt_task(
         let mut last_activity = Instant::now();
 
         loop {
-            // Wait for either a reading or ping timeout
-            let timeout = Duration::from_secs(PING_INTERVAL_SECS);
+            enum MqttWork {
+                Reading(RadioReading),
+                KeepAlivePing,
+            }
 
-            match select(receiver.receive(), Timer::after(timeout)).await {
-                Either::First(reading) => {
+            let work = if let Some(reading) = pending_reading.take() {
+                debug!("MQTT: Retrying buffered reading after reconnect");
+                MqttWork::Reading(reading)
+            } else {
+                // Wait for either a reading or ping timeout
+                let timeout = Duration::from_secs(PING_INTERVAL_SECS);
+                match select(receiver.receive(), Timer::after(timeout)).await {
+                    Either::First(reading) => MqttWork::Reading(reading),
+                    Either::Second(()) => MqttWork::KeepAlivePing,
+                }
+            };
+
+            match work {
+                MqttWork::Reading(reading) => {
                     // Got a reading - publish it
                     let time_since_last = last_activity.elapsed().as_secs();
                     debug!("MQTT: Got reading after {}s idle", time_since_last);
-
-                    // Send a ping first if we've been idle for a while
-                    if time_since_last > 10 {
-                        debug!(
-                            "MQTT: Sending ping before publish (idle {}s)",
+                    if time_since_last > RECONNECT_BEFORE_PUBLISH_IDLE_SECS {
+                        info!(
+                            "MQTT: Reconnecting before publish after {}s idle",
                             time_since_last
                         );
-                        unsafe { client.buffer().reset() };
-                        if let Err(e) = client.ping().await {
-                            warn!(
-                                "MQTT: Pre-publish ping failed: {:?}, reconnecting...",
-                                defmt::Debug2Format(&e)
-                            );
-                            break;
-                        }
-                        // Small delay after ping
-                        Timer::after(Duration::from_millis(100)).await;
+                        pending_reading = Some(reading);
+                        break;
                     }
-
-                    last_activity = Instant::now();
 
                     // Reset buffer before publish
                     unsafe { client.buffer().reset() };
@@ -224,12 +263,16 @@ pub async fn mqtt_task(
                             "MQTT: Publish failed: {:?}, reconnecting...",
                             defmt::Debug2Format(&e)
                         );
+                        pending_reading = Some(reading);
                         break; // Break inner loop to reconnect
                     }
 
                     debug!("MQTT: Publish successful!");
+                    info!("MQTT: Publish confirmed, checking deep sleep policy");
+                    power::maybe_sleep_after_frame();
+                    last_activity = Instant::now();
                 }
-                Either::Second(()) => {
+                MqttWork::KeepAlivePing => {
                     // Ping timeout - send keepalive
                     debug!("MQTT: Sending periodic ping");
                     unsafe { client.buffer().reset() };

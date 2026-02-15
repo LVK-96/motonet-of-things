@@ -37,6 +37,8 @@ impl UiInput for EC11RotaryEncoderInput {
         use embassy_futures::select::{Either3, select3};
 
         loop {
+            // Note: in deep sleep, wake is handled by ext0 on GPIO27 (switch). Rotary A/B
+            // transitions do not wake the chip; this loop only runs once awake.
             // Wait for either: button press, or rotation (rising edge on A)
             match select3(
                 self.sw.wait_for_falling_edge(),

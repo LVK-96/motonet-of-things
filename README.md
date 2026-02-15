@@ -65,6 +65,37 @@ Suggested usage:
 - `info`: normal bring-up/debugging
 - `debug`/`trace`: deep protocol and timing investigation
 
+## Sleep Modes And Power Policy
+
+Power behavior is controlled by the firmware settings menu:
+
+- `Pred Slp`: enable/disable predictive deep sleep
+- `Sleep`: deep sleep duration (seconds)
+- `UI Idle`: idle timeout before predictive sleep is allowed
+
+Current behavior:
+
+- Any UI input resets the idle countdown.
+- Predictive deep sleep is only considered after a successful sensor frame decode.
+- Deep sleep wake sources are timer + EC11 push button (`GPIO27`).
+- Rotary A/B movement does not wake from deep sleep.
+
+## Wi-Fi Reconnect Tuning
+
+The firmware logs per-stage reconnect timings (Wi-Fi start, association, IP config, TCP connect, MQTT connect, first publish) with wake context tags to make power/performance tuning measurable.
+
+Optional reconnect optimizations are configured in `firmware/src/secrets.rs`:
+
+- `WIFI_CHANNEL_HINT`
+- `WIFI_BSSID_HINT`
+- `WIFI_STATIC_IP`
+- `WIFI_SUBNET_PREFIX`
+- `WIFI_GATEWAY_IP`
+- `WIFI_DNS1_IP`
+- `WIFI_DNS2_IP`
+
+Use `None` values to keep default behavior (scan + DHCP).
+
 ## Tests
 
 Run tests from repository root or crate directories:

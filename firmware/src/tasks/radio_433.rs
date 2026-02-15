@@ -11,6 +11,7 @@ use esp_hal::Async;
 use esp_hal::rmt::{Channel as RmtChannel, Rx};
 
 use crate::messages::{RadioReading, RadioSettings};
+use crate::power;
 use crate::pulse_capture::PulseCapture;
 #[cfg(feature = "pulse_rmt")]
 use crate::pulse_capture::apply_pending_settings;
@@ -26,6 +27,10 @@ type SharedRadio = &'static Mutex<CriticalSectionRawMutex, Cc1101Radio>;
 const RF_SWEEP_ENABLED: bool = true;
 const RF_SWEEP_DWELL_SAMPLES: u16 = 24;
 const RF_SWEEP_SAMPLE_PERIOD_MS: u64 = 50;
+const PERSISTED_RF_PROFILE_MAGIC: u8 = 0xC7;
+const PERSISTED_RF_PROFILE_VERSION: u8 = 1;
+#[esp_hal::ram(unstable(rtc_slow, persistent))]
+static mut PERSISTED_RF_PROFILE_WORD: u32 = 0;
 
 #[derive(Clone, Copy)]
 struct RfSweepCandidate {
@@ -107,6 +112,56 @@ impl SignalStats {
     }
 }
 
+fn rf_profile_checksum(payload: [u8; 3]) -> u8 {
+    payload
+        .iter()
+        .fold(0x39u8, |acc, byte| acc.rotate_left(1).wrapping_add(*byte))
+}
+
+fn read_persisted_rf_profile_word() -> u32 {
+    critical_section::with(|_| unsafe {
+        core::ptr::read_volatile(core::ptr::addr_of!(PERSISTED_RF_PROFILE_WORD))
+    })
+}
+
+fn write_persisted_rf_profile_word(word: u32) {
+    critical_section::with(|_| unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(PERSISTED_RF_PROFILE_WORD), word);
+    });
+}
+
+fn persist_rf_profile_index(index: usize) {
+    let Ok(index_u8) = u8::try_from(index) else {
+        warn!("RF sweep selected index {} out of u8 range", index);
+        return;
+    };
+
+    let payload = [
+        PERSISTED_RF_PROFILE_MAGIC,
+        index_u8,
+        PERSISTED_RF_PROFILE_VERSION,
+    ];
+    let checksum = rf_profile_checksum(payload);
+    let word = u32::from_le_bytes([payload[0], payload[1], payload[2], checksum]);
+    write_persisted_rf_profile_word(word);
+    info!("Persisted RF profile idx={} word=0x{:08x}", index_u8, word);
+}
+
+fn load_persisted_rf_profile_index() -> Option<usize> {
+    let word = read_persisted_rf_profile_word();
+    let [magic, index_u8, version, checksum] = word.to_le_bytes();
+    let payload = [magic, index_u8, version];
+    if magic != PERSISTED_RF_PROFILE_MAGIC
+        || version != PERSISTED_RF_PROFILE_VERSION
+        || checksum != rf_profile_checksum(payload)
+    {
+        return None;
+    }
+
+    let index = usize::from(index_u8);
+    (index < RF_SWEEP_CANDIDATES.len()).then_some(index)
+}
+
 async fn sample_signal_stats(
     radio: &mut Cc1101Radio,
     sample_count: u16,
@@ -147,9 +202,9 @@ async fn sample_signal_stats(
     stats
 }
 
-async fn run_rf_sweep(radio: &mut Cc1101Radio) {
+async fn run_rf_sweep(radio: &mut Cc1101Radio) -> Option<usize> {
     if !RF_SWEEP_ENABLED {
-        return;
+        return None;
     }
 
     info!(
@@ -157,9 +212,9 @@ async fn run_rf_sweep(radio: &mut Cc1101Radio) {
         RF_SWEEP_CANDIDATES.len()
     );
 
-    let mut best: Option<(RfSweepCandidate, SignalStats, i32)> = None;
+    let mut best: Option<(usize, RfSweepCandidate, SignalStats, i32)> = None;
 
-    for candidate in RF_SWEEP_CANDIDATES {
+    for (index, candidate) in RF_SWEEP_CANDIDATES.into_iter().enumerate() {
         if let Err(e) = radio.apply_rf_profile(candidate.freq_hz, candidate.bandwidth_hz) {
             warn!("Sweep apply failed [{}]: {:?}", candidate.name, e);
             continue;
@@ -192,12 +247,12 @@ async fn run_rf_sweep(radio: &mut Cc1101Radio) {
             stats.max_rssi
         );
 
-        if best.is_none_or(|(_, _, best_score)| score > best_score) {
-            best = Some((candidate, stats, score));
+        if best.is_none_or(|(_, _, _, best_score)| score > best_score) {
+            best = Some((index, candidate, stats, score));
         }
     }
 
-    if let Some((candidate, stats, score)) = best {
+    if let Some((index, candidate, stats, score)) = best {
         info!(
             "RF sweep selected [{}] f={}Hz bw={}kHz score={} toggles={} pin_gdo0={}/{}",
             candidate.name,
@@ -210,9 +265,13 @@ async fn run_rf_sweep(radio: &mut Cc1101Radio) {
         );
         if let Err(e) = radio.apply_rf_profile(candidate.freq_hz, candidate.bandwidth_hz) {
             warn!("Failed to apply selected sweep profile: {:?}", e);
+            None
+        } else {
+            Some(index)
         }
     } else {
         warn!("RF sweep did not produce a valid candidate");
+        None
     }
 }
 
@@ -246,7 +305,33 @@ async fn prepare_radio_for_capture(radio: &mut Cc1101Radio) -> Result<RadioSetti
         return Err(());
     }
 
-    run_rf_sweep(radio).await;
+    let wake_class = power::wake_reason_class();
+    if wake_class == "cold_boot" {
+        if let Some(index) = run_rf_sweep(radio).await {
+            persist_rf_profile_index(index);
+        }
+    } else if let Some(index) = load_persisted_rf_profile_index() {
+        let candidate = RF_SWEEP_CANDIDATES[index];
+        if let Err(e) = radio.apply_rf_profile(candidate.freq_hz, candidate.bandwidth_hz) {
+            warn!(
+                "Wake {}: failed to apply persisted RF profile [{}]: {:?}",
+                wake_class, candidate.name, e
+            );
+        } else {
+            info!(
+                "Wake {}: applied persisted RF profile [{}] f={}Hz bw={}kHz",
+                wake_class,
+                candidate.name,
+                candidate.freq_hz,
+                candidate.bandwidth_hz / 1000
+            );
+        }
+    } else {
+        warn!(
+            "Wake {}: no persisted RF profile, skipping sweep and using defaults",
+            wake_class
+        );
+    }
 
     let stats = sample_signal_stats(radio, 60, Duration::from_millis(50)).await;
     info!("RSSI: min={} max={} dBm", stats.min_rssi, stats.max_rssi);

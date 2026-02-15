@@ -16,10 +16,13 @@ use karu_menu::{
 use crate::display::{Display, Sh1106Display};
 use crate::messages::{
     CARRIER_SENSE_MAX, CARRIER_SENSE_MIN, CHANNEL_BANDWIDTH_MAX_INDEX, CHANNEL_BANDWIDTH_MIN_INDEX,
-    DEFAULT_RADIO_SETTINGS, DETECTION_THRESHOLD_MAX_DB, DETECTION_THRESHOLD_MIN_DB,
-    DETECTION_THRESHOLD_STEP_DB, MAGN_TARGET_MAX, MAGN_TARGET_MIN, RadioReading, RadioSettings,
+    DEFAULT_POWER_SETTINGS, DEFAULT_RADIO_SETTINGS, DETECTION_THRESHOLD_MAX_DB,
+    DETECTION_THRESHOLD_MIN_DB, DETECTION_THRESHOLD_STEP_DB, MAGN_TARGET_MAX, MAGN_TARGET_MIN,
+    POWER_SLEEP_DURATION_MAX_SECS, POWER_SLEEP_DURATION_MIN_SECS, POWER_UI_IDLE_TIMEOUT_MAX_SECS,
+    POWER_UI_IDLE_TIMEOUT_MIN_SECS, PowerSettings, RadioReading, RadioSettings,
     channel_bandwidth_hz,
 };
+use crate::power;
 use crate::time_sync::TIME_WATCH;
 use crate::ui_input::{EC11RotaryEncoderInput, UiEvent, UiInput};
 
@@ -81,13 +84,19 @@ struct SettingsFrameKey {
     magn: u8,
     bandwidth_index: u8,
     carrier_sense: u8,
+    predictive_sleep_enabled: bool,
+    sleep_duration_secs: u8,
+    ui_idle_timeout_secs: u8,
 }
 
-const SETTINGS_MENU_CAPACITY: usize = 5;
+const SETTINGS_MENU_CAPACITY: usize = 8;
 const THRESHOLD_ITEM_INDEX: usize = 0;
 const MAGN_ITEM_INDEX: usize = 1;
 const BANDWIDTH_ITEM_INDEX: usize = 2;
 const CARRIER_SENSE_ITEM_INDEX: usize = 3;
+const PREDICTIVE_SLEEP_ITEM_INDEX: usize = 4;
+const SLEEP_DURATION_ITEM_INDEX: usize = 5;
+const UI_IDLE_TIMEOUT_ITEM_INDEX: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsAction {
@@ -125,6 +134,18 @@ fn format_bandwidth(value: u8) -> String<32> {
     out
 }
 
+fn format_on_off(value: u8) -> String<32> {
+    let mut out = String::new();
+    let _ = write!(out, "{}", if value == 0 { "Off" } else { "On" });
+    out
+}
+
+fn format_seconds(value: u8) -> String<32> {
+    let mut out = String::new();
+    let _ = write!(out, "{value}s");
+    out
+}
+
 fn menu_event_from_ui_event(event: UiEvent) -> MenuUiEvent {
     match event {
         UiEvent::NextScreen => MenuUiEvent::NextScreen,
@@ -146,14 +167,14 @@ fn add_menu_item(menu: &mut SettingsMenu, item: MenuEntry<u8, SettingsAction>, i
     }
 }
 
-fn build_settings_menu(initial: RadioSettings) -> SettingsMenu {
+fn build_settings_menu(initial_radio: RadioSettings, initial_power: PowerSettings) -> SettingsMenu {
     let mut menu = Menu::new(ScrollableViewport::new(128, 64));
 
     add_menu_item(
         &mut menu,
         MenuEntry::numeric(NumericItem::new(
             "Threshold",
-            initial.detection_threshold_db,
+            initial_radio.detection_threshold_db,
             DETECTION_THRESHOLD_MIN_DB..=DETECTION_THRESHOLD_MAX_DB,
             DETECTION_THRESHOLD_STEP_DB,
             format_db,
@@ -164,7 +185,7 @@ fn build_settings_menu(initial: RadioSettings) -> SettingsMenu {
         &mut menu,
         MenuEntry::numeric(NumericItem::new(
             "Magn Tgt",
-            initial.magn_target,
+            initial_radio.magn_target,
             MAGN_TARGET_MIN..=MAGN_TARGET_MAX,
             1,
             format_magn_target,
@@ -175,7 +196,7 @@ fn build_settings_menu(initial: RadioSettings) -> SettingsMenu {
         &mut menu,
         MenuEntry::numeric(NumericItem::new(
             "Bandwidth",
-            initial.channel_bandwidth_index,
+            initial_radio.channel_bandwidth_index,
             CHANNEL_BANDWIDTH_MIN_INDEX..=CHANNEL_BANDWIDTH_MAX_INDEX,
             1,
             format_bandwidth,
@@ -186,12 +207,45 @@ fn build_settings_menu(initial: RadioSettings) -> SettingsMenu {
         &mut menu,
         MenuEntry::numeric(NumericItem::new(
             "CS Thrsh",
-            initial.carrier_sense_threshold,
+            initial_radio.carrier_sense_threshold,
             CARRIER_SENSE_MIN..=CARRIER_SENSE_MAX,
             1,
             format_db,
         )),
         "CS Thrsh",
+    );
+    add_menu_item(
+        &mut menu,
+        MenuEntry::numeric(NumericItem::new(
+            "Pred Slp",
+            u8::from(initial_power.predictive_sleep_enabled),
+            0..=1,
+            1,
+            format_on_off,
+        )),
+        "Pred Slp",
+    );
+    add_menu_item(
+        &mut menu,
+        MenuEntry::numeric(NumericItem::new(
+            "Sleep",
+            initial_power.sleep_duration_secs,
+            POWER_SLEEP_DURATION_MIN_SECS..=POWER_SLEEP_DURATION_MAX_SECS,
+            1,
+            format_seconds,
+        )),
+        "Sleep",
+    );
+    add_menu_item(
+        &mut menu,
+        MenuEntry::numeric(NumericItem::new(
+            "UI Idle",
+            initial_power.ui_idle_timeout_secs,
+            POWER_UI_IDLE_TIMEOUT_MIN_SECS..=POWER_UI_IDLE_TIMEOUT_MAX_SECS,
+            1,
+            format_seconds,
+        )),
+        "UI Idle",
     );
     add_menu_item(
         &mut menu,
@@ -209,14 +263,25 @@ fn numeric_value_at(menu: &SettingsMenu, index: usize) -> Option<u8> {
     })
 }
 
-fn sync_pending_from_menu(menu: &SettingsMenu, pending: &mut RadioSettings) {
-    pending.detection_threshold_db =
-        numeric_value_at(menu, THRESHOLD_ITEM_INDEX).unwrap_or(pending.detection_threshold_db);
-    pending.magn_target = numeric_value_at(menu, MAGN_ITEM_INDEX).unwrap_or(pending.magn_target);
-    pending.channel_bandwidth_index =
-        numeric_value_at(menu, BANDWIDTH_ITEM_INDEX).unwrap_or(pending.channel_bandwidth_index);
-    pending.carrier_sense_threshold =
-        numeric_value_at(menu, CARRIER_SENSE_ITEM_INDEX).unwrap_or(pending.carrier_sense_threshold);
+fn sync_pending_from_menu(
+    menu: &SettingsMenu,
+    pending_radio: &mut RadioSettings,
+    pending_power: &mut PowerSettings,
+) {
+    pending_radio.detection_threshold_db = numeric_value_at(menu, THRESHOLD_ITEM_INDEX)
+        .unwrap_or(pending_radio.detection_threshold_db);
+    pending_radio.magn_target =
+        numeric_value_at(menu, MAGN_ITEM_INDEX).unwrap_or(pending_radio.magn_target);
+    pending_radio.channel_bandwidth_index = numeric_value_at(menu, BANDWIDTH_ITEM_INDEX)
+        .unwrap_or(pending_radio.channel_bandwidth_index);
+    pending_radio.carrier_sense_threshold = numeric_value_at(menu, CARRIER_SENSE_ITEM_INDEX)
+        .unwrap_or(pending_radio.carrier_sense_threshold);
+    pending_power.predictive_sleep_enabled =
+        numeric_value_at(menu, PREDICTIVE_SLEEP_ITEM_INDEX).is_some_and(|v| v != 0);
+    pending_power.sleep_duration_secs = numeric_value_at(menu, SLEEP_DURATION_ITEM_INDEX)
+        .unwrap_or(pending_power.sleep_duration_secs);
+    pending_power.ui_idle_timeout_secs = numeric_value_at(menu, UI_IDLE_TIMEOUT_ITEM_INDEX)
+        .unwrap_or(pending_power.ui_idle_timeout_secs);
 }
 
 fn temp_to_deci(temp_c: f32) -> i16 {
@@ -232,8 +297,20 @@ pub async fn display_task(
     mut display: Sh1106Display<I2c<'static, Blocking>>,
     mut receiver: watch::Receiver<'static, CriticalSectionRawMutex, RadioReading, 2>,
     ui_event_receiver: channel::Receiver<'static, CriticalSectionRawMutex, UiEvent, 8>,
-    mut settings_receiver: watch::Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
-    settings_sender: watch::Sender<'static, CriticalSectionRawMutex, RadioSettings, 2>,
+    mut radio_settings_receiver: watch::Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        RadioSettings,
+        2,
+    >,
+    radio_settings_sender: watch::Sender<'static, CriticalSectionRawMutex, RadioSettings, 2>,
+    mut power_settings_receiver: watch::Receiver<
+        'static,
+        CriticalSectionRawMutex,
+        PowerSettings,
+        2,
+    >,
+    power_settings_sender: watch::Sender<'static, CriticalSectionRawMutex, PowerSettings, 2>,
 ) {
     info!("Display task started");
 
@@ -248,11 +325,18 @@ pub async fn display_task(
     let mut state = DisplayState::Main;
     let mut last_reading: Option<RadioReading> = None;
 
-    let mut pending_settings = settings_receiver
+    let mut pending_radio_settings = radio_settings_receiver
         .try_get()
         .unwrap_or(DEFAULT_RADIO_SETTINGS);
-    let mut settings_menu = build_settings_menu(pending_settings);
-    sync_pending_from_menu(&settings_menu, &mut pending_settings);
+    let mut pending_power_settings = power_settings_receiver
+        .try_get()
+        .unwrap_or(DEFAULT_POWER_SETTINGS);
+    let mut settings_menu = build_settings_menu(pending_radio_settings, pending_power_settings);
+    sync_pending_from_menu(
+        &settings_menu,
+        &mut pending_radio_settings,
+        &mut pending_power_settings,
+    );
 
     // Skip full redraws when nothing visual has changed.
     let mut last_frame: Option<FrameKey> = None;
@@ -269,10 +353,13 @@ pub async fn display_task(
                 last_reading = Some(reading);
             }
             Either3::Second(event) => {
+                power::notify_ui_activity();
                 // Handle UI events based on current state
                 state = match state {
                     DisplayState::Main => match event {
-                        UiEvent::NextScreen | UiEvent::PrevScreen => DisplayState::Radio(RadioState::Overview),
+                        UiEvent::NextScreen | UiEvent::PrevScreen => {
+                            DisplayState::Radio(RadioState::Overview)
+                        }
                         UiEvent::Select => {
                             reset_settings_menu_for_entry(&mut settings_menu);
                             DisplayState::Radio(RadioState::Settings)
@@ -289,7 +376,11 @@ pub async fn display_task(
                         let menu_event =
                             settings_menu.handle_event(menu_event_from_ui_event(event));
                         if matches!(menu_event, MenuEvent::ValueChanged(_)) {
-                            sync_pending_from_menu(&settings_menu, &mut pending_settings);
+                            sync_pending_from_menu(
+                                &settings_menu,
+                                &mut pending_radio_settings,
+                                &mut pending_power_settings,
+                            );
                         }
 
                         match menu_event {
@@ -297,18 +388,27 @@ pub async fn display_task(
                                 action: SettingsAction::Save,
                                 ..
                             } => {
-                                sync_pending_from_menu(&settings_menu, &mut pending_settings);
+                                sync_pending_from_menu(
+                                    &settings_menu,
+                                    &mut pending_radio_settings,
+                                    &mut pending_power_settings,
+                                );
                                 settings_menu.commit_all();
-                                settings_sender.send(pending_settings);
-                                let bandwidth_khz =
-                                    channel_bandwidth_hz(pending_settings.channel_bandwidth_index)
-                                        / 1000;
+                                radio_settings_sender.send(pending_radio_settings);
+                                power_settings_sender.send(pending_power_settings);
+                                power::set_settings(pending_power_settings);
+                                let bandwidth_khz = channel_bandwidth_hz(
+                                    pending_radio_settings.channel_bandwidth_index,
+                                ) / 1000;
                                 info!(
-                                    "Settings saved: threshold={} dB, magn_target={}, bandwidth={} kHz, carrier_sense={}",
-                                    pending_settings.detection_threshold_db,
-                                    pending_settings.magn_target,
+                                    "Settings saved: threshold={} dB, magn_target={}, bandwidth={} kHz, carrier_sense={}, predictive_sleep={}, sleep={}s, ui_idle={}s",
+                                    pending_radio_settings.detection_threshold_db,
+                                    pending_radio_settings.magn_target,
                                     bandwidth_khz,
-                                    pending_settings.carrier_sense_threshold
+                                    pending_radio_settings.carrier_sense_threshold,
+                                    pending_power_settings.predictive_sleep_enabled,
+                                    pending_power_settings.sleep_duration_secs,
+                                    pending_power_settings.ui_idle_timeout_secs
                                 );
                                 DisplayState::Radio(RadioState::Overview)
                             }
@@ -322,31 +422,37 @@ pub async fn display_task(
             }
         }
 
-        if let Some(current_settings) = settings_receiver.try_get()
-            && current_settings != pending_settings
+        if let Some(current_radio_settings) = radio_settings_receiver.try_get()
+            && current_radio_settings != pending_radio_settings
             && !matches!(state, DisplayState::Radio(RadioState::Settings))
         {
-            pending_settings = current_settings;
-            settings_menu = build_settings_menu(pending_settings);
+            pending_radio_settings = current_radio_settings;
+            settings_menu = build_settings_menu(pending_radio_settings, pending_power_settings);
+        }
+
+        if let Some(current_power_settings) = power_settings_receiver.try_get()
+            && current_power_settings != pending_power_settings
+            && !matches!(state, DisplayState::Radio(RadioState::Settings))
+        {
+            pending_power_settings = current_power_settings;
+            settings_menu = build_settings_menu(pending_radio_settings, pending_power_settings);
         }
 
         let current_time = time_receiver.try_get().flatten();
         let frame = match state {
-            DisplayState::Main => {
-                last_reading.map_or(FrameKey::Waiting, |reading| {
-                    FrameKey::Main(MainFrameKey {
-                        temp_deci: temp_to_deci(reading.inner.temperature_c),
-                        sensor_id: reading.inner.id,
-                        channel: reading.inner.channel,
-                        battery_ok: reading.inner.battery_ok,
-                        time_secs: current_time.map(|t| t.now_unix_secs()),
-                    })
+            DisplayState::Main => last_reading.map_or(FrameKey::Waiting, |reading| {
+                FrameKey::Main(MainFrameKey {
+                    temp_deci: temp_to_deci(reading.inner.temperature_c),
+                    sensor_id: reading.inner.id,
+                    channel: reading.inner.channel,
+                    battery_ok: reading.inner.battery_ok,
+                    time_secs: current_time.map(|t| t.now_unix_secs()),
                 })
-            }
+            }),
             DisplayState::Radio(RadioState::Overview) => {
                 let rssi = last_reading.map(|r| r.rssi);
                 let detection_threshold = last_reading
-                    .map_or(pending_settings.detection_threshold_db, |r| {
+                    .map_or(pending_radio_settings.detection_threshold_db, |r| {
                         r.detection_threshold
                     });
                 FrameKey::Radio(RadioFrameKey::Overview {
@@ -354,14 +460,19 @@ pub async fn display_task(
                     detection_threshold,
                 })
             }
-            DisplayState::Radio(RadioState::Settings) => FrameKey::Radio(RadioFrameKey::Settings(SettingsFrameKey {
-                nav_index: u8::try_from(settings_menu.selected_index()).map_or(u8::MAX, |v| v),
-                editing: settings_menu.is_editing(),
-                threshold: pending_settings.detection_threshold_db,
-                magn: pending_settings.magn_target,
-                bandwidth_index: pending_settings.channel_bandwidth_index,
-                carrier_sense: pending_settings.carrier_sense_threshold,
-            })),
+            DisplayState::Radio(RadioState::Settings) => {
+                FrameKey::Radio(RadioFrameKey::Settings(SettingsFrameKey {
+                    nav_index: u8::try_from(settings_menu.selected_index()).map_or(u8::MAX, |v| v),
+                    editing: settings_menu.is_editing(),
+                    threshold: pending_radio_settings.detection_threshold_db,
+                    magn: pending_radio_settings.magn_target,
+                    bandwidth_index: pending_radio_settings.channel_bandwidth_index,
+                    carrier_sense: pending_radio_settings.carrier_sense_threshold,
+                    predictive_sleep_enabled: pending_power_settings.predictive_sleep_enabled,
+                    sleep_duration_secs: pending_power_settings.sleep_duration_secs,
+                    ui_idle_timeout_secs: pending_power_settings.ui_idle_timeout_secs,
+                }))
+            }
         };
 
         if Some(frame) == last_frame {
@@ -399,7 +510,7 @@ pub async fn display_task(
             DisplayState::Radio(RadioState::Overview) => {
                 let rssi = last_reading.map(|r| r.rssi);
                 let det_threshold = last_reading
-                    .map_or(pending_settings.detection_threshold_db, |r| {
+                    .map_or(pending_radio_settings.detection_threshold_db, |r| {
                         r.detection_threshold
                     });
                 if let Err(e) = display.show_radio_info(rssi, det_threshold) {

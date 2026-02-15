@@ -59,6 +59,34 @@ impl Default for RadioSettings {
     }
 }
 
+/// Power policy settings that can be changed at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub struct PowerSettings {
+    /// Enable predictive deep sleep between expected sensor transmissions.
+    pub predictive_sleep_enabled: bool,
+    /// Deep-sleep duration used once idle countdown has elapsed.
+    pub sleep_duration_secs: u8,
+    /// UI idle timeout before predictive sleep is allowed.
+    pub ui_idle_timeout_secs: u8,
+}
+
+pub const POWER_SLEEP_DURATION_MIN_SECS: u8 = 1;
+pub const POWER_SLEEP_DURATION_MAX_SECS: u8 = 59;
+pub const POWER_UI_IDLE_TIMEOUT_MIN_SECS: u8 = 5;
+pub const POWER_UI_IDLE_TIMEOUT_MAX_SECS: u8 = 180;
+
+pub const DEFAULT_POWER_SETTINGS: PowerSettings = PowerSettings {
+    predictive_sleep_enabled: true,
+    sleep_duration_secs: 45,
+    ui_idle_timeout_secs: 60,
+};
+
+impl Default for PowerSettings {
+    fn default() -> Self {
+        DEFAULT_POWER_SETTINGS
+    }
+}
+
 #[must_use]
 pub const fn channel_bandwidth_hz(index: u8) -> u32 {
     match index {

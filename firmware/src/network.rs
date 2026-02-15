@@ -5,8 +5,8 @@ use alloc::string::String;
 
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
-use embassy_net::{Runner, StackResources};
-use embassy_time::{Duration, Timer};
+use embassy_net::{Ipv4Address, Ipv4Cidr, Runner, StackResources, StaticConfigV4};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_radio::{
     Controller,
@@ -14,7 +14,52 @@ use esp_radio::{
 };
 use static_cell::StaticCell;
 
-use crate::secrets::{WIFI_PASSWORD, WIFI_SSID};
+use crate::power;
+use crate::secrets::{
+    WIFI_BSSID_HINT, WIFI_CHANNEL_HINT, WIFI_DNS1_IP, WIFI_DNS2_IP, WIFI_GATEWAY_IP, WIFI_PASSWORD,
+    WIFI_SSID, WIFI_STATIC_IP, WIFI_SUBNET_PREFIX,
+};
+
+fn ipv4(raw: [u8; 4]) -> Ipv4Address {
+    Ipv4Address::new(raw[0], raw[1], raw[2], raw[3])
+}
+
+#[allow(clippy::default_trait_access)]
+fn build_stack_config() -> embassy_net::Config {
+    WIFI_STATIC_IP.map_or_else(
+        || embassy_net::Config::dhcpv4(embassy_net::DhcpConfig::default()),
+        |static_ip| {
+            let mut static_cfg = StaticConfigV4 {
+                address: Ipv4Cidr::new(ipv4(static_ip), WIFI_SUBNET_PREFIX),
+                gateway: WIFI_GATEWAY_IP.map(ipv4),
+                dns_servers: Default::default(),
+            };
+            if let Some(dns1) = WIFI_DNS1_IP {
+                let _ = static_cfg.dns_servers.push(ipv4(dns1));
+            }
+            if let Some(dns2) = WIFI_DNS2_IP {
+                let _ = static_cfg.dns_servers.push(ipv4(dns2));
+            }
+            embassy_net::Config::ipv4_static(static_cfg)
+        },
+    )
+}
+
+fn build_client_config() -> ClientConfig {
+    let mut client_config = ClientConfig::default()
+        .with_ssid(String::from(WIFI_SSID))
+        .with_password(String::from(WIFI_PASSWORD));
+
+    if let Some(channel) = WIFI_CHANNEL_HINT {
+        client_config = client_config.with_channel(channel);
+    }
+
+    if let Some(bssid) = WIFI_BSSID_HINT {
+        client_config = client_config.with_bssid(bssid);
+    }
+
+    client_config
+}
 
 /// Initialize `WiFi` and return the network stack
 ///
@@ -29,7 +74,7 @@ use crate::secrets::{WIFI_PASSWORD, WIFI_SSID};
 /// # Panics
 ///
 /// Panics if `WiFi` controller creation fails or if task spawning fails.
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::too_many_lines)]
 pub async fn setup_wifi(
     controller: &'static mut Controller<'static>,
     wifi_device: WIFI<'static>,
@@ -38,17 +83,18 @@ pub async fn setup_wifi(
     // Create network stack using the STA interface
     static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
 
-    info!("Setting up WiFi...");
+    info!("NET[{}]: Setting up WiFi", power::wake_reason_class());
 
     let wifi_config = wifi::Config::default();
     let (mut wifi_controller, interfaces) =
         wifi::new(controller, wifi_device, wifi_config).expect("Failed to create WiFi controller");
 
     let resources = STACK_RESOURCES.init(StackResources::new());
+    let stack_config = build_stack_config();
 
     let (stack, runner) = embassy_net::new(
         interfaces.sta,
-        embassy_net::Config::dhcpv4(embassy_net::DhcpConfig::default()),
+        stack_config,
         resources,
         1234u64, // Random seed
     );
@@ -59,38 +105,63 @@ pub async fn setup_wifi(
         .expect("Failed to spawn network task");
 
     // Configure, start, and connect to WiFi with retry
-    info!("Connecting to WiFi SSID: {}", WIFI_SSID);
+    info!(
+        "NET[{}]: Connecting to WiFi SSID {} (channel_hint_set={}, bssid_hint_set={}, static_ip_set={})",
+        power::wake_reason_class(),
+        WIFI_SSID,
+        WIFI_CHANNEL_HINT.is_some(),
+        WIFI_BSSID_HINT.is_some(),
+        WIFI_STATIC_IP.is_some()
+    );
     loop {
-        let client_config = ClientConfig::default()
-            .with_ssid(String::from(WIFI_SSID))
-            .with_password(String::from(WIFI_PASSWORD));
+        let client_config = build_client_config();
 
         if let Err(e) = wifi_controller.set_config(&ModeConfig::Client(client_config)) {
             warn!(
-                "WiFi config failed: {:?}, retrying...",
+                "NET[{}]: WiFi config failed: {:?}, retrying...",
+                power::wake_reason_class(),
                 defmt::Debug2Format(&e)
             );
             Timer::after(Duration::from_secs(1)).await;
             continue;
         }
 
-        if let Err(e) = wifi_controller.start_async().await {
-            warn!(
-                "WiFi start failed: {:?}, retrying...",
-                defmt::Debug2Format(&e)
-            );
-            Timer::after(Duration::from_secs(1)).await;
-            continue;
+        let wifi_start_at = Instant::now();
+        match wifi_controller.start_async().await {
+            Ok(()) => {
+                info!(
+                    "NET[{}]: WiFi start complete in {}ms",
+                    power::wake_reason_class(),
+                    wifi_start_at.elapsed().as_millis()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "NET[{}]: WiFi start failed after {}ms: {:?}, retrying...",
+                    power::wake_reason_class(),
+                    wifi_start_at.elapsed().as_millis(),
+                    defmt::Debug2Format(&e)
+                );
+                Timer::after(Duration::from_secs(1)).await;
+                continue;
+            }
         }
 
+        let assoc_at = Instant::now();
         match wifi_controller.connect_async().await {
             Ok(()) => {
-                info!("WiFi connected!");
+                info!(
+                    "NET[{}]: WiFi associated in {}ms",
+                    power::wake_reason_class(),
+                    assoc_at.elapsed().as_millis()
+                );
                 break;
             }
             Err(e) => {
                 warn!(
-                    "WiFi connect failed: {:?}, retrying...",
+                    "NET[{}]: WiFi association failed after {}ms: {:?}, retrying...",
+                    power::wake_reason_class(),
+                    assoc_at.elapsed().as_millis(),
                     defmt::Debug2Format(&e)
                 );
                 Timer::after(Duration::from_secs(1)).await;
@@ -98,11 +169,24 @@ pub async fn setup_wifi(
         }
     }
 
-    // Wait for DHCP
-    info!("Waiting for DHCP...");
+    // Wait for DHCP (or static IP stack readiness).
+    let config_up_at = Instant::now();
+    info!(
+        "NET[{}]: Waiting for IPv4 config",
+        power::wake_reason_class()
+    );
     stack.wait_config_up().await;
+    info!(
+        "NET[{}]: IPv4 config ready in {}ms",
+        power::wake_reason_class(),
+        config_up_at.elapsed().as_millis()
+    );
     if let Some(config) = stack.config_v4() {
-        info!("Got IP: {}", defmt::Debug2Format(&config.address));
+        info!(
+            "NET[{}]: Got IP {}",
+            power::wake_reason_class(),
+            defmt::Debug2Format(&config.address)
+        );
     }
 
     // Spawn WiFi connection monitor task
@@ -123,22 +207,35 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
 
 #[embassy_executor::task]
 async fn wifi_connection_task(mut controller: WifiController<'static>) {
-    info!("WiFi connection monitor started");
+    info!(
+        "NET[{}]: WiFi connection monitor started",
+        power::wake_reason_class()
+    );
 
     loop {
         // Check if still connected
         if !matches!(controller.is_connected(), Ok(true)) {
-            warn!("WiFi disconnected, reconnecting...");
+            warn!(
+                "NET[{}]: WiFi disconnected, reconnecting...",
+                power::wake_reason_class()
+            );
 
             loop {
+                let reconnect_at = Instant::now();
                 match controller.connect_async().await {
                     Ok(()) => {
-                        info!("WiFi reconnected!");
+                        info!(
+                            "NET[{}]: WiFi reconnected in {}ms",
+                            power::wake_reason_class(),
+                            reconnect_at.elapsed().as_millis()
+                        );
                         break;
                     }
                     Err(e) => {
                         warn!(
-                            "WiFi reconnection failed: {:?}, retrying in 2s...",
+                            "NET[{}]: WiFi reconnection failed after {}ms: {:?}, retrying in 2s...",
+                            power::wake_reason_class(),
+                            reconnect_at.elapsed().as_millis(),
                             defmt::Debug2Format(&e)
                         );
                         Timer::after(Duration::from_secs(2)).await;
