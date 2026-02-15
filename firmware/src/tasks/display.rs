@@ -1,5 +1,7 @@
 use core::fmt::Write;
 
+use app_core::display_model::{DisplayFrameInput, FrameKey, derive_frame};
+use app_core::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
 use defmt::{error, info};
 use embassy_futures::select::{Either3, select3};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -51,44 +53,6 @@ enum RadioState {
     Settings,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FrameKey {
-    Waiting,
-    Main(MainFrameKey),
-    Radio(RadioFrameKey),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct MainFrameKey {
-    temp_deci: i16,
-    sensor_id: u8,
-    channel: u8,
-    battery_ok: bool,
-    time_secs: Option<u64>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RadioFrameKey {
-    Overview {
-        rssi: Option<i16>,
-        detection_threshold: u8,
-    },
-    Settings(SettingsFrameKey),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct SettingsFrameKey {
-    nav_index: u8,
-    editing: bool,
-    threshold: u8,
-    magn: u8,
-    bandwidth_index: u8,
-    carrier_sense: u8,
-    predictive_sleep_enabled: bool,
-    sleep_duration_secs: u8,
-    ui_idle_timeout_secs: u8,
-}
-
 const SETTINGS_MENU_CAPACITY: usize = 8;
 const THRESHOLD_ITEM_INDEX: usize = 0;
 const MAGN_ITEM_INDEX: usize = 1;
@@ -104,6 +68,42 @@ enum SettingsAction {
 }
 
 type SettingsMenu = Menu<MenuEntry<u8, SettingsAction>, SETTINGS_MENU_CAPACITY>;
+
+fn to_ui_screen_state(state: DisplayState) -> UiScreenState {
+    match state {
+        DisplayState::Main => UiScreenState::Main,
+        DisplayState::Radio(RadioState::Overview) => UiScreenState::RadioOverview,
+        DisplayState::Radio(RadioState::Settings) => UiScreenState::RadioSettings,
+    }
+}
+
+fn to_sensor_reading(reading: RadioReading) -> SensorReading {
+    SensorReading {
+        sensor_id: reading.inner.id,
+        channel: reading.inner.channel,
+        battery_ok: reading.inner.battery_ok,
+        temperature_c: reading.inner.temperature_c,
+        rssi_dbm: reading.rssi,
+        detection_threshold_db: reading.detection_threshold,
+    }
+}
+
+fn to_radio_config_view(settings: RadioSettings) -> RadioConfigView {
+    RadioConfigView {
+        detection_threshold_db: settings.detection_threshold_db,
+        magn_target: settings.magn_target,
+        channel_bandwidth_index: settings.channel_bandwidth_index,
+        carrier_sense_threshold: settings.carrier_sense_threshold,
+    }
+}
+
+fn to_power_config_view(settings: PowerSettings) -> PowerConfigView {
+    PowerConfigView {
+        predictive_sleep_enabled: settings.predictive_sleep_enabled,
+        sleep_duration_secs: settings.sleep_duration_secs,
+        ui_idle_timeout_secs: settings.ui_idle_timeout_secs,
+    }
+}
 
 fn format_db(value: u8) -> String<32> {
     let mut out = String::new();
@@ -284,13 +284,6 @@ fn sync_pending_from_menu(
         .unwrap_or(pending_power.ui_idle_timeout_secs);
 }
 
-fn temp_to_deci(temp_c: f32) -> i16 {
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        (temp_c * 10.0) as i16
-    }
-}
-
 #[embassy_executor::task]
 #[allow(clippy::too_many_lines, clippy::expect_used)]
 pub async fn display_task(
@@ -439,41 +432,15 @@ pub async fn display_task(
         }
 
         let current_time = time_receiver.try_get().flatten();
-        let frame = match state {
-            DisplayState::Main => last_reading.map_or(FrameKey::Waiting, |reading| {
-                FrameKey::Main(MainFrameKey {
-                    temp_deci: temp_to_deci(reading.inner.temperature_c),
-                    sensor_id: reading.inner.id,
-                    channel: reading.inner.channel,
-                    battery_ok: reading.inner.battery_ok,
-                    time_secs: current_time.map(|t| t.now_unix_secs()),
-                })
-            }),
-            DisplayState::Radio(RadioState::Overview) => {
-                let rssi = last_reading.map(|r| r.rssi);
-                let detection_threshold = last_reading
-                    .map_or(pending_radio_settings.detection_threshold_db, |r| {
-                        r.detection_threshold
-                    });
-                FrameKey::Radio(RadioFrameKey::Overview {
-                    rssi,
-                    detection_threshold,
-                })
-            }
-            DisplayState::Radio(RadioState::Settings) => {
-                FrameKey::Radio(RadioFrameKey::Settings(SettingsFrameKey {
-                    nav_index: u8::try_from(settings_menu.selected_index()).map_or(u8::MAX, |v| v),
-                    editing: settings_menu.is_editing(),
-                    threshold: pending_radio_settings.detection_threshold_db,
-                    magn: pending_radio_settings.magn_target,
-                    bandwidth_index: pending_radio_settings.channel_bandwidth_index,
-                    carrier_sense: pending_radio_settings.carrier_sense_threshold,
-                    predictive_sleep_enabled: pending_power_settings.predictive_sleep_enabled,
-                    sleep_duration_secs: pending_power_settings.sleep_duration_secs,
-                    ui_idle_timeout_secs: pending_power_settings.ui_idle_timeout_secs,
-                }))
-            }
-        };
+        let frame = derive_frame(DisplayFrameInput {
+            screen: to_ui_screen_state(state),
+            reading: last_reading.map(to_sensor_reading),
+            radio: to_radio_config_view(pending_radio_settings),
+            power: to_power_config_view(pending_power_settings),
+            time_secs: current_time.map(|time_ref| time_ref.now_unix_secs()),
+            settings_nav_index: u8::try_from(settings_menu.selected_index()).map_or(u8::MAX, |v| v),
+            settings_editing: settings_menu.is_editing(),
+        });
 
         if Some(frame) == last_frame {
             continue;

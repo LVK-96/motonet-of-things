@@ -5,6 +5,7 @@ pub struct SensorReading {
     pub battery_ok: bool,
     pub temperature_c: f32,
     pub rssi_dbm: i16,
+    pub detection_threshold_db: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
