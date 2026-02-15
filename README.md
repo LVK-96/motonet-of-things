@@ -65,6 +65,17 @@ Suggested usage:
 - `info`: normal bring-up/debugging
 - `debug`/`trace`: deep protocol and timing investigation
 
+## Local Secrets Setup
+
+Create local firmware credentials before running firmware checks/flash commands:
+
+```bash
+cp firmware/src/secrets.rs.example firmware/src/secrets.rs
+```
+
+Then edit `firmware/src/secrets.rs` with your local Wi-Fi and MQTT values.
+The file is git-ignored and must never be committed.
+
 ## Sleep Modes And Power Policy
 
 Power behavior is controlled by the firmware settings menu:

@@ -22,4 +22,5 @@ target/
 #.idea/
 
 secrets.rs
+firmware/src/secrets.rs
 .worktrees/
