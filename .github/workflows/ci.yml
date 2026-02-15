@@ -16,17 +16,14 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install just
+        uses: extractions/setup-just@v2
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Rustfmt
-        run: cargo fmt --all --check
-
-      - name: Clippy (host crates)
-        run: cargo clippy -p rubicson -p eu-dst -p karu-menu --target x86_64-unknown-linux-gnu -- -D warnings
-
-      - name: Tests (host crates)
-        run: cargo test -p rubicson -p eu-dst -p karu-menu --target x86_64-unknown-linux-gnu
+      - name: Host verification
+        run: just test-host
 
   firmware:
     name: Firmware Check
@@ -44,12 +41,11 @@ jobs:
           default: true
           ldproxy: false
 
+      - name: Install just
+        uses: extractions/setup-just@v2
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Prepare local secrets
-        run: cp firmware/src/secrets.rs.example firmware/src/secrets.rs
-
-      - name: Firmware cargo check
-        working-directory: firmware
-        run: cargo check
+      - name: Firmware verification
+        run: just check-firmware

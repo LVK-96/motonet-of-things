@@ -112,14 +112,17 @@ Use `None` values to keep default behavior (scan + DHCP).
 Run verification from repository root:
 
 ```bash
-./scripts/test-host.sh
-./scripts/check-firmware.sh
+just test-host
+just check-firmware
+# Or run everything:
+just verify
 ```
 
 Verification matrix:
 
 | Command | Validates | Latest run |
 | --- | --- | --- |
-| `./scripts/test-host.sh` | host `fmt`, host `clippy`, and host tests for `rubicson`, `eu-dst`, and `karu-menu` | PASS |
-| `./scripts/check-firmware.sh` | firmware `cargo check` for `xtensa-esp32-none-elf` | PASS |
+| `just test-host` | host `fmt`, host `clippy`, and host tests for `rubicson`, `eu-dst`, and `karu-menu` | PASS |
+| `just check-firmware` | firmware `cargo check` for `xtensa-esp32-none-elf` | PASS |
+| `just verify` | full host + firmware verification bundle | PASS |
 | `cargo test -p karu-menu --target x86_64-unknown-linux-gnu` | root-level host sanity test command | PASS |
