@@ -294,18 +294,12 @@ where
 
     /// Sets the absolute RSSI threshold for asserting carrier sense.
     ///
-    /// The threshold is relative to the MAGN_TARGET setting in AGCCTRL2.
-    /// Value 0 disables absolute carrier sense threshold.
-    /// Values 1-7: threshold is (value - 8) dB below MAGN_TARGET (i.e., -7 to -1 dB).
-    /// Values 8-15: threshold is (value - 7) dB above MAGN_TARGET (i.e., +1 to +8 dB).
-    ///
-    /// Typical values:
-    /// - 0: Disabled (use relative threshold only)
-    /// - 1: -7 dB below MAGN_TARGET (most sensitive)
-    /// - 7: -1 dB below MAGN_TARGET
-    /// - 8: 0 dB (at MAGN_TARGET)
-    /// - 9: +1 dB above MAGN_TARGET
-    /// - 15: +8 dB above MAGN_TARGET (least sensitive)
+    /// The field value is written directly to `AGCCTRL1.CARRIER_SENSE_ABS_THR`.
+    /// It is a 4-bit two's complement value.
+    /// Its meaning is relative to the `MAGN_TARGET` setting in `AGCCTRL2`:
+    /// - `0b1000` (`-8`): absolute carrier sense threshold disabled
+    /// - `0b1001..=0b1111` (`-7..=-1`): 7 dB to 1 dB below `MAGN_TARGET`
+    /// - `0b0000..=0b0111` (`0..=7`): at `MAGN_TARGET` up to 7 dB above it
     pub fn set_carrier_sense_threshold(&mut self, threshold: u8) -> Result<(), Error<SpiE>> {
         self.0.modify_register(Config::AGCCTRL1, |r| {
             AGCCTRL1(r).modify().carrier_sense_abs_thr(threshold.min(15)).bits()
