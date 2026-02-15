@@ -96,12 +96,15 @@ Optional reconnect optimizations are configured in `firmware/src/secrets.rs`:
 
 Use `None` values to keep default behavior (scan + DHCP).
 
-## Tests
+## Verification
 
-Run tests from repository root or crate directories:
+Run verification from repository root:
 
 ```bash
-cargo test
+./scripts/test-host.sh
+./scripts/check-firmware.sh
 ```
 
-Note: firmware is `no_std` and host tests are primarily in helper crates (for example `crates/rubicson`).
+What these scripts validate:
+- `./scripts/test-host.sh`: host fmt, clippy, and tests for `rubicson`, `eu-dst`, and `karu-menu`
+- `./scripts/check-firmware.sh`: firmware `cargo check` for `xtensa-esp32-none-elf`
