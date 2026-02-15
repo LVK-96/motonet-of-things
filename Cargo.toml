@@ -8,9 +8,6 @@ members = [
 ]
 resolver = "2"
 
-[patch."https://github.com/dsvensson/cc1101.git"]
-cc1101 = { path = "patches/cc1101" }
-
 [profile.dev]
 opt-level = "s"
 
