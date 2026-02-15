@@ -1,0 +1,10 @@
+[package]
+name = "app-core"
+version = "0.1.0"
+edition = "2024"
+description = "Platform-independent application domain models and policies"
+
+[dependencies]
+
+[lints]
+workspace = true
