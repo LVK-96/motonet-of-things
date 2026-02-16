@@ -3,6 +3,7 @@
 use defmt::error;
 use embassy_time::{Duration, Timer};
 
+pub mod app_bus;
 pub mod display;
 pub mod messages;
 pub mod network;

@@ -2,7 +2,6 @@ use defmt::{error, info, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 #[cfg(feature = "pulse_rmt")]
 use embassy_sync::mutex::Mutex;
-use embassy_sync::{channel, watch};
 use embassy_time::{Duration, Timer};
 
 #[cfg(feature = "pulse_rmt")]
@@ -10,17 +9,20 @@ use esp_hal::Async;
 #[cfg(feature = "pulse_rmt")]
 use esp_hal::rmt::{Channel as RmtChannel, Rx};
 
-use crate::messages::{RadioReading, RadioSettings};
+use crate::app_bus::{self, AppEvent};
+use crate::messages::RadioSettings;
 use crate::power;
 use crate::pulse_capture::PulseCapture;
 #[cfg(feature = "pulse_rmt")]
 use crate::pulse_capture::apply_pending_settings;
 use crate::radio_433::{Cc1101Radio, Radio433};
 
-type ReadingSender = watch::Sender<'static, CriticalSectionRawMutex, RadioReading, 2>;
-type MqttSender = channel::Sender<'static, CriticalSectionRawMutex, RadioReading, 16>;
-type SettingsSender = watch::Sender<'static, CriticalSectionRawMutex, RadioSettings, 2>;
-type SettingsReceiver = watch::Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>;
+type ReadingSender = app_bus::ReadingSender;
+type MqttSender = app_bus::RadioTelemetrySender;
+type SettingsSender = app_bus::RadioSettingsSender;
+type SettingsReceiver = app_bus::RadioSettingsReceiver;
+type AppCommandSender = app_bus::AppCommandSender;
+type RadioTelemetryReceiver = app_bus::RadioTelemetryReceiver;
 #[cfg(feature = "pulse_rmt")]
 type SharedRadio = &'static Mutex<CriticalSectionRawMutex, Cc1101Radio>;
 
@@ -400,6 +402,19 @@ pub async fn radio_433_rx_task(
 
     let mut capture = PulseCapture::new(rmt_rx, shared_radio, reading_sender, mqtt_sender);
     capture.run().await;
+}
+
+#[embassy_executor::task]
+pub async fn radio_433_event_router_task(
+    telemetry_receiver: RadioTelemetryReceiver,
+    app_command_sender: AppCommandSender,
+) {
+    loop {
+        let reading = telemetry_receiver.receive().await;
+        if let Some(command) = app_bus::route_event(AppEvent::RadioFrameDecoded(reading)) {
+            app_command_sender.send(command).await;
+        }
+    }
 }
 
 #[cfg(feature = "pulse_rmt")]

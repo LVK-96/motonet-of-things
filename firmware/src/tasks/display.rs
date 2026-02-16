@@ -5,8 +5,6 @@ use app_core::display_model::{DisplayFrameInput, FrameKey, derive_frame};
 use app_core::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
 use defmt::{error, info};
 use embassy_futures::select::{Either3, select3};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::{channel, watch};
 use embassy_time::{Duration, Timer};
 use esp_hal::Blocking;
 use esp_hal::i2c::master::I2c;
@@ -16,6 +14,7 @@ use karu_menu::{
     UiEvent as MenuUiEvent,
 };
 
+use crate::app_bus::{self, AppCommand, AppEvent, UiInputEvent};
 use crate::display::{Display, Sh1106Display};
 use crate::messages::{
     CARRIER_SENSE_MAX, CARRIER_SENSE_MIN, CHANNEL_BANDWIDTH_MAX_INDEX, CHANNEL_BANDWIDTH_MIN_INDEX,
@@ -32,13 +31,15 @@ use crate::ui_input::{EC11RotaryEncoderInput, UiEvent, UiInput};
 #[embassy_executor::task]
 pub async fn ui_input_task(
     mut ui: EC11RotaryEncoderInput,
-    ui_event_sender: channel::Sender<'static, CriticalSectionRawMutex, UiEvent, 8>,
+    app_event_sender: app_bus::AppEventSender,
 ) {
     loop {
         let event = ui
             .next_event(UiEvent::NextScreen, UiEvent::PrevScreen)
             .await;
-        ui_event_sender.send(event).await;
+        app_event_sender
+            .send(AppEvent::UiInput(UiInputEvent::Navigation(event)))
+            .await;
     }
 }
 
@@ -169,6 +170,13 @@ fn menu_event_from_ui_event(event: UiEvent) -> MenuUiEvent {
         UiEvent::NextScreen => MenuUiEvent::NextScreen,
         UiEvent::PrevScreen => MenuUiEvent::PrevScreen,
         UiEvent::Select => MenuUiEvent::Select,
+    }
+}
+
+fn navigation_event_from_app_event(event: AppEvent) -> Option<UiEvent> {
+    match event {
+        AppEvent::UiInput(UiInputEvent::Navigation(ui_event)) => Some(ui_event),
+        _ => None,
     }
 }
 
@@ -306,22 +314,11 @@ fn sync_pending_from_menu(
 #[allow(clippy::too_many_lines, clippy::expect_used)]
 pub async fn display_task(
     mut display: Sh1106Display<I2c<'static, Blocking>>,
-    mut receiver: watch::Receiver<'static, CriticalSectionRawMutex, RadioReading, 2>,
-    ui_event_receiver: channel::Receiver<'static, CriticalSectionRawMutex, UiEvent, 8>,
-    mut radio_settings_receiver: watch::Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        RadioSettings,
-        2,
-    >,
-    radio_settings_sender: watch::Sender<'static, CriticalSectionRawMutex, RadioSettings, 2>,
-    mut power_settings_receiver: watch::Receiver<
-        'static,
-        CriticalSectionRawMutex,
-        PowerSettings,
-        2,
-    >,
-    power_settings_sender: watch::Sender<'static, CriticalSectionRawMutex, PowerSettings, 2>,
+    mut receiver: app_bus::ReadingReceiver,
+    app_event_receiver: app_bus::AppEventReceiver,
+    mut radio_settings_receiver: app_bus::RadioSettingsReceiver,
+    mut power_settings_receiver: app_bus::PowerSettingsReceiver,
+    app_command_sender: app_bus::AppCommandSender,
 ) {
     info!("Display task started");
 
@@ -355,7 +352,7 @@ pub async fn display_task(
     loop {
         match select3(
             receiver.changed(),
-            ui_event_receiver.receive(),
+            app_event_receiver.receive(),
             Timer::after(Duration::from_millis(250)),
         )
         .await
@@ -363,7 +360,10 @@ pub async fn display_task(
             Either3::First(reading) => {
                 last_reading = Some(reading);
             }
-            Either3::Second(event) => {
+            Either3::Second(app_event) => {
+                let Some(event) = navigation_event_from_app_event(app_event) else {
+                    continue;
+                };
                 power::notify_ui_activity();
                 // Handle UI events based on current state
                 state = match state {
@@ -413,9 +413,16 @@ pub async fn display_task(
                                         to_power_config_view(pending_power_settings),
                                     ));
                                 settings_menu.commit_all();
-                                radio_settings_sender.send(pending_radio_settings);
-                                power_settings_sender.send(pending_power_settings);
-                                power::set_settings(pending_power_settings);
+                                if let Some(command) = app_bus::route_event(AppEvent::UiInput(
+                                    UiInputEvent::ApplySettings {
+                                        radio: pending_radio_settings,
+                                        power: pending_power_settings,
+                                    },
+                                )) {
+                                    if let AppCommand::ApplySettings { .. } = command {
+                                        app_command_sender.send(command).await;
+                                    }
+                                }
                                 let bandwidth_khz = channel_bandwidth_hz(
                                     pending_radio_settings.channel_bandwidth_index,
                                 ) / 1000;

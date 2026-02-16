@@ -7,10 +7,8 @@ use defmt::{error, info};
 
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
 #[cfg(feature = "pulse_rmt")]
 use embassy_sync::mutex::Mutex;
-use embassy_sync::watch::Watch;
 
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{DriveMode, Input, InputConfig, Pull};
@@ -30,8 +28,8 @@ use esp_println as _;
 use esp_radio::init;
 use static_cell::StaticCell;
 
+use esp32_rust_project::app_bus;
 use esp32_rust_project::display::{Display, Sh1106Display};
-use esp32_rust_project::messages::{PowerSettings, RadioReading, RadioSettings};
 use esp32_rust_project::network;
 use esp32_rust_project::power;
 use esp32_rust_project::radio_433::Cc1101Radio;
@@ -42,21 +40,8 @@ use esp32_rust_project::tasks::{
     network_supervisor as network_supervisor_task, radio_433 as radio_433_task,
     time_sync as time_sync_task,
 };
-use esp32_rust_project::ui_input::{EC11RotaryEncoderInput, UiEvent};
+use esp32_rust_project::ui_input::EC11RotaryEncoderInput;
 use esp32_rust_project::with_retry;
-
-/// Watch for sharing latest readings with display/UI.
-static READING_WATCH: Watch<CriticalSectionRawMutex, RadioReading, 2> = Watch::new();
-/// Queue carrying telemetry-bound readings out of capture tasks.
-static TELEMETRY_READING_CHANNEL: Channel<CriticalSectionRawMutex, RadioReading, 16> =
-    Channel::new();
-
-/// Watch for sharing radio settings with the radio task
-static RADIO_SETTINGS_WATCH: Watch<CriticalSectionRawMutex, RadioSettings, 2> = Watch::new();
-/// Watch for sharing power settings with UI + runtime power policy.
-static POWER_SETTINGS_WATCH: Watch<CriticalSectionRawMutex, PowerSettings, 2> = Watch::new();
-/// Queue for UI events so display task does not cancel GPIO edge waits.
-static UI_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, UiEvent, 8> = Channel::new();
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -90,7 +75,9 @@ async fn main(spawner: Spawner) -> ! {
     power::log_wakeup_cause();
     let initial_power_settings = power::load_settings_or_default();
     power::restore_settings_after_reset(initial_power_settings);
-    POWER_SETTINGS_WATCH.sender().send(initial_power_settings);
+    app_bus::POWER_SETTINGS_WATCH
+        .sender()
+        .send(initial_power_settings);
 
     // Initialize async runtime
     esp_rtos::start(TimerGroup::new(peripherals.TIMG0).timer0);
@@ -212,15 +199,15 @@ async fn main(spawner: Spawner) -> ! {
     // Spawn tasks
     #[cfg(feature = "pulse_sw")]
     {
-        let settings_receiver = RADIO_SETTINGS_WATCH
+        let settings_receiver = app_bus::RADIO_SETTINGS_WATCH
             .receiver()
             .expect("Failed to get settings receiver");
         spawner
             .spawn(radio_433_task::radio_433_rx_task(
                 r433,
-                READING_WATCH.sender(),
-                TELEMETRY_READING_CHANNEL.sender(),
-                RADIO_SETTINGS_WATCH.sender(),
+                app_bus::READING_WATCH.sender(),
+                app_bus::RADIO_TELEMETRY_CHANNEL.sender(),
+                app_bus::RADIO_SETTINGS_WATCH.sender(),
                 settings_receiver,
             ))
             .expect("Failed to spawn radio task");
@@ -228,7 +215,7 @@ async fn main(spawner: Spawner) -> ! {
     #[cfg(feature = "pulse_rmt")]
     {
         let shared_radio = SHARED_RADIO.init(Mutex::new(r433));
-        let settings_receiver = RADIO_SETTINGS_WATCH
+        let settings_receiver = app_bus::RADIO_SETTINGS_WATCH
             .receiver()
             .expect("Failed to get settings receiver");
         spawner
@@ -241,37 +228,47 @@ async fn main(spawner: Spawner) -> ! {
             .spawn(radio_433_task::radio_433_rx_task(
                 shared_radio,
                 rmt_rx,
-                READING_WATCH.sender(),
-                TELEMETRY_READING_CHANNEL.sender(),
-                RADIO_SETTINGS_WATCH.sender(),
+                app_bus::READING_WATCH.sender(),
+                app_bus::RADIO_TELEMETRY_CHANNEL.sender(),
+                app_bus::RADIO_SETTINGS_WATCH.sender(),
             ))
             .expect("Failed to spawn radio task");
     }
-    let telemetry_receiver = TELEMETRY_READING_CHANNEL.receiver();
     spawner
-        .spawn(mqtt_task::mqtt_task(network_stack, telemetry_receiver))
+        .spawn(radio_433_task::radio_433_event_router_task(
+            app_bus::RADIO_TELEMETRY_CHANNEL.receiver(),
+            app_bus::APP_COMMAND_CHANNEL.sender(),
+        ))
+        .expect("Failed to spawn radio event router task");
+    spawner
+        .spawn(app_bus::app_command_dispatch_task())
+        .expect("Failed to spawn app command dispatch task");
+    spawner
+        .spawn(mqtt_task::mqtt_task(
+            network_stack,
+            app_bus::MQTT_COMMAND_CHANNEL.receiver(),
+        ))
         .expect("Failed to spawn mqtt task");
     spawner
         .spawn(display_task::ui_input_task(
             ui_input,
-            UI_EVENT_CHANNEL.sender(),
+            app_bus::APP_EVENT_CHANNEL.sender(),
         ))
         .expect("Failed to spawn ui input task");
     spawner
         .spawn(display_task::display_task(
             display,
-            READING_WATCH
+            app_bus::READING_WATCH
                 .receiver()
                 .expect("Failed to get reading receiver"),
-            UI_EVENT_CHANNEL.receiver(),
-            RADIO_SETTINGS_WATCH
+            app_bus::APP_EVENT_CHANNEL.receiver(),
+            app_bus::RADIO_SETTINGS_WATCH
                 .receiver()
                 .expect("Failed to get settings receiver for display"),
-            RADIO_SETTINGS_WATCH.sender(),
-            POWER_SETTINGS_WATCH
+            app_bus::POWER_SETTINGS_WATCH
                 .receiver()
                 .expect("Failed to get power settings receiver for display"),
-            POWER_SETTINGS_WATCH.sender(),
+            app_bus::APP_COMMAND_CHANNEL.sender(),
         ))
         .expect("Failed to spawn display task");
     spawner

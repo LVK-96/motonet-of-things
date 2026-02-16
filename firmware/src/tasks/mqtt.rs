@@ -13,11 +13,18 @@ use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
 use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
 use telemetry_core::publish_state::{BeginPublishError, PublishOutcome, PublishPipelineState};
 
+use crate::app_bus::{self, AppCommand};
 use crate::messages::RadioReading;
 use crate::network;
 use crate::power;
 use crate::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
-use crate::tasks::TelemetryReceiver;
+
+fn telemetry_from_command(command: AppCommand) -> Option<RadioReading> {
+    match command {
+        AppCommand::PublishTelemetry(reading) => Some(reading),
+        AppCommand::ApplySettings { .. } => None,
+    }
+}
 
 /// Sets up the MQTT client, including TCP connection and MQTT broker handshake.
 async fn establish_mqtt_session<'a>(
@@ -140,7 +147,10 @@ async fn establish_mqtt_session<'a>(
 
 #[embassy_executor::task]
 #[allow(clippy::expect_used, clippy::too_many_lines)]
-pub async fn mqtt_task(network_stack: embassy_net::Stack<'static>, receiver: TelemetryReceiver) {
+pub async fn mqtt_task(
+    network_stack: embassy_net::Stack<'static>,
+    receiver: app_bus::MqttCommandReceiver,
+) {
     // Backoff parameters
     const MIN_BACKOFF_SECS: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
@@ -195,7 +205,11 @@ pub async fn mqtt_task(network_stack: embassy_net::Stack<'static>, receiver: Tel
                 // Wait for either a reading or ping timeout
                 let timeout = Duration::from_secs(PING_INTERVAL_SECS);
                 match select(receiver.receive(), Timer::after(timeout)).await {
-                    Either::First(reading) => {
+                    Either::First(command) => {
+                        let Some(reading) = telemetry_from_command(command) else {
+                            trace!("MQTT: Ignoring non-telemetry command");
+                            continue;
+                        };
                         if let Err(BeginPublishError::Busy) = publish_state.begin_new(reading) {
                             deferred_reading = Some(reading);
                             warn!(
