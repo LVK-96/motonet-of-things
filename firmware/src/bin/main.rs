@@ -237,7 +237,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(radio_433_task::radio_433_event_router_task(
             app_bus::RADIO_TELEMETRY_CHANNEL.receiver(),
-            app_bus::APP_COMMAND_CHANNEL.sender(),
+            app_bus::MQTT_COMMAND_CHANNEL.sender(),
         ))
         .expect("Failed to spawn radio event router task");
     spawner

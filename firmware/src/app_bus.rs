@@ -53,6 +53,15 @@ pub enum AppCommand {
     PublishTelemetry(RadioReading),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlDispatch {
+    ApplySettings {
+        radio: RadioSettings,
+        power: PowerSettings,
+    },
+    Ignore,
+}
+
 pub type ReadingSender =
     WatchSender<'static, CriticalSectionRawMutex, RadioReading, READINGS_WATCH_DEPTH>;
 pub type ReadingReceiver =
@@ -126,16 +135,43 @@ pub fn route_event(event: AppEvent) -> Option<AppCommand> {
     }
 }
 
+#[must_use]
+pub fn route_event_to_control_command(event: AppEvent) -> Option<AppCommand> {
+    match route_event(event) {
+        Some(AppCommand::ApplySettings { radio, power }) => {
+            Some(AppCommand::ApplySettings { radio, power })
+        }
+        Some(AppCommand::PublishTelemetry(_)) | None => None,
+    }
+}
+
+#[must_use]
+pub fn route_event_to_mqtt_command(event: AppEvent) -> Option<AppCommand> {
+    match route_event(event) {
+        Some(AppCommand::PublishTelemetry(reading)) => Some(AppCommand::PublishTelemetry(reading)),
+        Some(AppCommand::ApplySettings { .. }) | None => None,
+    }
+}
+
+#[must_use]
+pub fn classify_control_dispatch(command: AppCommand) -> ControlDispatch {
+    match command {
+        AppCommand::ApplySettings { radio, power } => {
+            ControlDispatch::ApplySettings { radio, power }
+        }
+        AppCommand::PublishTelemetry(_) => ControlDispatch::Ignore,
+    }
+}
+
 #[embassy_executor::task]
 pub async fn app_command_dispatch_task() {
     let app_command_receiver = APP_COMMAND_CHANNEL.receiver();
-    let mqtt_command_sender = MQTT_COMMAND_CHANNEL.sender();
     let radio_settings_sender = RADIO_SETTINGS_WATCH.sender();
     let power_settings_sender = POWER_SETTINGS_WATCH.sender();
 
     loop {
-        match app_command_receiver.receive().await {
-            AppCommand::ApplySettings {
+        match classify_control_dispatch(app_command_receiver.receive().await) {
+            ControlDispatch::ApplySettings {
                 radio,
                 power: power_settings,
             } => {
@@ -143,18 +179,18 @@ pub async fn app_command_dispatch_task() {
                 power_settings_sender.send(power_settings);
                 power::set_settings(power_settings);
             }
-            AppCommand::PublishTelemetry(reading) => {
-                mqtt_command_sender
-                    .send(AppCommand::PublishTelemetry(reading))
-                    .await;
-            }
+            ControlDispatch::Ignore => {}
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AppCommand, AppEvent, MqttSessionState, NetworkState, UiInputEvent, route_event};
+    use super::{
+        AppCommand, AppEvent, ControlDispatch, MqttSessionState, NetworkState, UiInputEvent,
+        classify_control_dispatch, route_event, route_event_to_control_command,
+        route_event_to_mqtt_command,
+    };
     use crate::messages::{
         DEFAULT_POWER_SETTINGS, DEFAULT_RADIO_SETTINGS, PowerSettings, RadioReading, RadioSettings,
     };
@@ -222,6 +258,42 @@ mod tests {
                     && routed.inner.channel == reading.inner.channel
                     && routed.rssi == reading.rssi
                     && routed.detection_threshold == reading.detection_threshold
+        ));
+    }
+
+    #[test]
+    fn ui_apply_settings_routes_to_control_path_only() {
+        let radio = sample_radio_settings();
+        let power = sample_power_settings();
+        let event = AppEvent::UiInput(UiInputEvent::ApplySettings { radio, power });
+
+        assert!(matches!(
+            route_event_to_control_command(event),
+            Some(AppCommand::ApplySettings { .. })
+        ));
+        assert!(route_event_to_mqtt_command(event).is_none());
+    }
+
+    #[test]
+    fn radio_frame_routes_to_mqtt_path_only() {
+        let reading = sample_reading();
+        let event = AppEvent::RadioFrameDecoded(reading);
+
+        assert!(matches!(
+            route_event_to_mqtt_command(event),
+            Some(AppCommand::PublishTelemetry(routed))
+                if routed.inner.id == reading.inner.id
+                    && routed.inner.channel == reading.inner.channel
+        ));
+        assert!(route_event_to_control_command(event).is_none());
+    }
+
+    #[test]
+    fn control_dispatch_ignores_publish_telemetry_commands() {
+        let reading = sample_reading();
+        assert!(matches!(
+            classify_control_dispatch(AppCommand::PublishTelemetry(reading)),
+            ControlDispatch::Ignore
         ));
     }
 

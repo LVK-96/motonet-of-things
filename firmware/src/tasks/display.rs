@@ -413,12 +413,12 @@ pub async fn display_task(
                                         to_power_config_view(pending_power_settings),
                                     ));
                                 settings_menu.commit_all();
-                                if let Some(command) = app_bus::route_event(AppEvent::UiInput(
-                                    UiInputEvent::ApplySettings {
+                                if let Some(command) = app_bus::route_event_to_control_command(
+                                    AppEvent::UiInput(UiInputEvent::ApplySettings {
                                         radio: pending_radio_settings,
                                         power: pending_power_settings,
-                                    },
-                                )) {
+                                    }),
+                                ) {
                                     if let AppCommand::ApplySettings { .. } = command {
                                         app_command_sender.send(command).await;
                                     }

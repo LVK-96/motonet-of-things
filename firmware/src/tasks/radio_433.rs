@@ -21,7 +21,7 @@ type ReadingSender = app_bus::ReadingSender;
 type MqttSender = app_bus::RadioTelemetrySender;
 type SettingsSender = app_bus::RadioSettingsSender;
 type SettingsReceiver = app_bus::RadioSettingsReceiver;
-type AppCommandSender = app_bus::AppCommandSender;
+type MqttCommandSender = app_bus::MqttCommandSender;
 type RadioTelemetryReceiver = app_bus::RadioTelemetryReceiver;
 #[cfg(feature = "pulse_rmt")]
 type SharedRadio = &'static Mutex<CriticalSectionRawMutex, Cc1101Radio>;
@@ -407,12 +407,14 @@ pub async fn radio_433_rx_task(
 #[embassy_executor::task]
 pub async fn radio_433_event_router_task(
     telemetry_receiver: RadioTelemetryReceiver,
-    app_command_sender: AppCommandSender,
+    mqtt_command_sender: MqttCommandSender,
 ) {
     loop {
         let reading = telemetry_receiver.receive().await;
-        if let Some(command) = app_bus::route_event(AppEvent::RadioFrameDecoded(reading)) {
-            app_command_sender.send(command).await;
+        if let Some(command) =
+            app_bus::route_event_to_mqtt_command(AppEvent::RadioFrameDecoded(reading))
+        {
+            mqtt_command_sender.send(command).await;
         }
     }
 }
