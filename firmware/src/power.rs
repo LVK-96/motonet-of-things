@@ -12,11 +12,15 @@ use esp_hal::rtc_cntl::{
 };
 use esp_hal::system::SleepSource;
 
+#[path = "persistence/mod.rs"]
+pub(crate) mod persistence;
+
 use crate::messages::{
     DEFAULT_POWER_SETTINGS, POWER_SLEEP_DURATION_MAX_SECS, POWER_SLEEP_DURATION_MIN_SECS,
     POWER_UI_IDLE_TIMEOUT_MAX_SECS, POWER_UI_IDLE_TIMEOUT_MIN_SECS, PowerSettings,
 };
 use crate::telemetry;
+use persistence::rtc_schema;
 
 static PREDICTIVE_SLEEP_ENABLED: AtomicBool =
     AtomicBool::new(DEFAULT_POWER_SETTINGS.predictive_sleep_enabled);
@@ -24,7 +28,6 @@ static SLEEP_DURATION_SECS: AtomicU8 = AtomicU8::new(DEFAULT_POWER_SETTINGS.slee
 static UI_IDLE_TIMEOUT_SECS: AtomicU8 = AtomicU8::new(DEFAULT_POWER_SETTINGS.ui_idle_timeout_secs);
 static UI_IDLE_DEADLINE_SECS: AtomicU32 = AtomicU32::new(0);
 
-const PERSIST_WORD_MAGIC: u8 = 0xA5;
 const DEEP_SLEEP_LOG_FLUSH_DELAY_US: u32 = 20_000;
 #[esp_hal::ram(unstable(rtc_slow, persistent))]
 static mut PERSISTED_POWER_WORD: u32 = 0;
@@ -72,53 +75,27 @@ fn clamp_settings(settings: PowerSettings) -> PowerSettings {
     from_power_config_view(clamp_power_config(to_power_config_view(settings)))
 }
 
-fn persist_checksum(payload: &[u8]) -> u8 {
-    payload
-        .iter()
-        .fold(0x5Cu8, |acc, byte| acc.rotate_left(1).wrapping_add(*byte))
+fn to_rtc_payload(settings: PowerSettings) -> rtc_schema::PowerSettingsPayload {
+    rtc_schema::PowerSettingsPayload {
+        predictive_sleep_enabled: settings.predictive_sleep_enabled,
+        sleep_duration_secs: settings.sleep_duration_secs,
+        ui_idle_timeout_secs: settings.ui_idle_timeout_secs,
+    }
 }
 
-fn encode_persisted(settings: PowerSettings) -> u32 {
-    let clamped = clamp_settings(settings);
-    let byte0 = PERSIST_WORD_MAGIC;
-    let byte1 =
-        (u8::from(clamped.predictive_sleep_enabled) << 7) | (clamped.sleep_duration_secs & 0x7F);
-    let byte2 = clamped.ui_idle_timeout_secs;
-    let byte3 = persist_checksum(&[byte0, byte1, byte2]);
-    u32::from_le_bytes([byte0, byte1, byte2, byte3])
+fn from_rtc_payload(payload: rtc_schema::PowerSettingsPayload) -> PowerSettings {
+    PowerSettings {
+        predictive_sleep_enabled: payload.predictive_sleep_enabled,
+        sleep_duration_secs: payload.sleep_duration_secs,
+        ui_idle_timeout_secs: payload.ui_idle_timeout_secs,
+    }
 }
 
-fn decode_persisted(word: u32) -> Option<PowerSettings> {
-    let [byte0, byte1, byte2, byte3] = word.to_le_bytes();
-
-    if byte0 != PERSIST_WORD_MAGIC {
-        return None;
-    }
-
-    if byte3 != persist_checksum(&[byte0, byte1, byte2]) {
-        return None;
-    }
-
-    let predictive_sleep_enabled = (byte1 & 0x80) != 0;
-    let sleep_duration_secs = byte1 & 0x7F;
-    if !(POWER_SLEEP_DURATION_MIN_SECS..=POWER_SLEEP_DURATION_MAX_SECS)
-        .contains(&sleep_duration_secs)
-    {
-        return None;
-    }
-
-    let ui_idle_timeout_secs = byte2;
-    if !(POWER_UI_IDLE_TIMEOUT_MIN_SECS..=POWER_UI_IDLE_TIMEOUT_MAX_SECS)
-        .contains(&ui_idle_timeout_secs)
-    {
-        return None;
-    }
-
-    Some(PowerSettings {
-        predictive_sleep_enabled,
-        sleep_duration_secs,
-        ui_idle_timeout_secs,
-    })
+fn settings_within_bounds(settings: PowerSettings) -> bool {
+    (POWER_SLEEP_DURATION_MIN_SECS..=POWER_SLEEP_DURATION_MAX_SECS)
+        .contains(&settings.sleep_duration_secs)
+        && (POWER_UI_IDLE_TIMEOUT_MIN_SECS..=POWER_UI_IDLE_TIMEOUT_MAX_SECS)
+            .contains(&settings.ui_idle_timeout_secs)
 }
 
 fn read_persisted_word() -> u32 {
@@ -134,7 +111,7 @@ fn write_persisted_word(word: u32) {
 }
 
 fn persist_settings(settings: PowerSettings) {
-    let word = encode_persisted(settings);
+    let word = rtc_schema::encode_power_settings(to_rtc_payload(clamp_settings(settings)));
     write_persisted_word(word);
     let verify = read_persisted_word();
     let raw = word.to_le_bytes();
@@ -153,25 +130,51 @@ fn persist_settings(settings: PowerSettings) {
 pub fn load_settings_or_default() -> PowerSettings {
     let word = read_persisted_word();
     let raw = word.to_le_bytes();
-    decode_persisted(word).map_or_else(
-        || {
+    match rtc_schema::decode_power_settings(word) {
+        Ok(decoded) => {
+            let settings = from_rtc_payload(decoded.value);
+            if !settings_within_bounds(settings) {
+                info!(
+                    "PowerSave: persisted RTC_SLOW=0x{:08x} [{}, {}, {}, {}]",
+                    word, raw[0], raw[1], raw[2], raw[3]
+                );
+                info!("PowerSave: persisted settings out of range, using defaults");
+                DEFAULT_POWER_SETTINGS
+            } else {
+                if decoded.needs_migration {
+                    let migrated_word = rtc_schema::encode_power_settings(decoded.value);
+                    write_persisted_word(migrated_word);
+                    info!(
+                        "PowerSave: migrated legacy persisted schema to v{}",
+                        rtc_schema::POWER_SCHEMA_VERSION
+                    );
+                }
+
+                info!(
+                    "PowerSave: restored settings (enabled={}, sleep={}s, ui_idle={}s)",
+                    settings.predictive_sleep_enabled,
+                    settings.sleep_duration_secs,
+                    settings.ui_idle_timeout_secs
+                );
+                settings
+            }
+        }
+        Err(decode_error) => {
             info!(
                 "PowerSave: persisted RTC_SLOW=0x{:08x} [{}, {}, {}, {}]",
                 word, raw[0], raw[1], raw[2], raw[3]
             );
-            info!("PowerSave: no valid persisted settings, using defaults");
+            match decode_error {
+                rtc_schema::DecodeError::ChecksumMismatch => {
+                    warn!("PowerSave: persisted checksum mismatch, using defaults");
+                }
+                _ => {
+                    info!("PowerSave: no valid persisted settings, using defaults");
+                }
+            }
             DEFAULT_POWER_SETTINGS
-        },
-        |settings| {
-            info!(
-                "PowerSave: restored settings (enabled={}, sleep={}s, ui_idle={}s)",
-                settings.predictive_sleep_enabled,
-                settings.sleep_duration_secs,
-                settings.ui_idle_timeout_secs
-            );
-            settings
-        },
-    )
+        }
+    }
 }
 
 fn apply_settings(settings: PowerSettings, persist: bool, rearm_idle_countdown: bool) {

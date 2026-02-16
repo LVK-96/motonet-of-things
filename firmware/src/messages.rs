@@ -6,6 +6,16 @@
 use rubicson::RubicsonReading;
 use telemetry_core::TelemetryRecord;
 
+pub use app_core::config_rules::{
+    CARRIER_SENSE_MAX, CARRIER_SENSE_MIN, CHANNEL_BANDWIDTH_MAX_INDEX, CHANNEL_BANDWIDTH_MIN_INDEX,
+    DEFAULT_CARRIER_SENSE_THRESHOLD, DEFAULT_CHANNEL_BANDWIDTH_HZ, DEFAULT_CHANNEL_BANDWIDTH_INDEX,
+    DEFAULT_DETECTION_THRESHOLD_DB, DEFAULT_MAGN_TARGET, DETECTION_THRESHOLD_MAX_DB,
+    DETECTION_THRESHOLD_MIN_DB, DETECTION_THRESHOLD_STEP_DB, MAGN_TARGET_MAX, MAGN_TARGET_MIN,
+    POWER_DEFAULT_PREDICTIVE_SLEEP_ENABLED, POWER_DEFAULT_SLEEP_DURATION_SECS,
+    POWER_DEFAULT_UI_IDLE_TIMEOUT_SECS, POWER_SLEEP_DURATION_MAX_SECS,
+    POWER_SLEEP_DURATION_MIN_SECS, POWER_UI_IDLE_TIMEOUT_MAX_SECS, POWER_UI_IDLE_TIMEOUT_MIN_SECS,
+};
+
 /// A sensor reading bundled with radio signal metadata.
 ///
 /// This struct wraps a decoded `RubicsonReading` with additional
@@ -63,23 +73,11 @@ pub struct RadioSettings {
 }
 
 pub const DEFAULT_RADIO_SETTINGS: RadioSettings = RadioSettings {
-    detection_threshold_db: 16,
-    magn_target: 7, // 42 dB - matches CC1101 default
+    detection_threshold_db: DEFAULT_DETECTION_THRESHOLD_DB,
+    magn_target: DEFAULT_MAGN_TARGET, // 42 dB - matches CC1101 default
     channel_bandwidth_index: DEFAULT_CHANNEL_BANDWIDTH_INDEX,
-    carrier_sense_threshold: 0, // At MAGN_TARGET level
+    carrier_sense_threshold: DEFAULT_CARRIER_SENSE_THRESHOLD, // At MAGN_TARGET level
 };
-
-pub const DETECTION_THRESHOLD_MIN_DB: u8 = 4;
-pub const DETECTION_THRESHOLD_MAX_DB: u8 = 16;
-pub const DETECTION_THRESHOLD_STEP_DB: u8 = 4;
-pub const MAGN_TARGET_MIN: u8 = 0;
-pub const MAGN_TARGET_MAX: u8 = 7;
-pub const CHANNEL_BANDWIDTH_MIN_INDEX: u8 = 0;
-pub const CHANNEL_BANDWIDTH_MAX_INDEX: u8 = 3;
-pub const DEFAULT_CHANNEL_BANDWIDTH_HZ: u32 = 203_000;
-pub const DEFAULT_CHANNEL_BANDWIDTH_INDEX: u8 = 1;
-pub const CARRIER_SENSE_MIN: u8 = 0;
-pub const CARRIER_SENSE_MAX: u8 = 7;
 
 impl Default for RadioSettings {
     fn default() -> Self {
@@ -98,15 +96,10 @@ pub struct PowerSettings {
     pub ui_idle_timeout_secs: u8,
 }
 
-pub const POWER_SLEEP_DURATION_MIN_SECS: u8 = 1;
-pub const POWER_SLEEP_DURATION_MAX_SECS: u8 = 59;
-pub const POWER_UI_IDLE_TIMEOUT_MIN_SECS: u8 = 5;
-pub const POWER_UI_IDLE_TIMEOUT_MAX_SECS: u8 = 180;
-
 pub const DEFAULT_POWER_SETTINGS: PowerSettings = PowerSettings {
-    predictive_sleep_enabled: true,
-    sleep_duration_secs: 45,
-    ui_idle_timeout_secs: 60,
+    predictive_sleep_enabled: POWER_DEFAULT_PREDICTIVE_SLEEP_ENABLED,
+    sleep_duration_secs: POWER_DEFAULT_SLEEP_DURATION_SECS,
+    ui_idle_timeout_secs: POWER_DEFAULT_UI_IDLE_TIMEOUT_SECS,
 };
 
 impl Default for PowerSettings {

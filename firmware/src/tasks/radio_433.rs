@@ -12,6 +12,7 @@ use esp_hal::rmt::{Channel as RmtChannel, Rx};
 use crate::app_bus::{self, AppEvent};
 use crate::messages::RadioSettings;
 use crate::power;
+use crate::power::persistence::rtc_schema;
 use crate::pulse_capture::PulseCapture;
 #[cfg(feature = "pulse_rmt")]
 use crate::pulse_capture::apply_pending_settings;
@@ -29,8 +30,6 @@ type SharedRadio = &'static Mutex<CriticalSectionRawMutex, Cc1101Radio>;
 const RF_SWEEP_ENABLED: bool = true;
 const RF_SWEEP_DWELL_SAMPLES: u16 = 24;
 const RF_SWEEP_SAMPLE_PERIOD_MS: u64 = 50;
-const PERSISTED_RF_PROFILE_MAGIC: u8 = 0xC7;
-const PERSISTED_RF_PROFILE_VERSION: u8 = 1;
 #[esp_hal::ram(unstable(rtc_slow, persistent))]
 static mut PERSISTED_RF_PROFILE_WORD: u32 = 0;
 
@@ -114,12 +113,6 @@ impl SignalStats {
     }
 }
 
-fn rf_profile_checksum(payload: [u8; 3]) -> u8 {
-    payload
-        .iter()
-        .fold(0x39u8, |acc, byte| acc.rotate_left(1).wrapping_add(*byte))
-}
-
 fn read_persisted_rf_profile_word() -> u32 {
     critical_section::with(|_| unsafe {
         core::ptr::read_volatile(core::ptr::addr_of!(PERSISTED_RF_PROFILE_WORD))
@@ -138,30 +131,43 @@ fn persist_rf_profile_index(index: usize) {
         return;
     };
 
-    let payload = [
-        PERSISTED_RF_PROFILE_MAGIC,
-        index_u8,
-        PERSISTED_RF_PROFILE_VERSION,
-    ];
-    let checksum = rf_profile_checksum(payload);
-    let word = u32::from_le_bytes([payload[0], payload[1], payload[2], checksum]);
+    let word = rtc_schema::encode_rf_profile(rtc_schema::RfProfilePayload {
+        profile_index: index_u8,
+    });
     write_persisted_rf_profile_word(word);
     info!("Persisted RF profile idx={} word=0x{:08x}", index_u8, word);
 }
 
 fn load_persisted_rf_profile_index() -> Option<usize> {
     let word = read_persisted_rf_profile_word();
-    let [magic, index_u8, version, checksum] = word.to_le_bytes();
-    let payload = [magic, index_u8, version];
-    if magic != PERSISTED_RF_PROFILE_MAGIC
-        || version != PERSISTED_RF_PROFILE_VERSION
-        || checksum != rf_profile_checksum(payload)
-    {
-        return None;
+    match rtc_schema::decode_rf_profile(word) {
+        Ok(decoded) => {
+            let index = usize::from(decoded.value.profile_index);
+            if index >= RF_SWEEP_CANDIDATES.len() {
+                warn!(
+                    "Persisted RF profile index {} out of range (max={})",
+                    index,
+                    RF_SWEEP_CANDIDATES.len()
+                );
+                None
+            } else {
+                if decoded.needs_migration {
+                    let migrated_word = rtc_schema::encode_rf_profile(decoded.value);
+                    write_persisted_rf_profile_word(migrated_word);
+                    info!(
+                        "Migrated legacy RF profile schema to v{}",
+                        rtc_schema::RF_PROFILE_SCHEMA_VERSION
+                    );
+                }
+                Some(index)
+            }
+        }
+        Err(rtc_schema::DecodeError::ChecksumMismatch) => {
+            warn!("Persisted RF profile checksum mismatch; ignoring stored profile");
+            None
+        }
+        Err(_) => None,
     }
-
-    let index = usize::from(index_u8);
-    (index < RF_SWEEP_CANDIDATES.len()).then_some(index)
 }
 
 async fn sample_signal_stats(

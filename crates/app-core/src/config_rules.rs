@@ -2,17 +2,26 @@ use crate::domain::{PowerConfigView, RadioConfigView};
 
 pub const DETECTION_THRESHOLD_MIN_DB: u8 = 4;
 pub const DETECTION_THRESHOLD_MAX_DB: u8 = 16;
+pub const DETECTION_THRESHOLD_STEP_DB: u8 = 4;
 pub const MAGN_TARGET_MIN: u8 = 0;
 pub const MAGN_TARGET_MAX: u8 = 7;
 pub const CHANNEL_BANDWIDTH_MIN_INDEX: u8 = 0;
 pub const CHANNEL_BANDWIDTH_MAX_INDEX: u8 = 3;
 pub const CARRIER_SENSE_MIN: u8 = 0;
 pub const CARRIER_SENSE_MAX: u8 = 7;
+pub const DEFAULT_DETECTION_THRESHOLD_DB: u8 = DETECTION_THRESHOLD_MAX_DB;
+pub const DEFAULT_MAGN_TARGET: u8 = MAGN_TARGET_MAX;
+pub const DEFAULT_CHANNEL_BANDWIDTH_INDEX: u8 = 1;
+pub const DEFAULT_CHANNEL_BANDWIDTH_HZ: u32 = 203_000;
+pub const DEFAULT_CARRIER_SENSE_THRESHOLD: u8 = CARRIER_SENSE_MIN;
 
 pub const POWER_SLEEP_DURATION_MIN_SECS: u8 = 1;
 pub const POWER_SLEEP_DURATION_MAX_SECS: u8 = 59;
 pub const POWER_UI_IDLE_TIMEOUT_MIN_SECS: u8 = 5;
 pub const POWER_UI_IDLE_TIMEOUT_MAX_SECS: u8 = 180;
+pub const POWER_DEFAULT_PREDICTIVE_SLEEP_ENABLED: bool = true;
+pub const POWER_DEFAULT_SLEEP_DURATION_SECS: u8 = 45;
+pub const POWER_DEFAULT_UI_IDLE_TIMEOUT_SECS: u8 = 60;
 
 #[must_use]
 pub fn clamp_radio_config(settings: RadioConfigView) -> RadioConfigView {
@@ -48,8 +57,11 @@ pub fn clamp_power_config(settings: PowerConfigView) -> PowerConfigView {
 mod tests {
     use super::{
         CARRIER_SENSE_MAX, CARRIER_SENSE_MIN, CHANNEL_BANDWIDTH_MAX_INDEX,
-        CHANNEL_BANDWIDTH_MIN_INDEX, DETECTION_THRESHOLD_MAX_DB, DETECTION_THRESHOLD_MIN_DB,
-        MAGN_TARGET_MAX, MAGN_TARGET_MIN, POWER_SLEEP_DURATION_MAX_SECS,
+        CHANNEL_BANDWIDTH_MIN_INDEX, DEFAULT_CARRIER_SENSE_THRESHOLD,
+        DEFAULT_CHANNEL_BANDWIDTH_INDEX, DEFAULT_DETECTION_THRESHOLD_DB, DEFAULT_MAGN_TARGET,
+        DETECTION_THRESHOLD_MAX_DB, DETECTION_THRESHOLD_MIN_DB, DETECTION_THRESHOLD_STEP_DB,
+        MAGN_TARGET_MAX, MAGN_TARGET_MIN, POWER_DEFAULT_SLEEP_DURATION_SECS,
+        POWER_DEFAULT_UI_IDLE_TIMEOUT_SECS, POWER_SLEEP_DURATION_MAX_SECS,
         POWER_SLEEP_DURATION_MIN_SECS, POWER_UI_IDLE_TIMEOUT_MAX_SECS,
         POWER_UI_IDLE_TIMEOUT_MIN_SECS, clamp_power_config, clamp_radio_config,
     };
@@ -130,5 +142,31 @@ mod tests {
         assert!(!power.predictive_sleep_enabled);
         assert_eq!(power.sleep_duration_secs, 45);
         assert_eq!(power.ui_idle_timeout_secs, 60);
+    }
+
+    #[test]
+    fn shared_rule_constants_cover_power_and_radio_defaults() {
+        assert!(
+            (DETECTION_THRESHOLD_MIN_DB..=DETECTION_THRESHOLD_MAX_DB)
+                .contains(&DEFAULT_DETECTION_THRESHOLD_DB)
+        );
+        assert_eq!(
+            DEFAULT_DETECTION_THRESHOLD_DB % DETECTION_THRESHOLD_STEP_DB,
+            0
+        );
+        assert!((MAGN_TARGET_MIN..=MAGN_TARGET_MAX).contains(&DEFAULT_MAGN_TARGET));
+        assert!(
+            (CHANNEL_BANDWIDTH_MIN_INDEX..=CHANNEL_BANDWIDTH_MAX_INDEX)
+                .contains(&DEFAULT_CHANNEL_BANDWIDTH_INDEX)
+        );
+        assert!((CARRIER_SENSE_MIN..=CARRIER_SENSE_MAX).contains(&DEFAULT_CARRIER_SENSE_THRESHOLD));
+        assert!(
+            (POWER_SLEEP_DURATION_MIN_SECS..=POWER_SLEEP_DURATION_MAX_SECS)
+                .contains(&POWER_DEFAULT_SLEEP_DURATION_SECS)
+        );
+        assert!(
+            (POWER_UI_IDLE_TIMEOUT_MIN_SECS..=POWER_UI_IDLE_TIMEOUT_MAX_SECS)
+                .contains(&POWER_DEFAULT_UI_IDLE_TIMEOUT_SECS)
+        );
     }
 }
