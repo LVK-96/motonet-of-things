@@ -22,7 +22,13 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Host verification
+      - name: Core crates clippy
+        run: cargo clippy -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu -- -D warnings
+
+      - name: Core crates tests
+        run: cargo test -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu
+
+      - name: Host verification bundle
         run: just test-host
 
   firmware:

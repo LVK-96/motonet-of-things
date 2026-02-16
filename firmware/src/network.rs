@@ -10,7 +10,9 @@ use embassy_net::{Ipv4Address, Ipv4Cidr, Runner, StackResources, StaticConfigV4}
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
+use esp_hal::efuse::Efuse;
 use esp_hal::peripherals::WIFI;
+use esp_hal::rng::Rng;
 use esp_radio::{
     Controller,
     wifi::{self, ClientConfig, ModeConfig, WifiController, WifiDevice},
@@ -68,6 +70,20 @@ fn build_client_config() -> ClientConfig {
     client_config
 }
 
+fn derive_network_seed() -> u64 {
+    let rng = Rng::new();
+    let random_component = (u64::from(rng.random()) << 32) | u64::from(rng.random());
+    let mac_bytes = Efuse::read_base_mac_address();
+    let mut mac_component = 0u64;
+
+    for byte in mac_bytes {
+        mac_component = mac_component.rotate_left(8) ^ u64::from(byte);
+    }
+
+    // Mix fast-changing entropy with a stable chip-unique component.
+    random_component ^ mac_component.rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15
+}
+
 /// Initialize the Wi-Fi network stack and spawn the stack runner.
 ///
 /// This does not block on Wi-Fi association. A dedicated supervisor task
@@ -93,12 +109,12 @@ pub fn setup_network_stack(
 
     let resources = STACK_RESOURCES.init(StackResources::new());
     let stack_config = build_stack_config();
+    let stack_seed = derive_network_seed();
 
-    let (stack, runner) = embassy_net::new(
-        interfaces.sta,
-        stack_config,
-        resources,
-        1234u64, // Random seed
+    let (stack, runner) = embassy_net::new(interfaces.sta, stack_config, resources, stack_seed);
+    info!(
+        "NET[{}]: Stack seed derived from hardware entropy",
+        power::wake_reason_class()
     );
 
     spawner

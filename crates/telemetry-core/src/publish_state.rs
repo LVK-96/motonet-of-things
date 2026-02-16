@@ -165,6 +165,12 @@ impl<T: Copy> PublishPipelineState<T> {
         retry_item
     }
 
+    /// Start publishing a freshly queued item when no other work is in-flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BeginPublishError::Busy`] when either an in-flight publish or a
+    /// pending retry already exists.
     pub fn begin_new(&mut self, item: T) -> Result<(), BeginPublishError> {
         if self.in_flight.is_some() || self.pending_retry.is_some() {
             return Err(BeginPublishError::Busy);

@@ -3,6 +3,8 @@
 // Provides functionality to sync time from NTP servers and maintain
 // a monotonic clock reference for timestamping events.
 
+use app_core::ntp_servers::parse_ntp_server_list;
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use embassy_net::Stack;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -13,8 +15,15 @@ use sntpc::{NtpContext, NtpTimestampGenerator};
 use sntpc_net_embassy::UdpSocketWrapper;
 
 use crate::network;
+use crate::secrets::NTP_SERVER_IPV4_LIST;
 
 const NTP_PORT: u16 = 123;
+const DEFAULT_NTP_SERVER_IPV4: [Ipv4Addr; 4] = [
+    Ipv4Addr::new(216, 239, 35, 0),
+    Ipv4Addr::new(216, 239, 35, 4),
+    Ipv4Addr::new(216, 239, 35, 8),
+    Ipv4Addr::new(216, 239, 35, 12),
+];
 
 /// How often to resync time (1 hour)
 const RESYNC_INTERVAL_SECS: u64 = 3600;
@@ -115,31 +124,43 @@ async fn sync_time_once(stack: Stack<'static>) -> Option<TimeReference> {
     }
 
     let socket_wrapper = UdpSocketWrapper::new(socket);
-    let server_addr = core::net::SocketAddr::new(
-        core::net::IpAddr::V4(core::net::Ipv4Addr::new(216, 239, 35, 0)),
-        NTP_PORT,
-    );
 
-    let context = NtpContext::new(EmbassyTimestampGen::new());
-    let captured_at = Instant::now();
+    let server_list = parse_ntp_server_list(NTP_SERVER_IPV4_LIST, &DEFAULT_NTP_SERVER_IPV4);
+    for server_ip in server_list.as_slice() {
+        let server_addr = SocketAddr::new(IpAddr::V4(*server_ip), NTP_PORT);
+        let context = NtpContext::new(EmbassyTimestampGen::new());
+        let sync_started_at = Instant::now();
 
-    match sntpc::get_time(server_addr, &socket_wrapper, context).await {
-        Ok(result) => {
-            // sntpc returns Unix timestamp directly (seconds since 1970-01-01)
-            let unix_secs = u64::from(result.seconds);
+        match sntpc::get_time(server_addr, &socket_wrapper, context).await {
+            Ok(result) => {
+                // sntpc returns Unix timestamp directly (seconds since 1970-01-01)
+                let unix_secs = u64::from(result.seconds);
+                let captured_at = Instant::now();
 
-            defmt::info!("NTP: Synced! unix_secs={}", unix_secs);
+                defmt::info!(
+                    "NTP: Synced via {} in {}ms! unix_secs={}",
+                    defmt::Debug2Format(server_ip),
+                    sync_started_at.elapsed().as_millis(),
+                    unix_secs
+                );
 
-            Some(TimeReference {
-                unix_secs,
-                captured_at,
-            })
-        }
-        Err(e) => {
-            defmt::warn!("NTP: Sync failed: {:?}", defmt::Debug2Format(&e));
-            None
+                return Some(TimeReference {
+                    unix_secs,
+                    captured_at,
+                });
+            }
+            Err(e) => {
+                defmt::warn!(
+                    "NTP: Sync failed via {} after {}ms: {:?}",
+                    defmt::Debug2Format(server_ip),
+                    sync_started_at.elapsed().as_millis(),
+                    defmt::Debug2Format(&e)
+                );
+            }
         }
     }
+
+    None
 }
 
 /// NTP time sync task - syncs time periodically

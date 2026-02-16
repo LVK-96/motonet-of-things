@@ -109,6 +109,12 @@ Optional reconnect optimizations are configured in `firmware/src/secrets.rs`:
 
 Use `None` values to keep default behavior (scan + DHCP).
 
+Time sync failover is configured with:
+
+- `NTP_SERVER_IPV4_LIST` (comma-separated IPv4 values, tried in order)
+
+Invalid entries are ignored. If no valid server remains, firmware falls back to built-in defaults.
+
 ## Verification
 
 Run verification from repository root:
@@ -124,7 +130,8 @@ Verification matrix:
 
 | Command | Validates |
 | --- | --- |
-| `just test-host` | host `fmt`, host `clippy`, and host tests for `rubicson`, `eu-dst`, and `karu-menu` |
+| `just test-host` | host `fmt`, host `clippy`, and host tests for `rubicson`, `eu-dst`, `karu-menu`, `app-core`, and `telemetry-core` |
 | `just check-firmware` | firmware `cargo check` for `xtensa-esp32-none-elf` |
 | `just verify` | full host + firmware verification bundle |
-| `cargo test -p karu-menu --target x86_64-unknown-linux-gnu` | root-level host sanity test command |
+| `cargo clippy -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu -- -D warnings` | strict lint gate for host-only architecture/core crates |
+| `cargo test -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu` | host regression suite for core logic, including NTP list parsing |
