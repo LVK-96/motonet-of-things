@@ -93,6 +93,14 @@ pub enum BeginPublishError {
     Busy,
 }
 
+#[must_use]
+pub const fn predictive_sleep_safe_after_publish(
+    queue_empty: bool,
+    has_pending_retry: bool,
+) -> bool {
+    queue_empty && !has_pending_retry
+}
+
 pub struct PublishPipelineState<T: Copy> {
     pending_retry: Option<T>,
     in_flight: Option<T>,
@@ -190,7 +198,7 @@ impl<T: Copy> PublishPipelineState<T> {
 mod tests {
     use super::{
         BeginPublishError, PublishOutcome, PublishPipelineState, PublishStage, PublishStateMachine,
-        PublishTransition,
+        PublishTransition, predictive_sleep_safe_after_publish,
     };
     use crate::TelemetryRecord;
     use crate::queue::{DropPolicy, TelemetryQueue};
@@ -289,5 +297,50 @@ mod tests {
         assert_eq!(publish_state.in_flight(), None);
         assert_eq!(publish_state.pending_retry(), Some(in_flight));
         assert_eq!(publish_state.pending_retry_count(), 1);
+    }
+
+    #[test]
+    fn predictive_sleep_is_blocked_when_publish_queue_is_not_empty() {
+        let mut queue = TelemetryQueue::<4>::new(DropPolicy::DropOldest);
+        let _ = queue.enqueue(record(8, 1, 210, true));
+
+        assert!(!predictive_sleep_safe_after_publish(
+            queue.is_empty(),
+            false,
+        ));
+    }
+
+    #[test]
+    fn predictive_sleep_is_blocked_when_retry_is_pending() {
+        let mut publish_state = PublishPipelineState::new();
+        let failed = record(9, 1, 211, true);
+        assert!(publish_state.begin_new(failed).is_ok());
+        publish_state.complete_in_flight(PublishOutcome::RetryLater);
+
+        assert!(!predictive_sleep_safe_after_publish(
+            true,
+            publish_state.has_pending_retry(),
+        ));
+    }
+
+    #[test]
+    fn predictive_sleep_requires_success_and_safe_pipeline_state() {
+        let mut successful_publish = PublishPipelineState::new();
+        let completed = record(10, 2, 195, false);
+        assert!(successful_publish.begin_new(completed).is_ok());
+        successful_publish.complete_in_flight(PublishOutcome::Published);
+
+        assert!(predictive_sleep_safe_after_publish(
+            true,
+            successful_publish.has_pending_retry(),
+        ));
+
+        let mut failed_publish = PublishPipelineState::new();
+        assert!(failed_publish.begin_new(completed).is_ok());
+        failed_publish.complete_in_flight(PublishOutcome::RetryLater);
+        assert!(!predictive_sleep_safe_after_publish(
+            true,
+            failed_publish.has_pending_retry(),
+        ));
     }
 }

@@ -287,7 +287,9 @@ pub async fn mqtt_task(network_stack: embassy_net::Stack<'static>, receiver: Tel
                             publish_state.complete_in_flight(PublishOutcome::Published);
                             debug!("MQTT: Publish successful!");
                             info!("MQTT: Publish confirmed, checking deep sleep policy");
-                            power::maybe_sleep_after_frame();
+                            let queue_empty = receiver.is_empty() && deferred_reading.is_none();
+                            let has_pending_retry = publish_state.has_pending_retry();
+                            power::maybe_sleep_after_publish(queue_empty, has_pending_retry);
                             last_activity = Instant::now();
                         }
                     }

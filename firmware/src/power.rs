@@ -16,6 +16,7 @@ use crate::messages::{
     DEFAULT_POWER_SETTINGS, POWER_SLEEP_DURATION_MAX_SECS, POWER_SLEEP_DURATION_MIN_SECS,
     POWER_UI_IDLE_TIMEOUT_MAX_SECS, POWER_UI_IDLE_TIMEOUT_MIN_SECS, PowerSettings,
 };
+use crate::telemetry;
 
 static PREDICTIVE_SLEEP_ENABLED: AtomicBool =
     AtomicBool::new(DEFAULT_POWER_SETTINGS.predictive_sleep_enabled);
@@ -257,7 +258,16 @@ pub fn log_wakeup_cause() {
     }
 }
 
-pub fn maybe_sleep_after_frame() {
+pub fn maybe_sleep_after_publish(queue_empty: bool, has_pending_retry: bool) {
+    if !telemetry::predictive_sleep_pipeline_safe(queue_empty, has_pending_retry) {
+        if !queue_empty {
+            info!("PowerSave: skip deep sleep (telemetry queue still has buffered readings)");
+        } else {
+            info!("PowerSave: skip deep sleep (pending telemetry retry)");
+        }
+        return;
+    }
+
     let settings = get_settings();
     if !settings.predictive_sleep_enabled {
         info!("PowerSave: skip deep sleep (predictive sleep disabled)");
