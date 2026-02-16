@@ -4,8 +4,6 @@ use defmt::{debug, info, trace, warn};
 use embassy_futures::select::{Either, select};
 use embassy_net::Ipv4Address;
 use embassy_net::tcp::TcpSocket;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Receiver;
 use embassy_time::{Duration, Instant, Timer};
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
@@ -13,10 +11,12 @@ use rust_mqtt::client::Client;
 use rust_mqtt::client::options::{ConnectOptions, PublicationOptions, WillOptions};
 use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
 use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
+use telemetry_core::publish_state::{BeginPublishError, PublishOutcome, PublishPipelineState};
 
 use crate::messages::RadioReading;
 use crate::power;
 use crate::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
+use crate::tasks::TelemetryReceiver;
 
 /// Sets up the MQTT client, including TCP connection and MQTT broker handshake.
 async fn establish_mqtt_session<'a>(
@@ -139,10 +139,7 @@ async fn establish_mqtt_session<'a>(
 
 #[embassy_executor::task]
 #[allow(clippy::expect_used, clippy::too_many_lines)]
-pub async fn mqtt_task(
-    network_stack: embassy_net::Stack<'static>,
-    receiver: Receiver<'static, CriticalSectionRawMutex, RadioReading, 16>,
-) {
+pub async fn mqtt_task(network_stack: embassy_net::Stack<'static>, receiver: TelemetryReceiver) {
     // Backoff parameters
     const MIN_BACKOFF_SECS: u64 = 1;
     const MAX_BACKOFF_SECS: u64 = 60;
@@ -151,7 +148,7 @@ pub async fn mqtt_task(
     // for a while. This avoids a first publish attempt on a stale TCP connection.
     const RECONNECT_BEFORE_PUBLISH_IDLE_SECS: u64 = 20;
     let mut backoff_secs = MIN_BACKOFF_SECS;
-    let mut pending_reading: Option<RadioReading> = None;
+    let mut publish_state = PublishPipelineState::<RadioReading>::new();
 
     loop {
         // Create buffers on the stack for this session
@@ -172,6 +169,7 @@ pub async fn mqtt_task(
 
         backoff_secs = MIN_BACKOFF_SECS;
         info!("MQTT: Ready");
+        publish_state.clear_reconnect_required();
         let mut last_activity = Instant::now();
 
         loop {
@@ -180,21 +178,26 @@ pub async fn mqtt_task(
                 KeepAlivePing,
             }
 
-            let work = if let Some(reading) = pending_reading.take() {
+            let work = if let Some(reading) = publish_state.begin_retry() {
                 debug!("MQTT: Retrying buffered reading after reconnect");
                 MqttWork::Reading(reading)
             } else {
                 // Wait for either a reading or ping timeout
                 let timeout = Duration::from_secs(PING_INTERVAL_SECS);
                 match select(receiver.receive(), Timer::after(timeout)).await {
-                    Either::First(reading) => MqttWork::Reading(reading),
+                    Either::First(reading) => {
+                        if let Err(BeginPublishError::Busy) = publish_state.begin_new(reading) {
+                            warn!("MQTT: Deferring dequeued reading while retry item is pending");
+                            continue;
+                        }
+                        MqttWork::Reading(reading)
+                    }
                     Either::Second(()) => MqttWork::KeepAlivePing,
                 }
             };
 
             match work {
                 MqttWork::Reading(reading) => {
-                    // Got a reading - publish it
                     let time_since_last = last_activity.elapsed().as_secs();
                     debug!("MQTT: Got reading after {}s idle", time_since_last);
                     if time_since_last > RECONNECT_BEFORE_PUBLISH_IDLE_SECS {
@@ -202,78 +205,82 @@ pub async fn mqtt_task(
                             "MQTT: Reconnecting before publish after {}s idle",
                             time_since_last
                         );
-                        pending_reading = Some(reading);
-                        break;
-                    }
-
-                    // Reset buffer before publish
-                    unsafe { client.buffer().reset() };
-
-                    // Format topic: sensors/rubicson/{id}/temperature
-                    let mut topic: heapless::String<64> = heapless::String::new();
-                    if write!(topic, "sensors/rubicson/{}/temperature", reading.inner.id).is_err() {
-                        continue;
-                    }
-
-                    // Format payload: id={id},ch={channel},temp={temp},batt={ok/low},rssi={rssi},snr={snr}
-                    let mut payload: heapless::String<96> = heapless::String::new();
-                    let batt = if reading.inner.battery_ok {
-                        "ok"
+                        publish_state.complete_in_flight(PublishOutcome::RetryLater);
                     } else {
-                        "low"
-                    };
-                    if write!(
-                        payload,
-                        "id={},ch={},temp={:.1},batt={},rssi={},snr={}",
-                        reading.inner.id,
-                        reading.inner.channel,
-                        reading.inner.temperature_c,
-                        batt,
-                        reading.rssi,
-                        reading.detection_threshold
-                    )
-                    .is_err()
-                    {
-                        continue;
-                    }
+                        unsafe { client.buffer().reset() };
 
-                    trace!(
-                        "MQTT: Publishing to {} : {}",
-                        topic.as_str(),
-                        payload.as_str()
-                    );
+                        let mut topic: heapless::String<64> = heapless::String::new();
+                        if write!(topic, "sensors/rubicson/{}/temperature", reading.inner.id)
+                            .is_err()
+                        {
+                            publish_state.complete_in_flight(PublishOutcome::Dropped);
+                            warn!("MQTT: Dropping reading due to topic format error");
+                            continue;
+                        }
 
-                    // Create TopicName from the topic string
-                    let topic_name = match MqttString::from_slice(topic.as_str()) {
-                        Ok(s) => unsafe { TopicName::new_unchecked(s) },
-                        Err(_) => continue,
-                    };
+                        let mut payload: heapless::String<96> = heapless::String::new();
+                        let batt = if reading.inner.battery_ok {
+                            "ok"
+                        } else {
+                            "low"
+                        };
+                        if write!(
+                            payload,
+                            "id={},ch={},temp={:.1},batt={},rssi={},snr={}",
+                            reading.inner.id,
+                            reading.inner.channel,
+                            reading.inner.temperature_c,
+                            batt,
+                            reading.rssi,
+                            reading.detection_threshold
+                        )
+                        .is_err()
+                        {
+                            publish_state.complete_in_flight(PublishOutcome::Dropped);
+                            warn!("MQTT: Dropping reading due to payload format error");
+                            continue;
+                        }
 
-                    let pub_options = PublicationOptions {
-                        retain: false,
-                        topic: topic_name,
-                        qos: QoS::AtMostOnce,
-                    };
-
-                    if let Err(e) = client
-                        .publish(&pub_options, Bytes::from(payload.as_bytes()))
-                        .await
-                    {
-                        warn!(
-                            "MQTT: Publish failed: {:?}, reconnecting...",
-                            defmt::Debug2Format(&e)
+                        trace!(
+                            "MQTT: Publishing to {} : {}",
+                            topic.as_str(),
+                            payload.as_str()
                         );
-                        pending_reading = Some(reading);
-                        break; // Break inner loop to reconnect
-                    }
 
-                    debug!("MQTT: Publish successful!");
-                    info!("MQTT: Publish confirmed, checking deep sleep policy");
-                    power::maybe_sleep_after_frame();
-                    last_activity = Instant::now();
+                        let topic_name = match MqttString::from_slice(topic.as_str()) {
+                            Ok(s) => unsafe { TopicName::new_unchecked(s) },
+                            Err(_) => {
+                                publish_state.complete_in_flight(PublishOutcome::Dropped);
+                                warn!("MQTT: Dropping reading due to invalid topic");
+                                continue;
+                            }
+                        };
+
+                        let pub_options = PublicationOptions {
+                            retain: false,
+                            topic: topic_name,
+                            qos: QoS::AtMostOnce,
+                        };
+
+                        if let Err(e) = client
+                            .publish(&pub_options, Bytes::from(payload.as_bytes()))
+                            .await
+                        {
+                            warn!(
+                                "MQTT: Publish failed: {:?}, reconnecting...",
+                                defmt::Debug2Format(&e)
+                            );
+                            publish_state.complete_in_flight(PublishOutcome::RetryLater);
+                        } else {
+                            publish_state.complete_in_flight(PublishOutcome::Published);
+                            debug!("MQTT: Publish successful!");
+                            info!("MQTT: Publish confirmed, checking deep sleep policy");
+                            power::maybe_sleep_after_frame();
+                            last_activity = Instant::now();
+                        }
+                    }
                 }
                 MqttWork::KeepAlivePing => {
-                    // Ping timeout - send keepalive
                     debug!("MQTT: Sending periodic ping");
                     unsafe { client.buffer().reset() };
 
@@ -282,11 +289,16 @@ pub async fn mqtt_task(
                             "MQTT: Ping failed: {:?}, reconnecting...",
                             defmt::Debug2Format(&e)
                         );
-                        break;
+                        publish_state.mark_ping_failed();
+                    } else {
+                        debug!("MQTT: Ping sent successfully");
+                        last_activity = Instant::now();
                     }
-                    debug!("MQTT: Ping sent successfully");
-                    last_activity = Instant::now();
                 }
+            }
+
+            if publish_state.reconnect_required() {
+                break;
             }
         }
 

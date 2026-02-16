@@ -239,11 +239,9 @@ async fn main(spawner: Spawner) -> ! {
             ))
             .expect("Failed to spawn radio task");
     }
+    let telemetry_receiver = TELEMETRY_READING_CHANNEL.receiver();
     spawner
-        .spawn(mqtt_task::mqtt_task(
-            network_stack,
-            TELEMETRY_READING_CHANNEL.receiver(),
-        ))
+        .spawn(mqtt_task::mqtt_task(network_stack, telemetry_receiver))
         .expect("Failed to spawn mqtt task");
     spawner
         .spawn(display_task::ui_input_task(
