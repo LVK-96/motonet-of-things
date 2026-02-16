@@ -46,8 +46,9 @@ use esp32_rust_project::with_retry;
 
 /// Watch for sharing latest readings with display/UI.
 static READING_WATCH: Watch<CriticalSectionRawMutex, RadioReading, 2> = Watch::new();
-/// Queue for MQTT so bursts don't collapse to only the newest reading.
-static MQTT_READING_CHANNEL: Channel<CriticalSectionRawMutex, RadioReading, 16> = Channel::new();
+/// Queue carrying telemetry-bound readings out of capture tasks.
+static TELEMETRY_READING_CHANNEL: Channel<CriticalSectionRawMutex, RadioReading, 16> =
+    Channel::new();
 
 /// Watch for sharing radio settings with the radio task
 static RADIO_SETTINGS_WATCH: Watch<CriticalSectionRawMutex, RadioSettings, 2> = Watch::new();
@@ -210,7 +211,7 @@ async fn main(spawner: Spawner) -> ! {
             .spawn(radio_433_task::radio_433_rx_task(
                 r433,
                 READING_WATCH.sender(),
-                MQTT_READING_CHANNEL.sender(),
+                TELEMETRY_READING_CHANNEL.sender(),
                 RADIO_SETTINGS_WATCH.sender(),
                 settings_receiver,
             ))
@@ -233,7 +234,7 @@ async fn main(spawner: Spawner) -> ! {
                 shared_radio,
                 rmt_rx,
                 READING_WATCH.sender(),
-                MQTT_READING_CHANNEL.sender(),
+                TELEMETRY_READING_CHANNEL.sender(),
                 RADIO_SETTINGS_WATCH.sender(),
             ))
             .expect("Failed to spawn radio task");
@@ -241,7 +242,7 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(mqtt_task::mqtt_task(
             network_stack,
-            MQTT_READING_CHANNEL.receiver(),
+            TELEMETRY_READING_CHANNEL.receiver(),
         ))
         .expect("Failed to spawn mqtt task");
     spawner

@@ -9,6 +9,7 @@ use esp_hal::gpio::Input;
 use crate::messages::{RadioReading, RadioSettings};
 use crate::pulse_capture::apply_pending_settings;
 use crate::radio_433::Radio433;
+use crate::telemetry::{TelemetryEnqueueOutcome, TelemetryPipelineAdapter, now_ms};
 
 pub struct PulseCapture<'d, R: Radio433> {
     pin: Input<'d>,
@@ -16,6 +17,7 @@ pub struct PulseCapture<'d, R: Radio433> {
     sender: WatchSender<'static, CriticalSectionRawMutex, RadioReading, 2>,
     mqtt_sender: ChannelSender<'static, CriticalSectionRawMutex, RadioReading, 16>,
     settings_receiver: Receiver<'static, CriticalSectionRawMutex, RadioSettings, 2>,
+    telemetry_adapter: TelemetryPipelineAdapter<32>,
 }
 
 /// Timeout for considering a transmission ended
@@ -35,6 +37,7 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
             sender,
             mqtt_sender,
             settings_receiver,
+            telemetry_adapter: TelemetryPipelineAdapter::new(),
         }
     }
 
@@ -137,7 +140,20 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                             detection_threshold,
                         };
                         self.sender.send(radio_reading);
-                        let _ = self.mqtt_sender.try_send(radio_reading);
+                        match self.telemetry_adapter.enqueue_for_channel(
+                            radio_reading,
+                            now_ms(),
+                            &self.mqtt_sender,
+                        ) {
+                            TelemetryEnqueueOutcome::Queued
+                            | TelemetryEnqueueOutcome::DroppedByPolicy => {}
+                            TelemetryEnqueueOutcome::RejectedAsDuplicate => {
+                                info!(
+                                    "Telemetry duplicate rejected for sensor {}",
+                                    radio_reading.inner.id
+                                );
+                            }
+                        }
                         Timer::after(Duration::from_secs(45)).await;
                     }
                     Err(e) => {

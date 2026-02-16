@@ -976,6 +976,7 @@ dependencies = [
  "sntpc",
  "sntpc-net-embassy",
  "static_cell",
+ "telemetry-core",
  "xtensa-lx",
 ]
 

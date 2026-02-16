@@ -11,6 +11,7 @@ pub mod pulse_capture;
 pub mod radio_433;
 pub mod secrets;
 pub mod tasks;
+pub mod telemetry;
 pub mod time_sync;
 pub mod ui_input;
 

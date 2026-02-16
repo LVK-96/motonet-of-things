@@ -4,6 +4,7 @@
 //! between tasks, particularly radio readings with signal metadata.
 
 use rubicson::RubicsonReading;
+use telemetry_core::TelemetryRecord;
 
 /// A sensor reading bundled with radio signal metadata.
 ///
@@ -18,6 +19,33 @@ pub struct RadioReading {
     /// Configured detection threshold in dB (e.g., 16)
     /// This is the minimum signal-to-noise ratio required for detection.
     pub detection_threshold: u8,
+}
+
+impl RadioReading {
+    #[must_use]
+    pub fn to_telemetry_record(self) -> TelemetryRecord {
+        let scaled_temperature = self.inner.temperature_c * 10.0;
+        let rounded_temperature = if scaled_temperature >= 0.0 {
+            scaled_temperature + 0.5
+        } else {
+            scaled_temperature - 0.5
+        };
+
+        let temperature_deci_c = if rounded_temperature > f32::from(i16::MAX) {
+            i16::MAX
+        } else if rounded_temperature < f32::from(i16::MIN) {
+            i16::MIN
+        } else {
+            rounded_temperature as i16
+        };
+
+        TelemetryRecord {
+            sensor_id: self.inner.id,
+            channel: self.inner.channel,
+            temperature_deci_c,
+            battery_ok: self.inner.battery_ok,
+        }
+    }
 }
 
 /// Radio settings that can be changed at runtime.
