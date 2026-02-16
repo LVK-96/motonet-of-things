@@ -149,6 +149,7 @@ pub async fn mqtt_task(network_stack: embassy_net::Stack<'static>, receiver: Tel
     const RECONNECT_BEFORE_PUBLISH_IDLE_SECS: u64 = 20;
     let mut backoff_secs = MIN_BACKOFF_SECS;
     let mut publish_state = PublishPipelineState::<RadioReading>::new();
+    let mut deferred_reading: Option<RadioReading> = None;
 
     loop {
         // Create buffers on the stack for this session
@@ -181,13 +182,24 @@ pub async fn mqtt_task(network_stack: embassy_net::Stack<'static>, receiver: Tel
             let work = if let Some(reading) = publish_state.begin_retry() {
                 debug!("MQTT: Retrying buffered reading after reconnect");
                 MqttWork::Reading(reading)
+            } else if let Some(reading) = deferred_reading.take() {
+                if let Err(BeginPublishError::Busy) = publish_state.begin_new(reading) {
+                    deferred_reading = Some(reading);
+                    warn!("MQTT: Holding deferred reading until in-flight work is resolved");
+                    continue;
+                }
+                debug!("MQTT: Publishing deferred reading before draining queue");
+                MqttWork::Reading(reading)
             } else {
                 // Wait for either a reading or ping timeout
                 let timeout = Duration::from_secs(PING_INTERVAL_SECS);
                 match select(receiver.receive(), Timer::after(timeout)).await {
                     Either::First(reading) => {
                         if let Err(BeginPublishError::Busy) = publish_state.begin_new(reading) {
-                            warn!("MQTT: Deferring dequeued reading while retry item is pending");
+                            deferred_reading = Some(reading);
+                            warn!(
+                                "MQTT: Holding dequeued reading while retry/in-flight item exists"
+                            );
                             continue;
                         }
                         MqttWork::Reading(reading)
