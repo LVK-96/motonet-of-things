@@ -41,7 +41,7 @@ impl<const DEDUPE_CAPACITY: usize> TelemetryPipelineAdapter<DEDUPE_CAPACITY> {
             dropped_total: 0,
             rejected_duplicates_total: 0,
             drop_log_interval_ms,
-            next_drop_log_ms: drop_log_interval_ms,
+            next_drop_log_ms: 0,
         }
     }
 
