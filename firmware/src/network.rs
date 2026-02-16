@@ -3,7 +3,7 @@
 extern crate alloc;
 use alloc::string::String;
 
-use defmt::{error, info, warn};
+use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Runner, StackResources, StaticConfigV4};
 use embassy_time::{Duration, Instant, Timer};
@@ -61,32 +61,27 @@ fn build_client_config() -> ClientConfig {
     client_config
 }
 
-/// Initialize `WiFi` and return the network stack
+/// Initialize the Wi-Fi network stack and spawn the stack runner.
 ///
-/// This function:
-/// 1. Creates the `WiFi` controller and interfaces
-/// 2. Sets up the network stack with DHCP
-/// 3. Spawns the network runner task
-/// 4. Connects to `WiFi` and waits for DHCP
-///
-/// Returns a static reference to the network stack for use in other tasks.
+/// This does not block on Wi-Fi association. A dedicated supervisor task
+/// handles connect/reconnect loops so the rest of startup can proceed.
 ///
 /// # Panics
 ///
-/// Panics if `WiFi` controller creation fails or if task spawning fails.
-#[allow(clippy::expect_used, clippy::too_many_lines)]
-pub async fn setup_wifi(
+/// Panics if Wi-Fi controller creation fails or if task spawning fails.
+#[allow(clippy::expect_used)]
+pub fn setup_network_stack(
     controller: &'static mut Controller<'static>,
     wifi_device: WIFI<'static>,
     spawner: &Spawner,
-) -> embassy_net::Stack<'static> {
+) -> (embassy_net::Stack<'static>, WifiController<'static>) {
     // Create network stack using the STA interface
     static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
 
-    info!("NET[{}]: Setting up WiFi", power::wake_reason_class());
+    info!("NET[{}]: Setting up WiFi stack", power::wake_reason_class());
 
     let wifi_config = wifi::Config::default();
-    let (mut wifi_controller, interfaces) =
+    let (wifi_controller, interfaces) =
         wifi::new(controller, wifi_device, wifi_config).expect("Failed to create WiFi controller");
 
     let resources = STACK_RESOURCES.init(StackResources::new());
@@ -99,12 +94,19 @@ pub async fn setup_wifi(
         1234u64, // Random seed
     );
 
-    // Spawn network runner task
     spawner
         .spawn(net_task(runner))
         .expect("Failed to spawn network task");
+    info!(
+        "NET[{}]: Stack runner spawned; WiFi association handled by supervisor",
+        power::wake_reason_class()
+    );
 
-    // Configure, start, and connect to WiFi with retry
+    (stack, wifi_controller)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn connect_until_associated(controller: &mut WifiController<'static>) {
     info!(
         "NET[{}]: Connecting to WiFi SSID {} (channel_hint_set={}, bssid_hint_set={}, static_ip_set={})",
         power::wake_reason_class(),
@@ -116,7 +118,7 @@ pub async fn setup_wifi(
     loop {
         let client_config = build_client_config();
 
-        if let Err(e) = wifi_controller.set_config(&ModeConfig::Client(client_config)) {
+        if let Err(e) = controller.set_config(&ModeConfig::Client(client_config)) {
             warn!(
                 "NET[{}]: WiFi config failed: {:?}, retrying...",
                 power::wake_reason_class(),
@@ -127,7 +129,7 @@ pub async fn setup_wifi(
         }
 
         let wifi_start_at = Instant::now();
-        match wifi_controller.start_async().await {
+        match controller.start_async().await {
             Ok(()) => {
                 info!(
                     "NET[{}]: WiFi start complete in {}ms",
@@ -148,7 +150,7 @@ pub async fn setup_wifi(
         }
 
         let assoc_at = Instant::now();
-        match wifi_controller.connect_async().await {
+        match controller.connect_async().await {
             Ok(()) => {
                 info!(
                     "NET[{}]: WiFi associated in {}ms",
@@ -168,8 +170,9 @@ pub async fn setup_wifi(
             }
         }
     }
+}
 
-    // Wait for DHCP (or static IP stack readiness).
+pub(crate) async fn wait_for_ipv4_config(stack: embassy_net::Stack<'static>) {
     let config_up_at = Instant::now();
     info!(
         "NET[{}]: Waiting for IPv4 config",
@@ -188,16 +191,6 @@ pub async fn setup_wifi(
             defmt::Debug2Format(&config.address)
         );
     }
-
-    // Spawn WiFi connection monitor task
-    if spawner
-        .spawn(wifi_connection_task(wifi_controller))
-        .is_err()
-    {
-        error!("Failed to spawn WiFi connection task");
-    }
-
-    stack
 }
 
 #[embassy_executor::task]
@@ -205,46 +198,27 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await;
 }
 
-#[embassy_executor::task]
-async fn wifi_connection_task(mut controller: WifiController<'static>) {
-    info!(
-        "NET[{}]: WiFi connection monitor started",
-        power::wake_reason_class()
-    );
-
+pub(crate) async fn reconnect_until_connected(controller: &mut WifiController<'static>) {
     loop {
-        // Check if still connected
-        if !matches!(controller.is_connected(), Ok(true)) {
-            warn!(
-                "NET[{}]: WiFi disconnected, reconnecting...",
-                power::wake_reason_class()
-            );
-
-            loop {
-                let reconnect_at = Instant::now();
-                match controller.connect_async().await {
-                    Ok(()) => {
-                        info!(
-                            "NET[{}]: WiFi reconnected in {}ms",
-                            power::wake_reason_class(),
-                            reconnect_at.elapsed().as_millis()
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "NET[{}]: WiFi reconnection failed after {}ms: {:?}, retrying in 2s...",
-                            power::wake_reason_class(),
-                            reconnect_at.elapsed().as_millis(),
-                            defmt::Debug2Format(&e)
-                        );
-                        Timer::after(Duration::from_secs(2)).await;
-                    }
-                }
+        let reconnect_at = Instant::now();
+        match controller.connect_async().await {
+            Ok(()) => {
+                info!(
+                    "NET[{}]: WiFi reconnected in {}ms",
+                    power::wake_reason_class(),
+                    reconnect_at.elapsed().as_millis()
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    "NET[{}]: WiFi reconnection failed after {}ms: {:?}, retrying in 2s...",
+                    power::wake_reason_class(),
+                    reconnect_at.elapsed().as_millis(),
+                    defmt::Debug2Format(&e)
+                );
+                Timer::after(Duration::from_secs(2)).await;
             }
         }
-
-        // Check connection status periodically
-        Timer::after(Duration::from_secs(5)).await;
     }
 }

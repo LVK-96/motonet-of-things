@@ -39,7 +39,8 @@ use esp32_rust_project::radio_433::Cc1101Radio;
 use esp32_rust_project::radio_433::Radio433;
 use esp32_rust_project::tasks::{
     display as display_task, led_pwm as led_pwm_task, mqtt as mqtt_task,
-    radio_433 as radio_433_task, time_sync as time_sync_task,
+    network_supervisor as network_supervisor_task, radio_433 as radio_433_task,
+    time_sync as time_sync_task,
 };
 use esp32_rust_project::ui_input::{EC11RotaryEncoderInput, UiEvent};
 use esp32_rust_project::with_retry;
@@ -137,8 +138,15 @@ async fn main(spawner: Spawner) -> ! {
     })
     .await;
 
-    // Setup WiFi and network stack
-    let network_stack = network::setup_wifi(radio_controller, peripherals.WIFI, &spawner).await;
+    // Setup network stack without blocking startup on Wi-Fi association.
+    let (network_stack, wifi_controller) =
+        network::setup_network_stack(radio_controller, peripherals.WIFI, &spawner);
+    spawner
+        .spawn(network_supervisor_task::network_supervisor_task(
+            wifi_controller,
+            network_stack,
+        ))
+        .expect("Failed to spawn network supervisor task");
 
     // Setup 433MHz radio
     info!("Setting up CC1101 radio...");

@@ -6,6 +6,7 @@ use crate::messages::RadioReading;
 pub mod display;
 pub mod led_pwm;
 pub mod mqtt;
+pub mod network_supervisor;
 pub mod radio_433;
 pub mod time_sync;
 
