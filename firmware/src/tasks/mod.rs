@@ -3,6 +3,8 @@ use embassy_sync::channel::Receiver;
 
 use crate::messages::RadioReading;
 
+#[path = "../adapters/mod.rs"]
+pub(crate) mod adapters;
 pub mod display;
 pub mod led_pwm;
 pub mod mqtt;
