@@ -2,10 +2,13 @@
 
 extern crate alloc;
 use alloc::string::String;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::{Ipv4Address, Ipv4Cidr, Runner, StackResources, StaticConfigV4};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_radio::{
@@ -19,6 +22,10 @@ use crate::secrets::{
     WIFI_BSSID_HINT, WIFI_CHANNEL_HINT, WIFI_DNS1_IP, WIFI_DNS2_IP, WIFI_GATEWAY_IP, WIFI_PASSWORD,
     WIFI_SSID, WIFI_STATIC_IP, WIFI_SUBNET_PREFIX,
 };
+
+static CONFIG_UP_SEEN: AtomicBool = AtomicBool::new(false);
+// embassy-net uses a single state waker for config waits; serialize callers here.
+static CONFIG_UP_WAIT_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 
 fn ipv4(raw: [u8; 4]) -> Ipv4Address {
     Ipv4Address::new(raw[0], raw[1], raw[2], raw[3])
@@ -178,7 +185,7 @@ pub(crate) async fn wait_for_ipv4_config(stack: embassy_net::Stack<'static>) {
         "NET[{}]: Waiting for IPv4 config",
         power::wake_reason_class()
     );
-    stack.wait_config_up().await;
+    wait_for_config_up(stack).await;
     info!(
         "NET[{}]: IPv4 config ready in {}ms",
         power::wake_reason_class(),
@@ -191,6 +198,21 @@ pub(crate) async fn wait_for_ipv4_config(stack: embassy_net::Stack<'static>) {
             defmt::Debug2Format(&config.address)
         );
     }
+}
+
+pub async fn wait_for_config_up(stack: embassy_net::Stack<'static>) {
+    if CONFIG_UP_SEEN.load(Ordering::Relaxed) && stack.is_config_up() {
+        return;
+    }
+
+    let _guard = CONFIG_UP_WAIT_LOCK.lock().await;
+    if stack.is_config_up() {
+        CONFIG_UP_SEEN.store(true, Ordering::Relaxed);
+        return;
+    }
+
+    stack.wait_config_up().await;
+    CONFIG_UP_SEEN.store(true, Ordering::Relaxed);
 }
 
 #[embassy_executor::task]

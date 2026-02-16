@@ -12,6 +12,8 @@ use eu_dst::Timezone;
 use sntpc::{NtpContext, NtpTimestampGenerator};
 use sntpc_net_embassy::UdpSocketWrapper;
 
+use crate::network;
+
 const NTP_PORT: u16 = 123;
 
 /// How often to resync time (1 hour)
@@ -90,7 +92,7 @@ impl NtpTimestampGenerator for EmbassyTimestampGen {
 /// Perform a single NTP time sync
 async fn sync_time_once(stack: Stack<'static>) -> Option<TimeReference> {
     // Wait for network to be ready
-    stack.wait_config_up().await;
+    network::wait_for_config_up(stack).await;
 
     // Create UDP socket for NTP
     let mut rx_meta = [PacketMetadata::EMPTY; 1];

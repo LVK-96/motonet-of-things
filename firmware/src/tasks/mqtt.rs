@@ -14,6 +14,7 @@ use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
 use telemetry_core::publish_state::{BeginPublishError, PublishOutcome, PublishPipelineState};
 
 use crate::messages::RadioReading;
+use crate::network;
 use crate::power;
 use crate::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
 use crate::tasks::TelemetryReceiver;
@@ -28,7 +29,7 @@ async fn establish_mqtt_session<'a>(
     const MQTT_SOCKET_TIMEOUT_SECS: u64 = 30;
 
     // Wait for network to be up
-    network_stack.wait_config_up().await;
+    network::wait_for_config_up(network_stack).await;
 
     info!(
         "MQTT[{}]: Connecting to broker...",
