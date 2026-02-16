@@ -1779,6 +1779,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "telemetry-core"
+version = "0.1.0"
+dependencies = [
+ "heapless 0.9.2",
+]
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

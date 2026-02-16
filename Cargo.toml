@@ -5,6 +5,7 @@ members = [
     "crates/eu-dst",
     "crates/karu-menu",
     "crates/app-core",
+    "crates/telemetry-core",
 ]
 resolver = "2"
 
