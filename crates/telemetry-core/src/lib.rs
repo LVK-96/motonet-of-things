@@ -1,7 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod dedupe;
-pub mod publish_state;
 pub mod queue;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

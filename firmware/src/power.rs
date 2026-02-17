@@ -19,7 +19,6 @@ use crate::messages::{
     DEFAULT_POWER_SETTINGS, POWER_SLEEP_DURATION_MAX_SECS, POWER_SLEEP_DURATION_MIN_SECS,
     POWER_UI_IDLE_TIMEOUT_MAX_SECS, POWER_UI_IDLE_TIMEOUT_MIN_SECS, PowerSettings,
 };
-use crate::telemetry;
 use persistence::rtc_schema;
 
 static PREDICTIVE_SLEEP_ENABLED: AtomicBool =
@@ -261,15 +260,22 @@ pub fn log_wakeup_cause() {
     }
 }
 
-pub fn maybe_sleep_after_publish(queue_empty: bool, has_pending_retry: bool) {
-    if !telemetry::predictive_sleep_pipeline_safe(queue_empty, has_pending_retry) {
-        if !queue_empty {
-            info!("PowerSave: skip deep sleep (telemetry queue still has buffered readings)");
-        } else {
-            info!("PowerSave: skip deep sleep (pending telemetry retry)");
-        }
+pub fn maybe_sleep_after_publish(queue_empty: bool, time_since_mesaurement_receive: Duration) {
+    if !queue_empty {
+        info!("PowerSave: skip deep sleep (telemetry queue still has buffered readings)");
         return;
     }
+
+    // We don't want to sleep for less than ~30s, just skip the sleep if that is the case this
+    // cycle
+    if time_since_mesaurement_receive > Duration::from_secs(20) {
+        info!(
+            "PowerSave: skip deep sleep (Next measurement in less than {}s)",
+            60 - time_since_mesaurement_receive.as_secs()
+        );
+        return;
+    }
+    let max_sleep_time = POWER_SLEEP_DURATION_MAX_SECS.max((60 - time_since_mesaurement_receive.as_secs() - 10) as u8);
 
     let settings = get_settings();
     if !settings.predictive_sleep_enabled {
@@ -291,7 +297,7 @@ pub fn maybe_sleep_after_publish(queue_empty: bool, has_pending_retry: bool) {
 
     let sleep_secs = settings
         .sleep_duration_secs
-        .clamp(POWER_SLEEP_DURATION_MIN_SECS, POWER_SLEEP_DURATION_MAX_SECS);
+        .clamp(POWER_SLEEP_DURATION_MIN_SECS, max_sleep_time);
     info!(
         "PowerSave: entering deep sleep for {}s (timer + button wake)",
         sleep_secs

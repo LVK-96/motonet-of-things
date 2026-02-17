@@ -1,7 +1,6 @@
 use crate::messages::RadioReading;
 use telemetry_core::TelemetryRecord;
 use telemetry_core::dedupe::{DedupeCache, DedupeOutcome};
-use telemetry_core::publish_state::predictive_sleep_safe_after_publish;
 
 #[cfg(not(test))]
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -108,11 +107,6 @@ impl<const DEDUPE_CAPACITY: usize> TelemetryPipelineAdapter<DEDUPE_CAPACITY> {
 #[must_use]
 pub fn map_radio_reading_to_record(reading: RadioReading) -> TelemetryRecord {
     reading.to_telemetry_record()
-}
-
-#[must_use]
-pub const fn predictive_sleep_pipeline_safe(queue_empty: bool, has_pending_retry: bool) -> bool {
-    predictive_sleep_safe_after_publish(queue_empty, has_pending_retry)
 }
 
 #[cfg(not(test))]

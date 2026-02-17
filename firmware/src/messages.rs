@@ -3,6 +3,7 @@
 //! This module defines the data structures used to pass information
 //! between tasks, particularly radio readings with signal metadata.
 
+use embassy_time::Instant;
 use rubicson::RubicsonReading;
 use telemetry_core::TelemetryRecord;
 
@@ -29,6 +30,8 @@ pub struct RadioReading {
     /// Configured detection threshold in dB (e.g., 16)
     /// This is the minimum signal-to-noise ratio required for detection.
     pub detection_threshold: u8,
+    /// The time when the reading was received relative to system start
+    pub received_at: Instant,
 }
 
 impl RadioReading {

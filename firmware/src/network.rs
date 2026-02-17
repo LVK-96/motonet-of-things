@@ -130,17 +130,17 @@ pub fn setup_network_stack(
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn connect_until_associated(controller: &mut WifiController<'static>) {
-    info!(
-        "NET[{}]: Connecting to WiFi SSID {} (channel_hint_set={}, bssid_hint_set={}, static_ip_set={})",
-        power::wake_reason_class(),
-        WIFI_SSID,
-        WIFI_CHANNEL_HINT.is_some(),
-        WIFI_BSSID_HINT.is_some(),
-        WIFI_STATIC_IP.is_some()
-    );
     loop {
-        let client_config = build_client_config();
+        info!(
+            "NET[{}]: Connecting to WiFi SSID {} (channel_hint_set={}, bssid_hint_set={}, static_ip_set={})",
+            power::wake_reason_class(),
+            WIFI_SSID,
+            WIFI_CHANNEL_HINT.is_some(),
+            WIFI_BSSID_HINT.is_some(),
+            WIFI_STATIC_IP.is_some()
+        );
 
+        let client_config = build_client_config();
         if let Err(e) = controller.set_config(&ModeConfig::Client(client_config)) {
             warn!(
                 "NET[{}]: WiFi config failed: {:?}, retrying...",
