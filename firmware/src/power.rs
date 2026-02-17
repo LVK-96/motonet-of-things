@@ -275,7 +275,8 @@ pub fn maybe_sleep_after_publish(queue_empty: bool, time_since_mesaurement_recei
         );
         return;
     }
-    let max_sleep_time = POWER_SLEEP_DURATION_MAX_SECS.max((60 - time_since_mesaurement_receive.as_secs() - 10) as u8);
+    let max_sleep_time = POWER_SLEEP_DURATION_MAX_SECS
+        .max((60 - time_since_mesaurement_receive.as_secs() - 10) as u8);
 
     let settings = get_settings();
     if !settings.predictive_sleep_enabled {

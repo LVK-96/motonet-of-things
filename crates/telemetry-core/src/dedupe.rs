@@ -70,7 +70,8 @@ impl<const N: usize> DedupeCache<N> {
     }
 
     fn evict_oldest(&mut self) {
-        if let Some((idx, _)) = self.entries
+        if let Some((idx, _)) = self
+            .entries
             .iter()
             .enumerate()
             .min_by_key(|(_, entry)| entry.expires_at)

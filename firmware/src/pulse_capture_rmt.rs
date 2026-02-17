@@ -3,7 +3,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender as ChannelSender;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::watch::Sender as WatchSender;
-use embassy_time::{Duration, Timer, Instant};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::Async;
 use esp_hal::gpio::Level;
 use esp_hal::rmt::{Channel as RmtChannel, Error, PulseCode, Rx};
