@@ -138,6 +138,7 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                             inner: reading,
                             rssi,
                             detection_threshold,
+                            received_at: Instant::now(),
                         };
                         self.sender.send(radio_reading);
                         match self.telemetry_adapter.enqueue_for_channel(

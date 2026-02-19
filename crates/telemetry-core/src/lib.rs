@@ -9,4 +9,5 @@ pub struct TelemetryRecord {
     pub channel: u8,
     pub temperature_deci_c: i16,
     pub battery_ok: bool,
+    pub timestamp: u64,
 }

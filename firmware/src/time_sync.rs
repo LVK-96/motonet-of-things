@@ -54,6 +54,17 @@ impl TimeReference {
         let (hours, minutes, seconds) = TIMEZONE.to_local_hms(secs);
         let _ = write!(buf, "{hours:02}:{minutes:02}:{seconds:02}");
     }
+
+    #[must_use]
+    pub fn as_unix_secs(&self, ins: embassy_time::Instant) -> u64 {
+        if ins >= self.captured_at {
+            self.unix_secs
+                .saturating_add((ins - self.captured_at).as_secs())
+        } else {
+            self.unix_secs
+                .saturating_sub((self.captured_at - ins).as_secs())
+        }
+    }
 }
 
 /// Global watch for sharing time reference with other tasks

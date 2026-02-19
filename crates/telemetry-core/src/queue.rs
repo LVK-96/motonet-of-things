@@ -89,6 +89,7 @@ mod tests {
             channel,
             temperature_deci_c,
             battery_ok,
+            timestamp: 0,
         }
     }
 

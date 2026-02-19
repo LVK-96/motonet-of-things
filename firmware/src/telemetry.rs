@@ -170,6 +170,7 @@ mod tests {
             detection_threshold: 12,
             received_at: embassy_time::Instant::now(),
         };
+        let expected_timestamp = reading.received_at.as_ticks();
 
         assert_eq!(
             map_radio_reading_to_record(reading),
@@ -178,6 +179,7 @@ mod tests {
                 channel: 2,
                 temperature_deci_c: -105,
                 battery_ok: false,
+                timestamp: expected_timestamp,
             }
         );
     }

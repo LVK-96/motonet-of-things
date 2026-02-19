@@ -18,6 +18,7 @@ use crate::messages::RadioReading;
 use crate::network;
 use crate::power;
 use crate::secrets::{MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID};
+use crate::time_sync::TIME_WATCH;
 
 fn telemetry_from_command(command: AppCommand) -> Option<RadioReading> {
     match command {
@@ -165,6 +166,7 @@ pub async fn mqtt_task(
     // for a while. This avoids a first publish attempt on a stale TCP connection.
     const RECONNECT_BEFORE_PUBLISH_IDLE_SECS: u64 = 20;
     let mut backoff_secs = MIN_BACKOFF_SECS;
+    let mut deferred_reading: Option<RadioReading> = None;
 
     // TODO: Persist MQTT sessions
     loop {
@@ -194,17 +196,22 @@ pub async fn mqtt_task(
                 KeepAlivePing,
             }
 
-            // Wait for either a reading or ping timeout
-            let timeout = Duration::from_secs(PING_INTERVAL_SECS);
-            let work = match select(receiver.receive(), Timer::after(timeout)).await {
-                Either::First(command) => {
-                    let Some(reading) = telemetry_from_command(command) else {
-                        trace!("MQTT: Ignoring non-telemetry command");
-                        continue;
-                    };
-                    MqttWork::Reading(reading)
+            let work = if let Some(reading) = deferred_reading.take() {
+                debug!("MQTT: Retrying deferred reading after reconnect");
+                MqttWork::Reading(reading)
+            } else {
+                // Wait for either a reading or ping timeout
+                let timeout = Duration::from_secs(PING_INTERVAL_SECS);
+                match select(receiver.receive(), Timer::after(timeout)).await {
+                    Either::First(command) => {
+                        let Some(reading) = telemetry_from_command(command) else {
+                            trace!("MQTT: Ignoring non-telemetry command");
+                            continue;
+                        };
+                        MqttWork::Reading(reading)
+                    }
+                    Either::Second(()) => MqttWork::KeepAlivePing,
                 }
-                Either::Second(()) => MqttWork::KeepAlivePing,
             };
 
             match work {
@@ -217,18 +224,21 @@ pub async fn mqtt_task(
                             "MQTT: Reconnecting before publish after {}s idle",
                             time_since_last
                         );
+                        deferred_reading = Some(reading);
                         break; // Exit inner loop to reconnect
                     }
 
                     unsafe { client.buffer().reset() };
 
+                    let current_time = TIME_WATCH.anon_receiver().try_get().flatten();
+                    let unix_secs = current_time.map_or(0, |time_ref| time_ref.now_unix_secs());
                     let mut topic: heapless::String<64> = heapless::String::new();
                     if write!(topic, "sensors/rubicson/{}/temperature", reading.inner.id).is_err() {
                         warn!("MQTT: Dropping reading due to topic format error");
                         continue;
                     }
 
-                    let mut payload: heapless::String<96> = heapless::String::new();
+                    let mut payload: heapless::String<128> = heapless::String::new();
                     let batt = if reading.inner.battery_ok {
                         "ok"
                     } else {
@@ -236,13 +246,14 @@ pub async fn mqtt_task(
                     };
                     if write!(
                         payload,
-                        "id={},ch={},temp={:.1},batt={},rssi={},snr={}",
+                        "id={},ch={},temp={:.1},batt={},rssi={},snr={},unix_s={}",
                         reading.inner.id,
                         reading.inner.channel,
                         reading.inner.temperature_c,
                         batt,
                         reading.rssi,
-                        reading.detection_threshold
+                        reading.detection_threshold,
+                        u32::try_from(unix_secs).unwrap_or(u32::MAX)
                     )
                     .is_err()
                     {
@@ -277,6 +288,7 @@ pub async fn mqtt_task(
                             "MQTT: Publish failed: {:?}, reconnecting...",
                             defmt::Debug2Format(&e)
                         );
+                        deferred_reading = Some(reading);
                         break; // Exit inner loop to reconnect
                     }
 
