@@ -5,6 +5,9 @@ on:
     branches: ["main", "feat/**", "fix/**", "chore/**"]
   pull_request:
 
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
 jobs:
   host:
     name: Host Checks
@@ -23,10 +26,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Core crates clippy
-        run: cargo clippy -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu -- -D warnings
+        run: cargo +stable clippy -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu -- -D warnings
 
       - name: Core crates tests
-        run: cargo test -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu
+        run: cargo +stable test -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu
 
       - name: Host verification bundle
         run: just test-host
@@ -41,10 +44,11 @@ jobs:
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install ESP toolchain
-        run: |
-          cargo install espup --locked
-          espup install --targets esp32 --std
+      - name: Install Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          buildtargets: esp32
 
       - name: Install just
         uses: extractions/setup-just@v2
@@ -53,6 +57,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Firmware verification
-        run: |
-          source "$HOME/export-esp.sh"
-          just check-firmware
+        run: just esp-check
