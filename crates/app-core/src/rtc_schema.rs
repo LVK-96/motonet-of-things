@@ -47,6 +47,10 @@ pub fn encode_power_settings(settings: PowerSettingsPayload) -> u32 {
     encode_word([byte0, byte1, byte2], CHECKSUM_SEED_CURRENT)
 }
 
+/// Decode Power saving settings from RTC storage
+///
+/// # Errors
+/// Returns `DecodeError` if decode fails
 pub fn decode_power_settings(word: u32) -> Result<DecodedValue<PowerSettingsPayload>, DecodeError> {
     let [byte0, byte1, byte2, byte3] = word.to_le_bytes();
 
@@ -91,6 +95,10 @@ pub fn encode_rf_profile(profile: RfProfilePayload) -> u32 {
     )
 }
 
+/// Decode radio settings from RTC storage
+///
+/// # Errors
+/// Returns `DecodeError` if decode fails
 pub fn decode_rf_profile(word: u32) -> Result<DecodedValue<RfProfilePayload>, DecodeError> {
     let [byte0, byte1, byte2, byte3] = word.to_le_bytes();
 

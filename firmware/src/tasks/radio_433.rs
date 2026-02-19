@@ -12,11 +12,12 @@ use esp_hal::rmt::{Channel as RmtChannel, Rx};
 use crate::app_bus::{self, AppEvent};
 use crate::messages::RadioSettings;
 use crate::power;
-use crate::power::persistence::rtc_schema;
 use crate::pulse_capture::PulseCapture;
 #[cfg(feature = "pulse_rmt")]
 use crate::pulse_capture::apply_pending_settings;
 use crate::radio_433::{Cc1101Radio, Radio433};
+
+use app_core::rtc_schema;
 
 type ReadingSender = app_bus::ReadingSender;
 type MqttSender = app_bus::RadioTelemetrySender;

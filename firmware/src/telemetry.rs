@@ -22,6 +22,12 @@ pub struct TelemetryPipelineAdapter<const DEDUPE_CAPACITY: usize> {
     next_drop_log_ms: u64,
 }
 
+impl<const DEDUPE_CAPACITY: usize> Default for TelemetryPipelineAdapter<DEDUPE_CAPACITY> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const DEDUPE_CAPACITY: usize> TelemetryPipelineAdapter<DEDUPE_CAPACITY> {
     pub const DEFAULT_DEDUPE_TTL_MS: u64 = 30_000;
     pub const DEFAULT_DROP_LOG_INTERVAL_MS: u64 = 60_000;
@@ -146,6 +152,7 @@ mod tests {
             },
             rssi: -78,
             detection_threshold: 16,
+            received_at: embassy_time::Instant::now(),
         }
     }
 
@@ -161,6 +168,7 @@ mod tests {
             },
             rssi: -81,
             detection_threshold: 12,
+            received_at: embassy_time::Instant::now(),
         };
 
         assert_eq!(

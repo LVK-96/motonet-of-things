@@ -36,14 +36,18 @@ pub struct RadioReading {
 
 impl RadioReading {
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn to_telemetry_record(self) -> TelemetryRecord {
         let scaled_temperature = self.inner.temperature_c * 10.0;
+
+        // Rounding to nearest integer
         let rounded_temperature = if scaled_temperature >= 0.0 {
             scaled_temperature + 0.5
         } else {
             scaled_temperature - 0.5
         };
 
+        // 16-bit fixed point
         let temperature_deci_c = if rounded_temperature > f32::from(i16::MAX) {
             i16::MAX
         } else if rounded_temperature < f32::from(i16::MIN) {

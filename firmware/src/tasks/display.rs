@@ -4,7 +4,7 @@ use esp_hal::i2c::master::I2c;
 use karu_menu::MenuRenderer;
 
 use crate::app_bus::{self, AppEvent, UiInputEvent};
-use crate::display::{Display, Sh1106Display};
+use crate::display_driver::{Display, Sh1106Display};
 use crate::time_sync::TIME_WATCH;
 use crate::ui_input::{EC11RotaryEncoderInput, UiEvent, UiInput};
 

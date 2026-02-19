@@ -1,8 +1,7 @@
-use app_core::display_model::{DisplayFrameInput, FrameKey, derive_frame};
-use app_core::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
-
 use crate::messages::{PowerSettings, RadioReading, RadioSettings};
 use crate::tasks::display::state::{DisplayState, RadioState};
+use app_core::display_model::{DisplayFrameInput, FrameKey, derive_frame};
+use app_core::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
 
 #[must_use]
 pub(crate) fn to_ui_screen_state(state: DisplayState) -> UiScreenState {
@@ -87,6 +86,7 @@ pub(crate) fn derive_frame_key(
 #[cfg(test)]
 mod tests {
     use app_core::display_model::{FrameKey, MainFrameKey, RadioFrameKey, SettingsFrameKey};
+    use embassy_time::Instant;
     use rubicson::RubicsonReading;
 
     use super::derive_frame_key;
@@ -104,6 +104,7 @@ mod tests {
             },
             rssi: -70,
             detection_threshold: 12,
+            received_at: Instant::now(),
         }
     }
 

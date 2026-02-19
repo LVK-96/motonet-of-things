@@ -5,12 +5,23 @@ default:
 
 test-host:
     cp -n firmware/src/secrets.rs.example firmware/src/secrets.rs
-    cargo fmt --all --check
-    cargo clippy -p rubicson -p eu-dst -p karu-menu -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu -- -D warnings
-    cargo test -p rubicson -p eu-dst -p karu-menu -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu
+    cargo +stable fmt --all --check
+    cargo +stable clippy -p rubicson -p eu-dst -p karu-menu -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu -- -D warnings
+    cargo +stable test -p rubicson -p eu-dst -p karu-menu -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu
 
-check-firmware:
+esp-check:
     cp -n firmware/src/secrets.rs.example firmware/src/secrets.rs
-    cd firmware && cargo check
+    cargo check -Zbuild-std=core,alloc
 
-verify: test-host check-firmware
+esp-clippy:
+    cp -n firmware/src/secrets.rs.example firmware/src/secrets.rs
+    cargo clippy -Zbuild-std=core,alloc -- -D warnings
+
+esp-build:
+    cp -n firmware/src/secrets.rs.example firmware/src/secrets.rs
+    cargo build -Zbuild-std=core,alloc --release
+
+flash:
+    cd firmware && cargo run --release
+
+verify: test-host esp-check

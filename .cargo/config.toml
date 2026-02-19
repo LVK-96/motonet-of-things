@@ -1,0 +1,10 @@
+[target.xtensa-esp32-none-elf]
+runner = "espflash flash --monitor --log-format defmt"
+
+[build]
+target = "xtensa-esp32-none-elf"
+
+[alias]
+xtensa-check = "check -Zbuild-std=core,alloc"
+xtensa-clippy = "clippy -Zbuild-std=core,alloc"
+xtensa-build = "build -Zbuild-std=core,alloc --release"

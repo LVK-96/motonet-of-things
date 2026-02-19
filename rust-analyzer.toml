@@ -1,10 +1,11 @@
-# rust-analyzer configuration for mixed-target workspace
-# Allows firmware to build for ESP32 while crates build for host
-
 [cargo]
-# Don't override individual package targets
-# Let each package's .cargo/config.toml determine its target
+target = "xtensa-esp32-none-elf"
+extraArgs = ["-Zbuild-std=core,alloc"]
 
-[checkOnSave]
-# Disable automatic checks to avoid target conflicts in mixed workspaces
-enable = false
+[check]
+command = "clippy"
+extraArgs = ["-Zbuild-std=core,alloc"]
+allTargets = false
+
+[server]
+extraEnv = { RUSTUP_TOOLCHAIN = "esp" }

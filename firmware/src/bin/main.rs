@@ -29,7 +29,7 @@ use esp_radio::init;
 use static_cell::StaticCell;
 
 use esp32_rust_project::app_bus;
-use esp32_rust_project::display::{Display, Sh1106Display};
+use esp32_rust_project::display_driver::{Display, Sh1106Display};
 use esp32_rust_project::network;
 use esp32_rust_project::power;
 use esp32_rust_project::radio_433::Cc1101Radio;

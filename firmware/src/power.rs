@@ -12,14 +12,11 @@ use esp_hal::rtc_cntl::{
 };
 use esp_hal::system::SleepSource;
 
-#[path = "persistence/mod.rs"]
-pub(crate) mod persistence;
-
 use crate::messages::{
     DEFAULT_POWER_SETTINGS, POWER_SLEEP_DURATION_MAX_SECS, POWER_SLEEP_DURATION_MIN_SECS,
     POWER_UI_IDLE_TIMEOUT_MAX_SECS, POWER_UI_IDLE_TIMEOUT_MIN_SECS, PowerSettings,
 };
-use persistence::rtc_schema;
+use app_core::rtc_schema;
 
 static PREDICTIVE_SLEEP_ENABLED: AtomicBool =
     AtomicBool::new(DEFAULT_POWER_SETTINGS.predictive_sleep_enabled);
@@ -132,14 +129,7 @@ pub fn load_settings_or_default() -> PowerSettings {
     match rtc_schema::decode_power_settings(word) {
         Ok(decoded) => {
             let settings = from_rtc_payload(decoded.value);
-            if !settings_within_bounds(settings) {
-                info!(
-                    "PowerSave: persisted RTC_SLOW=0x{:08x} [{}, {}, {}, {}]",
-                    word, raw[0], raw[1], raw[2], raw[3]
-                );
-                info!("PowerSave: persisted settings out of range, using defaults");
-                DEFAULT_POWER_SETTINGS
-            } else {
+            if settings_within_bounds(settings) {
                 if decoded.needs_migration {
                     let migrated_word = rtc_schema::encode_power_settings(decoded.value);
                     write_persisted_word(migrated_word);
@@ -156,6 +146,13 @@ pub fn load_settings_or_default() -> PowerSettings {
                     settings.ui_idle_timeout_secs
                 );
                 settings
+            } else {
+                info!(
+                    "PowerSave: persisted RTC_SLOW=0x{:08x} [{}, {}, {}, {}]",
+                    word, raw[0], raw[1], raw[2], raw[3]
+                );
+                info!("PowerSave: persisted settings out of range, using defaults");
+                DEFAULT_POWER_SETTINGS
             }
         }
         Err(decode_error) => {
@@ -275,6 +272,8 @@ pub fn maybe_sleep_after_publish(queue_empty: bool, time_since_mesaurement_recei
         );
         return;
     }
+
+    #[allow(clippy::cast_possible_truncation)]
     let max_sleep_time = POWER_SLEEP_DURATION_MAX_SECS
         .max((60 - time_since_mesaurement_receive.as_secs() - 10) as u8);
 

@@ -116,7 +116,7 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 [[package]]
 name = "cc1101"
 version = "0.1.3"
-source = "git+https://github.com/LVK-96/cc1101.git?branch=main#d71cdc4fe707fdc168a428e45114f1c4dd278bd6"
+source = "git+https://github.com/LVK-96/cc1101.git?branch=dev%2FAGCCTRL1-setter#4f21ad6d137256a60afd21d4cae2a2aec59dcf8e"
 dependencies = [
  "embedded-hal 1.0.0",
 ]

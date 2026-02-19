@@ -27,6 +27,7 @@ fn telemetry_from_command(command: AppCommand) -> Option<RadioReading> {
 }
 
 /// Sets up the MQTT client, including TCP connection and MQTT broker handshake.
+#[allow(clippy::too_many_lines)]
 async fn establish_mqtt_session<'a>(
     network_stack: embassy_net::Stack<'static>,
     rx_buffer: &'a mut [u8],
@@ -255,12 +256,11 @@ pub async fn mqtt_task(
                         payload.as_str()
                     );
 
-                    let topic_name = match MqttString::from_slice(topic.as_str()) {
-                        Ok(s) => unsafe { TopicName::new_unchecked(s) },
-                        Err(_) => {
-                            warn!("MQTT: Dropping reading due to invalid topic");
-                            continue;
-                        }
+                    let topic_name = if let Ok(s) = MqttString::from_slice(topic.as_str()) {
+                        unsafe { TopicName::new_unchecked(s) }
+                    } else {
+                        warn!("MQTT: Dropping reading due to invalid topic");
+                        continue;
                     };
 
                     let pub_options = PublicationOptions {

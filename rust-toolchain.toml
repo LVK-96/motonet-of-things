@@ -1,3 +1,4 @@
-#:schema false, silence linter
+#:schema false, silence linter.
 [toolchain]
-channel = "stable"
+channel = "esp"
+components = ["rust-src"]
