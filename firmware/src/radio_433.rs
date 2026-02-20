@@ -1,8 +1,8 @@
 use core::future::Future;
 
 use cc1101::{
-    Cc1101, DecisionBoundary, FilterLength, GdoCfg, ModulationFormat, PacketLength, RadioMode,
-    SyncMode, TargetAmplitude,
+    AutoCalibration, Cc1101, DecisionBoundary, FilterLength, GdoCfg, MaxLnaGain, ModulationFormat,
+    PacketLength, RadioMode, SyncMode, TargetAmplitude,
 };
 use embassy_futures::select::{Either, select};
 use embassy_time::{Duration, Timer};
@@ -225,11 +225,20 @@ impl Cc1101Radio {
         self.driver
             .reset_chip()
             .map_err(|_| RadioError::ConfigError)?;
-        self.driver
-            .set_defaults()
-            .map_err(|_| RadioError::ConfigError)?;
 
         // Configure for 433 MHz OOK operation
+        self.driver
+            .white_data_enable(false)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_freq_if(203_125)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_autocalibration(AutoCalibration::FromIdle)
+            .map_err(|_| RadioError::ConfigError)?;
+        self.driver
+            .set_max_lna_gain(MaxLnaGain::BelowMax9_2)
+            .map_err(|_| RadioError::ConfigError)?;
         self.driver
             .set_frequency(433_920_000)
             .map_err(|_| RadioError::ConfigError)?;
