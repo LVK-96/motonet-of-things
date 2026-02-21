@@ -16,7 +16,7 @@ use esp_hal::time::Rate;
 
 use crate::messages::{
     CARRIER_SENSE_MAX, CHANNEL_BANDWIDTH_MAX_INDEX, DEFAULT_RADIO_SETTINGS, MAGN_TARGET_MAX,
-    channel_bandwidth_hz, channel_bandwidth_index,
+    channel_bandwidth_hz, channel_bandwidth_index, quantize_detection_threshold_db,
 };
 
 /// Error type for radio operations
@@ -135,11 +135,11 @@ pub struct SignalSnapshot {
 }
 
 fn decision_boundary_for_threshold(db: u8) -> DecisionBoundary {
-    match db {
-        0..=6 => DecisionBoundary::Db4,
-        7..=10 => DecisionBoundary::Db8,
-        11..=14 => DecisionBoundary::Db12,
-        _ => DecisionBoundary::Db16, // 15+ dB, default to max
+    match quantize_detection_threshold_db(db) {
+        4 => DecisionBoundary::Db4,
+        8 => DecisionBoundary::Db8,
+        12 => DecisionBoundary::Db12,
+        _ => DecisionBoundary::Db16,
     }
 }
 
@@ -264,11 +264,13 @@ impl Cc1101Radio {
         self.driver
             .set_magn_target(target_amplitude_for_level(self.filter_level))
             .map_err(|_| RadioError::ConfigError)?;
+        let detection_threshold_db = quantize_detection_threshold_db(self.detection_threshold_db);
         self.driver
             .set_filter_length(FilterLength::AmplitudeModulation(
-                decision_boundary_for_threshold(self.detection_threshold_db),
+                decision_boundary_for_threshold(detection_threshold_db),
             ))
             .map_err(|_| RadioError::ConfigError)?;
+        self.detection_threshold_db = detection_threshold_db;
 
         // Configure carrier sense threshold to filter noise
         self.driver
@@ -389,23 +391,24 @@ impl Radio433 for Cc1101Radio {
     }
 
     fn get_detection_threshold(&self) -> u8 {
-        self.detection_threshold_db
+        quantize_detection_threshold_db(self.detection_threshold_db)
     }
 
     fn set_detection_threshold(&mut self, db: u8) -> Result<(), RadioError> {
+        let quantized_db = quantize_detection_threshold_db(db);
         self.driver
             .set_radio_mode(RadioMode::Idle)
             .map_err(|_| RadioError::ConfigError)?;
         self.driver
             .set_filter_length(FilterLength::AmplitudeModulation(
-                decision_boundary_for_threshold(db),
+                decision_boundary_for_threshold(quantized_db),
             ))
             .map_err(|_| RadioError::ConfigError)?;
         self.driver
             .set_radio_mode(RadioMode::Receive)
             .map_err(|_| RadioError::ConfigError)?;
 
-        self.detection_threshold_db = db;
+        self.detection_threshold_db = quantized_db;
         Ok(())
     }
 

@@ -72,12 +72,12 @@ impl Timezone {
     #[must_use]
     pub fn to_local_hms(&self, unix_secs: u64) -> (u32, u32, u32) {
         let offset = self.offset_secs(unix_secs);
-        #[allow(clippy::cast_sign_loss)]
-        let local_secs = unix_secs.wrapping_add(offset as u64);
-        let secs_today = local_secs % 86400;
-        let hours = (secs_today / 3600) as u32;
-        let minutes = ((secs_today % 3600) / 60) as u32;
-        let seconds = (secs_today % 60) as u32;
+        let unix_secs = i64::try_from(unix_secs).map_or(i64::MAX, |secs| secs);
+        let local_secs = unix_secs.saturating_add(offset);
+        let secs_today = local_secs.rem_euclid(86_400);
+        let hours = u32::try_from(secs_today / 3_600).map_or(0, |hour| hour);
+        let minutes = u32::try_from((secs_today % 3_600) / 60).map_or(0, |minute| minute);
+        let seconds = u32::try_from(secs_today % 60).map_or(0, |second| second);
         (hours, minutes, seconds)
     }
 }
@@ -233,6 +233,20 @@ mod tests {
     }
 
     #[test]
+    fn test_winter_and_summer_time_across_multiple_years() {
+        let cases = [
+            (1736942400, false), // 2025-01-15 12:00:00 UTC
+            (1752580800, true),  // 2025-07-15 12:00:00 UTC
+            (1768478400, false), // 2026-01-15 12:00:00 UTC
+            (1784116800, true),  // 2026-07-15 12:00:00 UTC
+        ];
+
+        for (unix_secs, dst_active) in cases {
+            assert_eq!(is_dst_active(unix_secs), dst_active);
+        }
+    }
+
+    #[test]
     fn test_dst_transition_march() {
         // Last Sunday of March 2024 is March 31
         // At 00:59 UTC - still winter time
@@ -257,6 +271,36 @@ mod tests {
     }
 
     #[test]
+    fn test_dst_transition_edges_2025_exact_second() {
+        // 2025-03-30 00:59:59 UTC
+        assert!(!is_dst_active(1743296399));
+        // 2025-03-30 01:00:00 UTC
+        assert!(is_dst_active(1743296400));
+        // 2025-03-30 01:00:01 UTC
+        assert!(is_dst_active(1743296401));
+
+        // 2025-10-26 00:59:59 UTC
+        assert!(is_dst_active(1761440399));
+        // 2025-10-26 01:00:00 UTC
+        assert!(!is_dst_active(1761440400));
+        // 2025-10-26 01:00:01 UTC
+        assert!(!is_dst_active(1761440401));
+    }
+
+    #[test]
+    fn test_dst_transition_edges_2026_exact_second() {
+        // 2026-03-29 00:59:59 UTC
+        assert!(!is_dst_active(1774745999));
+        // 2026-03-29 01:00:00 UTC
+        assert!(is_dst_active(1774746000));
+
+        // 2026-10-25 00:59:59 UTC
+        assert!(is_dst_active(1792889999));
+        // 2026-10-25 01:00:00 UTC
+        assert!(!is_dst_active(1792890000));
+    }
+
+    #[test]
     fn test_last_sunday_march_2024() {
         // March 2024: Last Sunday is March 31
         assert_eq!(last_sunday_of_month(2024, 3), 31);
@@ -266,6 +310,14 @@ mod tests {
     fn test_last_sunday_october_2024() {
         // October 2024: Last Sunday is October 27
         assert_eq!(last_sunday_of_month(2024, 10), 27);
+    }
+
+    #[test]
+    fn test_last_sunday_multiple_years() {
+        assert_eq!(last_sunday_of_month(2025, 3), 30);
+        assert_eq!(last_sunday_of_month(2026, 3), 29);
+        assert_eq!(last_sunday_of_month(2025, 10), 26);
+        assert_eq!(last_sunday_of_month(2026, 10), 25);
     }
 
     #[test]
@@ -282,6 +334,20 @@ mod tests {
         // 2024-07-15 12:00:00 UTC -> 15:00:00 EEST (UTC+3)
         let unix_secs = 1721044800;
         assert_eq!(tz.to_local_hms(unix_secs), (15, 0, 0));
+    }
+
+    #[test]
+    fn test_to_local_hms_negative_base_offset_wraps_to_previous_day() {
+        let tz = Timezone::new(-5 * 3600);
+        assert_eq!(tz.to_local_hms(0), (19, 0, 0));
+    }
+
+    #[test]
+    fn test_to_local_hms_negative_base_offset_midday() {
+        let tz = Timezone::new(-5 * 3600);
+        // 2024-01-15 12:00:00 UTC -> 07:00:00 local (UTC-5 in winter)
+        let unix_secs = 1705320000;
+        assert_eq!(tz.to_local_hms(unix_secs), (7, 0, 0));
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub use app_core::config_rules::{
     POWER_DEFAULT_PREDICTIVE_SLEEP_ENABLED, POWER_DEFAULT_SLEEP_DURATION_SECS,
     POWER_DEFAULT_UI_IDLE_TIMEOUT_SECS, POWER_SLEEP_DURATION_MAX_SECS,
     POWER_SLEEP_DURATION_MIN_SECS, POWER_UI_IDLE_TIMEOUT_MAX_SECS, POWER_UI_IDLE_TIMEOUT_MIN_SECS,
+    quantize_detection_threshold_db,
 };
 
 /// A sensor reading bundled with radio signal metadata.

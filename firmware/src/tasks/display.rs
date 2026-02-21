@@ -9,6 +9,7 @@ use crate::time_sync::TIME_WATCH;
 use crate::ui_input::{EC11RotaryEncoderInput, UiEvent, UiInput};
 
 mod controller;
+pub(crate) mod frame_model;
 pub(crate) mod state;
 
 use controller::{DisplayController, DisplayLoopEvent, next_display_loop_event};

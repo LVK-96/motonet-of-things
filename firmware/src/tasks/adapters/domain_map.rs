@@ -1,6 +1,6 @@
 use crate::messages::{PowerSettings, RadioReading, RadioSettings};
+use crate::tasks::display::frame_model::{DisplayFrameInput, FrameKey, derive_frame};
 use crate::tasks::display::state::{DisplayState, RadioState};
-use app_core::display_model::{DisplayFrameInput, FrameKey, derive_frame};
 use app_core::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
 
 #[must_use]
@@ -85,12 +85,14 @@ pub(crate) fn derive_frame_key(
 
 #[cfg(test)]
 mod tests {
-    use app_core::display_model::{FrameKey, MainFrameKey, RadioFrameKey, SettingsFrameKey};
     use embassy_time::Instant;
     use rubicson::RubicsonReading;
 
     use super::derive_frame_key;
     use crate::messages::{DEFAULT_POWER_SETTINGS, DEFAULT_RADIO_SETTINGS, RadioReading};
+    use crate::tasks::display::frame_model::{
+        FrameKey, MainFrameKey, RadioFrameKey, SettingsFrameKey,
+    };
     use crate::tasks::display::state::{DisplayState, RadioState};
 
     fn sample_reading() -> RadioReading {

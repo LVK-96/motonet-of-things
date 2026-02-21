@@ -1,14 +1,14 @@
-use crate::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
+use app_core::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameKey {
+pub(crate) enum FrameKey {
     Waiting,
     Main(MainFrameKey),
     Radio(RadioFrameKey),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MainFrameKey {
+pub(crate) struct MainFrameKey {
     pub temp_deci: i16,
     pub sensor_id: u8,
     pub channel: u8,
@@ -17,7 +17,7 @@ pub struct MainFrameKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RadioFrameKey {
+pub(crate) enum RadioFrameKey {
     Overview {
         rssi: Option<i16>,
         detection_threshold: u8,
@@ -26,7 +26,7 @@ pub enum RadioFrameKey {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SettingsFrameKey {
+pub(crate) struct SettingsFrameKey {
     pub nav_index: u8,
     pub editing: bool,
     pub threshold: u8,
@@ -39,7 +39,7 @@ pub struct SettingsFrameKey {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct DisplayFrameInput {
+pub(crate) struct DisplayFrameInput {
     pub screen: UiScreenState,
     pub reading: Option<SensorReading>,
     pub radio: RadioConfigView,
@@ -50,7 +50,7 @@ pub struct DisplayFrameInput {
 }
 
 #[must_use]
-pub fn derive_frame(input: DisplayFrameInput) -> FrameKey {
+pub(crate) fn derive_frame(input: DisplayFrameInput) -> FrameKey {
     match input.screen {
         UiScreenState::Waiting => FrameKey::Waiting,
         UiScreenState::Main => input.reading.map_or(FrameKey::Waiting, |reading| {
@@ -98,7 +98,7 @@ mod tests {
     use super::{
         DisplayFrameInput, FrameKey, MainFrameKey, RadioFrameKey, SettingsFrameKey, derive_frame,
     };
-    use crate::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
+    use app_core::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
 
     fn sample_radio() -> RadioConfigView {
         RadioConfigView {

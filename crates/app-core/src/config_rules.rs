@@ -1,4 +1,5 @@
 use crate::domain::{PowerConfigView, RadioConfigView};
+use core::time::Duration;
 
 pub const DETECTION_THRESHOLD_MIN_DB: u8 = 4;
 pub const DETECTION_THRESHOLD_MAX_DB: u8 = 16;
@@ -23,12 +24,24 @@ pub const POWER_DEFAULT_PREDICTIVE_SLEEP_ENABLED: bool = true;
 pub const POWER_DEFAULT_SLEEP_DURATION_SECS: u8 = 45;
 pub const POWER_DEFAULT_UI_IDLE_TIMEOUT_SECS: u8 = 60;
 
+/// Quantize detection threshold to the effective hardware decision boundaries.
+///
+/// The CC1101 decision boundary buckets map to canonical values:
+/// 4, 8, 12, and 16 dB.
+#[must_use]
+pub fn quantize_detection_threshold_db(db: u8) -> u8 {
+    match db {
+        0..=6 => 4,
+        7..=10 => 8,
+        11..=14 => 12,
+        _ => 16,
+    }
+}
+
 #[must_use]
 pub fn clamp_radio_config(settings: RadioConfigView) -> RadioConfigView {
     RadioConfigView {
-        detection_threshold_db: settings
-            .detection_threshold_db
-            .clamp(DETECTION_THRESHOLD_MIN_DB, DETECTION_THRESHOLD_MAX_DB),
+        detection_threshold_db: quantize_detection_threshold_db(settings.detection_threshold_db),
         magn_target: settings.magn_target.clamp(MAGN_TARGET_MIN, MAGN_TARGET_MAX),
         channel_bandwidth_index: settings
             .channel_bandwidth_index
@@ -53,6 +66,20 @@ pub fn clamp_power_config(settings: PowerConfigView) -> PowerConfigView {
     }
 }
 
+/// Upper bound for predictive deep-sleep duration based on the 60s receive cadence.
+///
+/// The returned value is limited by both:
+/// - the configured global max sleep duration, and
+/// - the "next measurement minus safety margin" window (`60s - elapsed - 10s`).
+#[must_use]
+pub fn predictive_sleep_window_cap_secs(time_since_measurement_receive: Duration) -> u8 {
+    let window_secs = 60_u64
+        .saturating_sub(time_since_measurement_receive.as_secs())
+        .saturating_sub(10);
+    let window_secs_u8 = u8::try_from(window_secs).map_or(u8::MAX, |secs| secs);
+    POWER_SLEEP_DURATION_MAX_SECS.min(window_secs_u8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -64,8 +91,10 @@ mod tests {
         POWER_DEFAULT_UI_IDLE_TIMEOUT_SECS, POWER_SLEEP_DURATION_MAX_SECS,
         POWER_SLEEP_DURATION_MIN_SECS, POWER_UI_IDLE_TIMEOUT_MAX_SECS,
         POWER_UI_IDLE_TIMEOUT_MIN_SECS, clamp_power_config, clamp_radio_config,
+        predictive_sleep_window_cap_secs,
     };
     use crate::domain::{PowerConfigView, RadioConfigView};
+    use core::time::Duration;
 
     #[test]
     fn clamp_radio_settings_to_allowed_ranges() {
@@ -92,6 +121,36 @@ mod tests {
             clamped_min.detection_threshold_db,
             DETECTION_THRESHOLD_MIN_DB
         );
+    }
+
+    #[test]
+    fn detection_threshold_quantizes_to_hardware_steps() {
+        let cases = [
+            (0, 4),
+            (4, 4),
+            (6, 4),
+            (7, 8),
+            (10, 8),
+            (11, 12),
+            (14, 12),
+            (15, 16),
+            (16, 16),
+            (255, 16),
+        ];
+
+        for (input, expected) in cases {
+            let clamped = clamp_radio_config(RadioConfigView {
+                detection_threshold_db: input,
+                magn_target: DEFAULT_MAGN_TARGET,
+                channel_bandwidth_index: DEFAULT_CHANNEL_BANDWIDTH_INDEX,
+                carrier_sense_threshold: DEFAULT_CARRIER_SENSE_THRESHOLD,
+            });
+
+            assert_eq!(
+                clamped.detection_threshold_db, expected,
+                "input {input} should map to {expected}"
+            );
+        }
     }
 
     #[test]
@@ -168,5 +227,20 @@ mod tests {
             (POWER_UI_IDLE_TIMEOUT_MIN_SECS..=POWER_UI_IDLE_TIMEOUT_MAX_SECS)
                 .contains(&POWER_DEFAULT_UI_IDLE_TIMEOUT_SECS)
         );
+    }
+
+    #[test]
+    fn predictive_sleep_window_cap_uses_measurement_window_limit() {
+        assert_eq!(predictive_sleep_window_cap_secs(Duration::from_secs(0)), 50);
+        assert_eq!(
+            predictive_sleep_window_cap_secs(Duration::from_secs(20)),
+            30
+        );
+    }
+
+    #[test]
+    fn predictive_sleep_window_cap_never_exceeds_configured_global_max() {
+        assert_eq!(predictive_sleep_window_cap_secs(Duration::from_secs(9)), 41);
+        assert_eq!(predictive_sleep_window_cap_secs(Duration::from_secs(60)), 0);
     }
 }

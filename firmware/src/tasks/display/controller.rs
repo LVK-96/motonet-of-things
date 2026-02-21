@@ -1,7 +1,6 @@
 use core::fmt::Write;
 
 use app_core::config_rules::{clamp_power_config, clamp_radio_config};
-use app_core::display_model::FrameKey;
 use defmt::{error, info};
 use embassy_futures::select::{Either3, select3};
 use embassy_time::{Duration, Timer};
@@ -21,6 +20,7 @@ use crate::messages::{
 };
 use crate::power;
 use crate::tasks::adapters::domain_map;
+use crate::tasks::display::frame_model::FrameKey;
 use crate::ui_input::UiEvent;
 
 use super::state::{
