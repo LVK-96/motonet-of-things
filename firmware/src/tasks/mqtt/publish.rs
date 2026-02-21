@@ -1,14 +1,15 @@
 use core::fmt::Write;
 
 use defmt::{debug, trace, warn};
+use embedded_io_async::{Read as AsyncRead, Write as AsyncWrite};
 use rust_mqtt::Bytes;
+use rust_mqtt::buffer::BumpBuffer;
+use rust_mqtt::client::Client;
 use rust_mqtt::client::options::PublicationOptions;
 use rust_mqtt::types::{MqttString, QoS, TopicName};
 
 use crate::messages::RadioReading;
 use crate::time_sync::TIME_WATCH;
-
-use super::MqttClient;
 
 pub(super) enum PublishOutcome {
     Published,
@@ -18,7 +19,13 @@ pub(super) enum PublishOutcome {
 
 fn build_topic(reading: RadioReading) -> Option<heapless::String<64>> {
     let mut topic: heapless::String<64> = heapless::String::new();
-    if write!(topic, "sensors/rubicson/{}/temperature", reading.inner.id).is_err() {
+    if write!(
+        topic,
+        "home/sensors/rubicson/{}/temperature",
+        reading.inner.id
+    )
+    .is_err()
+    {
         warn!("MQTT: Dropping reading due to topic format error");
         return None;
     }
@@ -38,13 +45,12 @@ fn build_payload(reading: RadioReading) -> Option<heapless::String<128>> {
     let mut payload: heapless::String<128> = heapless::String::new();
     if write!(
         payload,
-        "id={},ch={},temp={:.1},batt={},rssi={},snr={},unix_s={}",
+        "{{\"id\":{},\"ch\":{},\"temp\":{:.1},\"batt\":\"{}\",\"rssi\":{},\"unix_s\":{}}}",
         reading.inner.id,
         reading.inner.channel,
         reading.inner.temperature_c,
         batt,
         reading.rssi,
-        reading.detection_threshold,
         u32::try_from(unix_secs).unwrap_or(u32::MAX)
     )
     .is_err()
@@ -56,10 +62,13 @@ fn build_payload(reading: RadioReading) -> Option<heapless::String<128>> {
     Some(payload)
 }
 
-pub(super) async fn publish_reading(
-    client: &mut MqttClient<'_>,
+pub(super) async fn publish_reading<'a, N>(
+    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2>,
     reading: RadioReading,
-) -> PublishOutcome {
+) -> PublishOutcome
+where
+    N: AsyncRead + AsyncWrite,
+{
     unsafe { client.buffer().reset() };
 
     let Some(topic) = build_topic(reading) else {
@@ -103,7 +112,12 @@ pub(super) async fn publish_reading(
     PublishOutcome::Published
 }
 
-pub(super) async fn ping(client: &mut MqttClient<'_>) -> Result<(), ()> {
+pub(super) async fn ping<'a, N>(
+    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2>,
+) -> Result<(), ()>
+where
+    N: AsyncRead + AsyncWrite,
+{
     debug!("MQTT: Sending periodic ping");
     unsafe { client.buffer().reset() };
 

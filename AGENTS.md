@@ -47,6 +47,8 @@ The system uses `embassy` for async task management on the ESP32.
     - Commit messages should be "Action: Details" (e.g., "Fix decode logic for negative temps").
 4.  **Known Issues**:
     - **Temperature Encoding**: The `rubicson` crate uses 12-bit two's complement. Be careful with sign extension. Negative temperatures (e.g., -10.5°C) correspond to raw values with high nibbles (e.g., 0xFxx). Always test with negative values.
+5.  **Networking Troubleshooting**:
+    - For Wi-Fi/MQTT connection errors, always ask the user to confirm `firmware/src/secrets.rs` setup first (SSID/password and any channel/BSSID/static-IP hints) before proposing code fixes.
 
 
 <skills_system priority="1">

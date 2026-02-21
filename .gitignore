@@ -24,3 +24,4 @@ target/
 secrets.rs
 firmware/src/secrets.rs
 .worktrees/
+scripts/.mqtt-test-tls/

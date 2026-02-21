@@ -57,6 +57,9 @@ embedded-hal-bus = { version = "0.3.0", features = ["defmt-03"] }
 embedded-io-async = "0.7.0"
 cc1101 = { git = "https://github.com/LVK-96/cc1101.git", branch = "dev/AGCCTRL1-setter" }
 rust-mqtt = { version = "0.4", default-features = false, features = ["defmt", "v5", "bump"] }
+embedded-tls = { version = "0.18.0", default-features = false, features = ["defmt", "rustpki"] }
+rand_core = { version = "0.6.3", default-features = false }
+der = { version = "0.8.0", default-features = false, features = ["heapless"] }
 heapless = "0.9.2"
 xtensa-lx = "0.13.0"
 

@@ -4,7 +4,7 @@ use esp_hal::Async;
 use esp_hal::Blocking;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{DriveMode, Input, InputConfig, Pull};
-use esp_hal::i2c::master::{BusTimeout, Config as I2cConfig, I2c, SoftwareTimeout};
+use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::ledc::{
     LSGlobalClkSource, Ledc, LowSpeed,
     channel::{self, Channel as LedcChannel, ChannelIFace},
@@ -13,7 +13,7 @@ use esp_hal::ledc::{
 use esp_hal::peripherals::Peripherals;
 #[cfg(feature = "pulse_rmt")]
 use esp_hal::rmt::{Channel as RmtChannel, Rmt, Rx, RxChannelConfig, RxChannelCreator};
-use esp_hal::time::{Duration, Rate};
+use esp_hal::time::Rate;
 use static_cell::StaticCell;
 
 use crate::display_driver::{Display, Sh1106Display};
@@ -109,19 +109,24 @@ pub(crate) fn setup_display(
     sda: esp_hal::peripherals::GPIO21<'static>,
     scl: esp_hal::peripherals::GPIO22<'static>,
 ) -> Sh1106Display<I2c<'static, Blocking>> {
+    const DISPLAY_I2C_FREQ_KHZ: u32 = 400;
     info!("Setting up I2C display...");
-    info!("Display: creating I2C bus (100 kHz) on SDA=GPIO21 SCL=GPIO22");
-    let i2c_config = I2cConfig::default()
-        .with_frequency(Rate::from_khz(100))
-        .with_timeout(BusTimeout::BusCycles(10_000))
-        .with_software_timeout(SoftwareTimeout::Transaction(Duration::from_millis(250)));
-    let i2c = I2c::new(i2c, i2c_config)
-        .expect("Failed to create I2C bus")
-        .with_sda(sda)
-        .with_scl(scl);
+
+    info!(
+        "Display: creating I2C bus ({} kHz) on SDA=GPIO21 SCL=GPIO22",
+        DISPLAY_I2C_FREQ_KHZ
+    );
+    let i2c = I2c::new(
+        i2c,
+        I2cConfig::default().with_frequency(Rate::from_khz(DISPLAY_I2C_FREQ_KHZ)),
+    )
+    .expect("Failed to create I2C bus")
+    .with_sda(sda)
+    .with_scl(scl);
 
     info!("Display: probing SH1106 over I2C (addr 0x3C)...");
     let mut display = Sh1106Display::new(i2c).expect("Failed to init display");
+    info!("Display: SH1106 init OK, drawing startup status...");
     let _ = display.show_status("Starting...");
     info!("Display initialized!");
     display
