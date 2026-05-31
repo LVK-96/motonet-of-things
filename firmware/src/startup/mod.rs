@@ -2,13 +2,13 @@ use core::future::pending;
 
 use embassy_executor::Spawner;
 
-mod composition;
+mod hw_context;
 mod hardware;
 mod spawn;
 
 pub async fn run(spawner: Spawner) -> ! {
-    let startup_context = composition::compose(&spawner).await;
-    spawn::spawn_tasks(&spawner, startup_context);
+    let hw_context = hw_context::hw_setup(&spawner).await;
+    spawn::spawn_tasks(&spawner, hw_context);
 
     loop {
         pending::<()>().await;

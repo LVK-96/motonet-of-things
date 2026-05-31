@@ -98,8 +98,8 @@ pub fn setup_network_stack(
     wifi_device: WIFI<'static>,
     spawner: &Spawner,
 ) -> (embassy_net::Stack<'static>, WifiController<'static>) {
-    // Create network stack using the STA interface
-    static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    // Socket capacity for concurrent embassy-net sockets.
+    static STACK_RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
 
     info!("NET[{}]: Setting up WiFi stack", power::wake_reason_class());
 

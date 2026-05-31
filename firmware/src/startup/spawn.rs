@@ -2,16 +2,17 @@ use defmt::{error, info};
 use embassy_executor::Spawner;
 
 use crate::app_bus;
-use crate::startup::composition::StartupContext;
+use crate::startup::hw_context::HWContext;
 use crate::tasks::{
     display as display_task, led_pwm as led_pwm_task, mqtt as mqtt_task,
     radio_433 as radio_433_task, time_sync as time_sync_task,
+    ota_payload_receive as ota_payload_receive_task,
 };
 
 #[allow(clippy::expect_used)]
 #[allow(clippy::too_many_lines)]
-pub(crate) fn spawn_tasks(spawner: &Spawner, context: StartupContext) {
-    let StartupContext {
+pub(crate) fn spawn_tasks(spawner: &Spawner, context: HWContext) {
+    let HWContext {
         led_channel,
         network_stack,
         display,
@@ -86,6 +87,12 @@ pub(crate) fn spawn_tasks(spawner: &Spawner, context: StartupContext) {
             app_bus::MQTT_COMMAND_CHANNEL.receiver(),
         ))
         .expect("Failed to spawn mqtt task");
+
+    spawner
+        .spawn(ota_payload_receive_task::ota_payload_receive_task(
+            network_stack,
+        ))
+        .expect("Failed to spawn OTA payload receiver task");
 
     spawner
         .spawn(display_task::ui_input_task(
