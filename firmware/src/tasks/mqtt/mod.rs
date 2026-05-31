@@ -24,7 +24,7 @@ type PlainClient<'a> = Client<'a, TcpSocket<'a>, BumpBuffer<'a>, 4, 2, 2>;
 type TlsSocket<'a> = TlsConnection<'a, TcpSocket<'a>, Aes128GcmSha256>;
 type TlsClient<'a> = Client<'a, TlsSocket<'a>, BumpBuffer<'a>, 4, 2, 2>;
 
-const MQTT_TLS_RECORD_READ_BUF_SIZE: usize = 4096;
+const MQTT_TLS_RECORD_READ_BUF_SIZE: usize = 16640;
 const MQTT_TLS_RECORD_WRITE_BUF_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug)]
