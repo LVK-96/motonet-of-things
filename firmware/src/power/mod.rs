@@ -13,6 +13,13 @@ mod persistence;
 mod policy;
 mod sleep;
 
+pub use persistence::load_settings_or_default;
+pub use policy::{
+    get_settings, maybe_sleep_after_publish, notify_ui_activity, predictive_sleep_enabled,
+    restore_settings_after_reset, set_settings,
+};
+pub use sleep::{log_wakeup_cause, wake_reason_class};
+
 static PREDICTIVE_SLEEP_ENABLED: AtomicBool =
     AtomicBool::new(DEFAULT_POWER_SETTINGS.predictive_sleep_enabled);
 static SLEEP_DURATION_SECS: AtomicU8 = AtomicU8::new(DEFAULT_POWER_SETTINGS.sleep_duration_secs);
@@ -60,47 +67,4 @@ fn rearm_ui_idle_deadline() {
 
 fn clamp_settings(settings: PowerSettings) -> PowerSettings {
     from_power_config_view(clamp_power_config(to_power_config_view(settings)))
-}
-
-#[must_use]
-pub fn load_settings_or_default() -> PowerSettings {
-    persistence::load_settings_or_default()
-}
-
-pub fn set_settings(settings: PowerSettings) {
-    policy::set_settings(settings);
-}
-
-pub fn restore_settings_after_reset(settings: PowerSettings) {
-    policy::restore_settings_after_reset(settings);
-}
-
-#[must_use]
-pub fn get_settings() -> PowerSettings {
-    policy::get_settings()
-}
-
-#[must_use]
-pub fn predictive_sleep_enabled() -> bool {
-    policy::predictive_sleep_enabled()
-}
-
-pub fn notify_ui_activity() {
-    policy::notify_ui_activity();
-}
-
-#[must_use]
-pub fn wake_reason_class() -> &'static str {
-    sleep::wake_reason_class()
-}
-
-pub fn log_wakeup_cause() {
-    sleep::log_wakeup_cause();
-}
-
-pub fn maybe_sleep_after_publish(
-    queue_empty: bool,
-    time_since_mesaurement_receive: core::time::Duration,
-) {
-    policy::maybe_sleep_after_publish(queue_empty, time_since_mesaurement_receive);
 }

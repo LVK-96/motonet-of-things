@@ -11,7 +11,7 @@ use esp_hal::system::SleepSource;
 const DEEP_SLEEP_LOG_FLUSH_DELAY_US: u32 = 20_000;
 
 #[must_use]
-pub(super) fn wake_reason_class() -> &'static str {
+pub fn wake_reason_class() -> &'static str {
     match wakeup_cause() {
         SleepSource::Undefined => "cold_boot",
         SleepSource::Timer => "timer_wake",
@@ -24,7 +24,7 @@ pub(super) fn wake_reason_class() -> &'static str {
     }
 }
 
-pub(super) fn log_wakeup_cause() {
+pub fn log_wakeup_cause() {
     let cause = wakeup_cause();
     let class = wake_reason_class();
     info!(

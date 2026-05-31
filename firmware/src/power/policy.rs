@@ -34,15 +34,15 @@ fn apply_settings(settings: PowerSettings, persist: bool, rearm_idle_countdown: 
     );
 }
 
-pub(super) fn set_settings(settings: PowerSettings) {
+pub fn set_settings(settings: PowerSettings) {
     apply_settings(settings, true, true);
 }
 
-pub(super) fn restore_settings_after_reset(settings: PowerSettings) {
+pub fn restore_settings_after_reset(settings: PowerSettings) {
     apply_settings(settings, false, false);
 }
 
-pub(super) fn get_settings() -> PowerSettings {
+pub fn get_settings() -> PowerSettings {
     PowerSettings {
         predictive_sleep_enabled: super::PREDICTIVE_SLEEP_ENABLED.load(Ordering::Relaxed),
         sleep_duration_secs: super::sleep_duration_secs(),
@@ -50,20 +50,17 @@ pub(super) fn get_settings() -> PowerSettings {
     }
 }
 
-pub(super) fn predictive_sleep_enabled() -> bool {
+pub fn predictive_sleep_enabled() -> bool {
     super::PREDICTIVE_SLEEP_ENABLED.load(Ordering::Relaxed)
 }
 
-pub(super) fn notify_ui_activity() {
+pub fn notify_ui_activity() {
     if predictive_sleep_enabled() {
         super::rearm_ui_idle_deadline();
     }
 }
 
-pub(super) fn maybe_sleep_after_publish(
-    queue_empty: bool,
-    time_since_mesaurement_receive: Duration,
-) {
+pub fn maybe_sleep_after_publish(queue_empty: bool, time_since_mesaurement_receive: Duration) {
     let settings = get_settings();
     let now = super::now_secs();
     let idle_deadline = super::UI_IDLE_DEADLINE_SECS.load(Ordering::Relaxed);

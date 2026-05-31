@@ -60,7 +60,7 @@ pub(super) fn persist_settings(settings: PowerSettings) {
 }
 
 #[must_use]
-pub(super) fn load_settings_or_default() -> PowerSettings {
+pub fn load_settings_or_default() -> PowerSettings {
     let word = read_persisted_word();
     let raw = word.to_le_bytes();
     match rtc_schema::decode_power_settings(word) {
