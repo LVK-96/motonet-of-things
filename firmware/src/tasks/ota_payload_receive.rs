@@ -1,4 +1,4 @@
-use crate::{network, power};
+use crate::{network, ota};
 use defmt::{Debug2Format, info, warn};
 use embassy_net::{IpListenEndpoint, tcp::TcpSocket};
 use embassy_time::Duration;
@@ -51,7 +51,7 @@ async fn ota_tcp_server(network_stack: embassy_net::Stack<'static>) {
 }
 
 async fn serve_one_ota_connection(socket: &mut TcpSocket<'_>) {
-    let _sleep_block = power::OtaUpdateGuard::begin();
+    let _sleep_block = ota::OtaUpdateGuard::begin();
     info!("Accepted OTA TCP connection");
     let mut payload_buf = [0u8; 1024];
     loop {

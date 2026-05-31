@@ -7,6 +7,7 @@ pub mod app_bus;
 pub mod display_driver;
 pub mod messages;
 pub mod network;
+pub mod ota;
 pub mod power;
 pub mod pulse_capture;
 pub mod radio_433;

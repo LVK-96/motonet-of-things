@@ -73,7 +73,7 @@ pub(super) fn maybe_sleep_after_publish(
         settings.predictive_sleep_enabled,
         settings.sleep_duration_secs,
         now,
-        super::ota_update_in_progress(),
+        crate::ota::ota_update_in_progress(),
         idle_deadline,
     );
 
