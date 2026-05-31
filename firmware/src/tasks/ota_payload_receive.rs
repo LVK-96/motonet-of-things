@@ -51,7 +51,7 @@ async fn ota_tcp_server(network_stack: embassy_net::Stack<'static>) {
 }
 
 async fn serve_one_ota_connection(socket: &mut TcpSocket<'_>) {
-    let _sleep_block = ota::OtaUpdateGuard::begin();
+    let _ota_update = ota::OtaUpdateGuard::begin_download();
     info!("Accepted OTA TCP connection");
     let mut payload_buf = [0u8; 1024];
     loop {
