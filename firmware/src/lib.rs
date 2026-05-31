@@ -5,6 +5,7 @@ use embassy_time::{Duration, Timer};
 
 pub mod app_bus;
 pub mod display_driver;
+mod domain_map;
 pub mod messages;
 pub mod network;
 pub mod ota;

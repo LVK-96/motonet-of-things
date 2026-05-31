@@ -1,7 +1,6 @@
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use app_core::config_rules::clamp_power_config;
-use app_core::domain::PowerConfigView;
 use embassy_time::Instant;
 
 use crate::messages::{
@@ -25,22 +24,6 @@ static PREDICTIVE_SLEEP_ENABLED: AtomicBool =
 static SLEEP_DURATION_SECS: AtomicU8 = AtomicU8::new(DEFAULT_POWER_SETTINGS.sleep_duration_secs);
 static UI_IDLE_TIMEOUT_SECS: AtomicU8 = AtomicU8::new(DEFAULT_POWER_SETTINGS.ui_idle_timeout_secs);
 static UI_IDLE_DEADLINE_SECS: AtomicU32 = AtomicU32::new(0);
-
-fn to_power_config_view(settings: PowerSettings) -> PowerConfigView {
-    PowerConfigView {
-        predictive_sleep_enabled: settings.predictive_sleep_enabled,
-        sleep_duration_secs: settings.sleep_duration_secs,
-        ui_idle_timeout_secs: settings.ui_idle_timeout_secs,
-    }
-}
-
-fn from_power_config_view(view: PowerConfigView) -> PowerSettings {
-    PowerSettings {
-        predictive_sleep_enabled: view.predictive_sleep_enabled,
-        sleep_duration_secs: view.sleep_duration_secs,
-        ui_idle_timeout_secs: view.ui_idle_timeout_secs,
-    }
-}
 
 fn ui_idle_timeout_secs() -> u8 {
     UI_IDLE_TIMEOUT_SECS.load(Ordering::Relaxed).clamp(
@@ -66,5 +49,5 @@ fn rearm_ui_idle_deadline() {
 }
 
 fn clamp_settings(settings: PowerSettings) -> PowerSettings {
-    from_power_config_view(clamp_power_config(to_power_config_view(settings)))
+    PowerSettings::from(clamp_power_config(settings.into()))
 }

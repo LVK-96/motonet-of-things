@@ -1,7 +1,8 @@
+use app_core::domain::UiScreenState;
+
 use crate::messages::{PowerSettings, RadioReading, RadioSettings};
 use crate::tasks::display::frame_model::{DisplayFrameInput, FrameKey, derive_frame};
 use crate::tasks::display::state::{DisplayState, RadioState};
-use app_core::domain::{PowerConfigView, RadioConfigView, SensorReading, UiScreenState};
 
 #[must_use]
 pub(crate) fn to_ui_screen_state(state: DisplayState) -> UiScreenState {
@@ -9,56 +10,6 @@ pub(crate) fn to_ui_screen_state(state: DisplayState) -> UiScreenState {
         DisplayState::Main => UiScreenState::Main,
         DisplayState::Radio(RadioState::Overview) => UiScreenState::RadioOverview,
         DisplayState::Radio(RadioState::Settings) => UiScreenState::RadioSettings,
-    }
-}
-
-#[must_use]
-pub(crate) fn to_sensor_reading(reading: RadioReading) -> SensorReading {
-    SensorReading {
-        sensor_id: reading.inner.id,
-        channel: reading.inner.channel,
-        battery_ok: reading.inner.battery_ok,
-        temperature_c: reading.inner.temperature_c,
-        rssi_dbm: reading.rssi,
-        detection_threshold_db: reading.detection_threshold,
-    }
-}
-
-#[must_use]
-pub(crate) fn to_radio_config_view(settings: RadioSettings) -> RadioConfigView {
-    RadioConfigView {
-        detection_threshold_db: settings.detection_threshold_db,
-        magn_target: settings.magn_target,
-        channel_bandwidth_index: settings.channel_bandwidth_index,
-        carrier_sense_threshold: settings.carrier_sense_threshold,
-    }
-}
-
-#[must_use]
-pub(crate) fn to_power_config_view(settings: PowerSettings) -> PowerConfigView {
-    PowerConfigView {
-        predictive_sleep_enabled: settings.predictive_sleep_enabled,
-        sleep_duration_secs: settings.sleep_duration_secs,
-        ui_idle_timeout_secs: settings.ui_idle_timeout_secs,
-    }
-}
-
-#[must_use]
-pub(crate) fn from_radio_config_view(config: RadioConfigView) -> RadioSettings {
-    RadioSettings {
-        detection_threshold_db: config.detection_threshold_db,
-        magn_target: config.magn_target,
-        channel_bandwidth_index: config.channel_bandwidth_index,
-        carrier_sense_threshold: config.carrier_sense_threshold,
-    }
-}
-
-#[must_use]
-pub(crate) fn from_power_config_view(config: PowerConfigView) -> PowerSettings {
-    PowerSettings {
-        predictive_sleep_enabled: config.predictive_sleep_enabled,
-        sleep_duration_secs: config.sleep_duration_secs,
-        ui_idle_timeout_secs: config.ui_idle_timeout_secs,
     }
 }
 
@@ -74,9 +25,9 @@ pub(crate) fn derive_frame_key(
 ) -> FrameKey {
     derive_frame(DisplayFrameInput {
         screen: to_ui_screen_state(state),
-        reading: reading.map(to_sensor_reading),
-        radio: to_radio_config_view(radio),
-        power: to_power_config_view(power),
+        reading: reading.map(Into::into),
+        radio: radio.into(),
+        power: power.into(),
         time_secs,
         settings_nav_index: u8::try_from(settings_nav_index).map_or(u8::MAX, |v| v),
         settings_editing,

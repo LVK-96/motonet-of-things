@@ -19,7 +19,7 @@ use crate::messages::{
     channel_bandwidth_hz,
 };
 use crate::power;
-use crate::tasks::adapters::domain_map;
+use crate::tasks::display::frame_map;
 use crate::tasks::display::frame_model::FrameKey;
 use crate::ui_input::UiEvent;
 
@@ -191,7 +191,7 @@ impl DisplayController {
 
     #[must_use]
     pub(crate) fn derive_frame_key(&self, time_secs: Option<u64>) -> FrameKey {
-        domain_map::derive_frame_key(
+        frame_map::derive_frame_key(
             self.state,
             self.last_reading,
             self.pending_radio_settings,
@@ -227,12 +227,10 @@ impl DisplayController {
         self.state = transition.state;
 
         if transition.effects.save_settings {
-            self.pending_radio_settings = domain_map::from_radio_config_view(clamp_radio_config(
-                domain_map::to_radio_config_view(self.pending_radio_settings),
-            ));
-            self.pending_power_settings = domain_map::from_power_config_view(clamp_power_config(
-                domain_map::to_power_config_view(self.pending_power_settings),
-            ));
+            self.pending_radio_settings =
+                RadioSettings::from(clamp_radio_config(self.pending_radio_settings.into()));
+            self.pending_power_settings =
+                PowerSettings::from(clamp_power_config(self.pending_power_settings.into()));
 
             self.settings_menu.commit_all();
 
