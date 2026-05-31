@@ -12,9 +12,9 @@ use rand_core::RngCore;
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
-use rust_mqtt::client::options::{ConnectOptions, PublicationOptions, WillOptions};
+use rust_mqtt::client::options::{ConnectOptions, PublicationOptions, TopicReference, WillOptions};
 use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
-use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicName};
+use rust_mqtt::types::{MqttBinary, MqttString, TopicName};
 
 use crate::network;
 use crate::power;
@@ -58,24 +58,22 @@ fn connect_options() -> Result<ConnectOptions<'static>, ()> {
         })
         .transpose()?;
 
-    let lwt = WillOptions {
-        will_qos: QoS::AtMostOnce,
-        will_retain: true,
-        will_topic: MqttString::try_from(STATUS_TOPIC).map_err(|_| ())?,
-        will_payload: MqttBinary::try_from(b"offline" as &[u8]).map_err(|_| ())?,
-        will_delay_interval: 0,
-        is_payload_utf8: true,
-        message_expiry_interval: None,
-        content_type: None,
-        response_topic: None,
-        correlation_data: None,
-    };
+    let status_topic = MqttString::try_from(STATUS_TOPIC).map_err(|_| ())?;
+    let status_topic_name = TopicName::new_unchecked(status_topic);
+    let lwt = WillOptions::new(
+        status_topic_name,
+        MqttBinary::try_from(b"offline" as &[u8]).map_err(|_| ())?,
+    )
+    .retain()
+    .payload_format_indicator(true);
 
     Ok(ConnectOptions {
         // We intentionally use non-persistent sessions for this publisher task.
         clean_start: true,
-        keep_alive: KeepAlive::Seconds(120),
+        keep_alive: KeepAlive::Seconds(core::num::NonZeroU16::new(120).ok_or(())?),
         session_expiry_interval: SessionExpiryInterval::EndOnDisconnect,
+        maximum_packet_size: rust_mqtt::config::MaximumPacketSize::Unlimited,
+        request_response_information: false,
         user_name,
         password,
         will: Some(lwt),
@@ -123,7 +121,7 @@ async fn connect_tcp<'a>(
 }
 
 async fn connect_broker_and_publish_online<'a, N>(
-    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2>,
+    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
     transport: N,
 ) -> Result<(), ()>
 where
@@ -164,15 +162,11 @@ where
         mqtt_connect_at.elapsed().as_millis(),
         session_present
     );
-    unsafe { client.buffer().reset() };
+    unsafe { client.buffer_mut().reset() };
 
     let status_topic = MqttString::try_from(STATUS_TOPIC).map_err(|_| ())?;
-    let status_topic_name = unsafe { TopicName::new_unchecked(status_topic) };
-    let online_options = PublicationOptions {
-        retain: true,
-        topic: status_topic_name,
-        qos: QoS::AtMostOnce,
-    };
+    let status_topic_name = TopicName::new_unchecked(status_topic);
+    let online_options = PublicationOptions::new(TopicReference::Name(status_topic_name)).retain();
     let online_publish_at = Instant::now();
 
     if let Err(e) = client

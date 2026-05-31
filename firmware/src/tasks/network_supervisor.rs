@@ -22,7 +22,7 @@ pub async fn network_supervisor_task(
     network::wait_for_ipv4_config(stack).await;
 
     loop {
-        if !matches!(wifi_controller.is_connected(), Ok(true)) {
+        if !wifi_controller.is_connected() {
             warn!(
                 "NET[{}]: WiFi disconnected, reconnecting...",
                 power::wake_reason_class()

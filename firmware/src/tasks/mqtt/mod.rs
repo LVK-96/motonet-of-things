@@ -20,9 +20,9 @@ use crate::secrets::MQTT_USE_TLS;
 mod publish;
 mod session;
 
-type PlainClient<'a> = Client<'a, TcpSocket<'a>, BumpBuffer<'a>, 4, 2, 2>;
+type PlainClient<'a> = Client<'a, TcpSocket<'a>, BumpBuffer<'a>, 4, 2, 2, 0>;
 type TlsSocket<'a> = TlsConnection<'a, TcpSocket<'a>, Aes128GcmSha256>;
-type TlsClient<'a> = Client<'a, TlsSocket<'a>, BumpBuffer<'a>, 4, 2, 2>;
+type TlsClient<'a> = Client<'a, TlsSocket<'a>, BumpBuffer<'a>, 4, 2, 2, 0>;
 
 const MQTT_TLS_RECORD_READ_BUF_SIZE: usize = 16640;
 const MQTT_TLS_RECORD_WRITE_BUF_SIZE: usize = 4096;
@@ -65,7 +65,7 @@ async fn pending_or_next_work(
 }
 
 async fn run_connected_loop<'a, N>(
-    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2>,
+    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
     receiver: &app_bus::MqttCommandReceiver,
     mut deferred_reading: Option<RadioReading>,
 ) -> Option<RadioReading>
@@ -126,7 +126,11 @@ where
 }
 
 #[embassy_executor::task]
-#[allow(clippy::expect_used, clippy::too_many_lines)]
+#[allow(
+    clippy::expect_used,
+    clippy::large_stack_arrays,
+    clippy::too_many_lines
+)]
 pub async fn mqtt_task(
     network_stack: embassy_net::Stack<'static>,
     receiver: app_bus::MqttCommandReceiver,

@@ -5,7 +5,7 @@ use embedded_io_async::{Read as AsyncRead, Write as AsyncWrite};
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
-use rust_mqtt::client::options::PublicationOptions;
+use rust_mqtt::client::options::{PublicationOptions, TopicReference};
 use rust_mqtt::types::{MqttString, QoS, TopicName};
 
 use crate::messages::RadioReading;
@@ -63,13 +63,13 @@ fn build_payload(reading: RadioReading) -> Option<heapless::String<128>> {
 }
 
 pub(super) async fn publish_reading<'a, N>(
-    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2>,
+    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
     reading: RadioReading,
 ) -> PublishOutcome
 where
     N: AsyncRead + AsyncWrite,
 {
-    unsafe { client.buffer().reset() };
+    unsafe { client.buffer_mut().reset() };
 
     let Some(topic) = build_topic(reading) else {
         return PublishOutcome::Dropped;
@@ -85,18 +85,15 @@ where
         payload.as_str()
     );
 
-    let topic_name = if let Ok(topic_str) = MqttString::from_slice(topic.as_str()) {
-        unsafe { TopicName::new_unchecked(topic_str) }
+    let topic_name = if let Ok(topic_str) = MqttString::from_str(topic.as_str()) {
+        TopicName::new_unchecked(topic_str)
     } else {
         warn!("MQTT: Dropping reading due to invalid topic");
         return PublishOutcome::Dropped;
     };
 
-    let pub_options = PublicationOptions {
-        retain: false,
-        topic: topic_name,
-        qos: QoS::AtLeastOnce, // QoS 1
-    };
+    let pub_options =
+        PublicationOptions::new(TopicReference::Name(topic_name)).qos(QoS::AtLeastOnce);
 
     if let Err(e) = client
         .publish(&pub_options, Bytes::from(payload.as_bytes()))
@@ -113,13 +110,13 @@ where
 }
 
 pub(super) async fn ping<'a, N>(
-    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2>,
+    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
 ) -> Result<(), ()>
 where
     N: AsyncRead + AsyncWrite,
 {
     debug!("MQTT: Sending periodic ping");
-    unsafe { client.buffer().reset() };
+    unsafe { client.buffer_mut().reset() };
 
     if let Err(e) = client.ping().await {
         warn!(

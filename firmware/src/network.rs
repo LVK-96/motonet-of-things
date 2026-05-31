@@ -10,12 +10,11 @@ use embassy_net::{Ipv4Address, Ipv4Cidr, Runner, StackResources, StaticConfigV4}
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
-use esp_hal::efuse::Efuse;
+use esp_hal::efuse;
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
-use esp_radio::{
-    Controller,
-    wifi::{self, ClientConfig, ModeConfig, WifiController, WifiDevice},
+use esp_radio::wifi::{
+    self, Config as WifiConfig, ControllerConfig, Interface, WifiController, sta::StationConfig,
 };
 use static_cell::StaticCell;
 
@@ -54,8 +53,8 @@ fn build_stack_config() -> embassy_net::Config {
     )
 }
 
-fn build_client_config() -> ClientConfig {
-    let mut client_config = ClientConfig::default()
+fn build_client_config() -> WifiConfig {
+    let mut client_config = StationConfig::default()
         .with_ssid(String::from(WIFI_SSID))
         .with_password(String::from(WIFI_PASSWORD));
 
@@ -67,17 +66,18 @@ fn build_client_config() -> ClientConfig {
         client_config = client_config.with_bssid(bssid);
     }
 
-    client_config
+    WifiConfig::Station(client_config)
 }
 
 fn derive_network_seed() -> u64 {
     let rng = Rng::new();
     let random_component = (u64::from(rng.random()) << 32) | u64::from(rng.random());
-    let mac_bytes = Efuse::read_base_mac_address();
+    let mac_address = efuse::base_mac_address();
+    let mac_bytes = mac_address.as_bytes();
     let mut mac_component = 0u64;
 
     for byte in mac_bytes {
-        mac_component = mac_component.rotate_left(8) ^ u64::from(byte);
+        mac_component = mac_component.rotate_left(8) ^ u64::from(*byte);
     }
 
     // Mix fast-changing entropy with a stable chip-unique component.
@@ -94,7 +94,6 @@ fn derive_network_seed() -> u64 {
 /// Panics if Wi-Fi controller creation fails or if task spawning fails.
 #[allow(clippy::expect_used)]
 pub fn setup_network_stack(
-    controller: &'static mut Controller<'static>,
     wifi_device: WIFI<'static>,
     spawner: &Spawner,
 ) -> (embassy_net::Stack<'static>, WifiController<'static>) {
@@ -103,23 +102,24 @@ pub fn setup_network_stack(
 
     info!("NET[{}]: Setting up WiFi stack", power::wake_reason_class());
 
-    let wifi_config = wifi::Config::default();
-    let (wifi_controller, interfaces) =
-        wifi::new(controller, wifi_device, wifi_config).expect("Failed to create WiFi controller");
+    let initial_config = build_client_config();
+    let (wifi_controller, interfaces) = wifi::new(
+        wifi_device,
+        ControllerConfig::default().with_initial_config(initial_config),
+    )
+    .expect("Failed to create WiFi controller");
 
     let resources = STACK_RESOURCES.init(StackResources::new());
     let stack_config = build_stack_config();
     let stack_seed = derive_network_seed();
 
-    let (stack, runner) = embassy_net::new(interfaces.sta, stack_config, resources, stack_seed);
+    let (stack, runner) = embassy_net::new(interfaces.station, stack_config, resources, stack_seed);
     info!(
         "NET[{}]: Stack seed derived from hardware entropy",
         power::wake_reason_class()
     );
 
-    spawner
-        .spawn(net_task(runner))
-        .expect("Failed to spawn network task");
+    spawner.spawn(net_task(runner).expect("Failed to spawn network task"));
     info!(
         "NET[{}]: Stack runner spawned; WiFi association handled by supervisor",
         power::wake_reason_class()
@@ -141,7 +141,7 @@ pub(crate) async fn connect_until_associated(controller: &mut WifiController<'st
         );
 
         let client_config = build_client_config();
-        if let Err(e) = controller.set_config(&ModeConfig::Client(client_config)) {
+        if let Err(e) = controller.set_config(&client_config) {
             warn!(
                 "NET[{}]: WiFi config failed: {:?}, retrying...",
                 power::wake_reason_class(),
@@ -151,30 +151,9 @@ pub(crate) async fn connect_until_associated(controller: &mut WifiController<'st
             continue;
         }
 
-        let wifi_start_at = Instant::now();
-        match controller.start_async().await {
-            Ok(()) => {
-                info!(
-                    "NET[{}]: WiFi start complete in {}ms",
-                    power::wake_reason_class(),
-                    wifi_start_at.elapsed().as_millis()
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "NET[{}]: WiFi start failed after {}ms: {:?}, retrying...",
-                    power::wake_reason_class(),
-                    wifi_start_at.elapsed().as_millis(),
-                    defmt::Debug2Format(&e)
-                );
-                Timer::after(Duration::from_secs(1)).await;
-                continue;
-            }
-        }
-
         let assoc_at = Instant::now();
         match controller.connect_async().await {
-            Ok(()) => {
+            Ok(_info) => {
                 info!(
                     "NET[{}]: WiFi associated in {}ms",
                     power::wake_reason_class(),
@@ -232,7 +211,7 @@ pub async fn wait_for_config_up(stack: embassy_net::Stack<'static>) {
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
     runner.run().await;
 }
 
@@ -240,7 +219,7 @@ pub(crate) async fn reconnect_until_connected(controller: &mut WifiController<'s
     loop {
         let reconnect_at = Instant::now();
         match controller.connect_async().await {
-            Ok(()) => {
+            Ok(_info) => {
                 info!(
                     "NET[{}]: WiFi reconnected in {}ms",
                     power::wake_reason_class(),

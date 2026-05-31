@@ -25,27 +25,26 @@ karu-menu = { path = "../crates/karu-menu" }
 app-core = { path = "../crates/app-core" }
 telemetry-core = { path = "../crates/telemetry-core" }
 
-defmt = "1.0.1"
-esp-hal = { version = "~1.0", features = ["defmt", "esp32", "unstable"] }
-esp-rtos = { version = "0.2.0", features = [
+defmt = "1.1.0"
+esp-hal = { version = "~1.1", features = ["defmt", "esp32", "unstable"] }
+esp-rtos = { version = "0.3.0", features = [
   "defmt",
   "embassy",
   "esp-alloc",
   "esp32",
   "esp-radio",
 ] }
-esp-bootloader-esp-idf = { version = "0.4.0", features = ["defmt", "esp32"] }
-embassy-executor = { version = "0.9.1", features = ["defmt"] }
-embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime-ms"] }
-embassy-sync = { version = "0.7.2", features = ["defmt"] }
-embassy-futures = { version = "0.1.1" }
-embassy-net = { version = "0.8.0", features = ["defmt", "tcp", "udp", "dhcpv4", "medium-ethernet"] }
-esp-alloc = { version = "0.9.0", features = ["defmt"] }
-esp-println = { version = "0.16.1", features = ["esp32", "defmt-espflash"] }
-esp-radio = { version = "0.17.0", features = [
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["defmt", "esp32"] }
+embassy-executor = { version = "0.10.0", features = ["defmt"] }
+embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime-ms"] }
+embassy-sync = { version = "0.8.0", features = ["defmt"] }
+embassy-futures = { version = "0.1.2" }
+embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "udp", "dhcpv4", "medium-ethernet"] }
+esp-alloc = { version = "0.10.0", features = ["defmt"] }
+esp-println = { version = "0.17.0", features = ["esp32", "defmt-espflash"] }
+esp-radio = { version = "0.18.0", features = [
   "esp32",
   "wifi",
-  "smoltcp",
   "defmt",
   "unstable",
 ] }
@@ -56,11 +55,11 @@ embedded-hal = "1.0"
 embedded-hal-bus = { version = "0.3.0", features = ["defmt-03"] }
 embedded-io-async = "0.7.0"
 cc1101 = { git = "https://github.com/dsvensson/cc1101.git", branch = "main" }
-rust-mqtt = { version = "0.4", default-features = false, features = ["defmt", "v5", "bump"] }
+rust-mqtt = { version = "0.5", default-features = false, features = ["defmt", "v5", "bump"] }
 embedded-tls = { version = "0.18.0", default-features = false, features = ["defmt", "rustpki"] }
-rand_core = { version = "0.6.3", default-features = false }
+rand_core = { version = "0.6.4", default-features = false }
 der = { version = "0.8.0", default-features = false, features = ["heapless"] }
-heapless = "0.9.2"
+heapless = "0.9.3"
 xtensa-lx = "0.13.0"
 
 # Display
@@ -69,8 +68,8 @@ embedded-graphics = "0.8"
 profont = "0.7"
 
 # Time sync
-sntpc = { version = "0.8", default-features = false }
-sntpc-net-embassy = "0.8"
+sntpc = { version = "0.10", default-features = false }
+sntpc-net-embassy = "0.10"
 
 [lints]
 workspace = true

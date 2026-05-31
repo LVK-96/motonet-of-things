@@ -99,8 +99,9 @@ pub(crate) fn setup_rmt_rx(
         .with_memsize(8);
 
     rmt.channel0
-        .configure_rx(data_pin, rmt_rx_cfg)
+        .configure_rx(&rmt_rx_cfg)
         .expect("Failed to configure RMT RX channel")
+        .with_pin(data_pin)
 }
 
 #[allow(clippy::expect_used)]
