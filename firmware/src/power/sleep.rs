@@ -53,7 +53,6 @@ pub(super) fn enter_deep_sleep(sleep_secs: u8) {
     sleep_cfg.set_rtc_slowmem_pd_en(false);
     sleep_cfg.set_rtc_fastmem_pd_en(true);
 
-    info!("PowerSave: entering deep sleep now");
     warn!("PowerSave: deep sleeping now (rtc_slowmem retained)");
     // Give RTT/defmt a short window to flush before reset-on-deep-sleep.
     esp_hal::rom::ets_delay_us(DEEP_SLEEP_LOG_FLUSH_DELAY_US);
