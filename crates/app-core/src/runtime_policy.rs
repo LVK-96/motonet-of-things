@@ -13,6 +13,7 @@ pub enum PredictiveSleepDecision {
     MeasurementTooOld,
     PredictiveSleepDisabled,
     UiIdleDeadlineNotElapsed { idle_remaining_secs: u32 },
+    OTAUpdateInProgress,
     Sleep { sleep_secs: u8 },
 }
 
@@ -23,6 +24,7 @@ pub fn predictive_sleep_decision(
     predictive_sleep_enabled: bool,
     configured_sleep_secs: u8,
     now_secs: u32,
+    ota_update_in_progress: bool,
     ui_idle_deadline_secs: u32,
 ) -> PredictiveSleepDecision {
     if !queue_empty {
@@ -43,6 +45,10 @@ pub fn predictive_sleep_decision(
         return PredictiveSleepDecision::UiIdleDeadlineNotElapsed {
             idle_remaining_secs: ui_idle_deadline_secs - now_secs,
         };
+    }
+
+    if ota_update_in_progress {
+        return PredictiveSleepDecision::OTAUpdateInProgress;
     }
 
     let max_sleep_secs = predictive_sleep_window_cap_secs(time_since_measurement_receive);
@@ -93,34 +99,40 @@ mod tests {
 
     #[test]
     fn predictive_sleep_gate_blocks_when_queue_has_pending_readings() {
-        let decision = predictive_sleep_decision(true, Duration::from_secs(0), true, 45, 100, 100);
+        let decision =
+            predictive_sleep_decision(true, Duration::from_secs(0), true, 45, 100, false, 100);
         assert_eq!(decision, PredictiveSleepDecision::Sleep { sleep_secs: 45 });
 
-        let blocked = predictive_sleep_decision(false, Duration::from_secs(0), true, 45, 100, 100);
+        let blocked =
+            predictive_sleep_decision(false, Duration::from_secs(0), true, 45, 100, false, 100);
         assert_eq!(blocked, PredictiveSleepDecision::QueueNotEmpty);
     }
 
     #[test]
     fn predictive_sleep_gate_blocks_when_measurement_is_too_old() {
-        let decision = predictive_sleep_decision(true, Duration::from_secs(21), true, 45, 100, 100);
+        let decision =
+            predictive_sleep_decision(true, Duration::from_secs(21), true, 45, 100, false, 100);
         assert_eq!(decision, PredictiveSleepDecision::MeasurementTooOld);
     }
 
     #[test]
     fn predictive_sleep_gate_allows_measurement_age_boundary() {
-        let decision = predictive_sleep_decision(true, Duration::from_secs(20), true, 45, 100, 100);
+        let decision =
+            predictive_sleep_decision(true, Duration::from_secs(20), true, 45, 100, false, 100);
         assert_eq!(decision, PredictiveSleepDecision::Sleep { sleep_secs: 30 });
     }
 
     #[test]
     fn predictive_sleep_gate_blocks_when_feature_is_disabled() {
-        let decision = predictive_sleep_decision(true, Duration::from_secs(0), false, 45, 100, 100);
+        let decision =
+            predictive_sleep_decision(true, Duration::from_secs(0), false, 45, 100, false, 100);
         assert_eq!(decision, PredictiveSleepDecision::PredictiveSleepDisabled);
     }
 
     #[test]
     fn predictive_sleep_gate_blocks_until_ui_idle_deadline_elapsed() {
-        let decision = predictive_sleep_decision(true, Duration::from_secs(0), true, 45, 100, 101);
+        let decision =
+            predictive_sleep_decision(true, Duration::from_secs(0), true, 45, 100, false, 101);
         assert_eq!(
             decision,
             PredictiveSleepDecision::UiIdleDeadlineNotElapsed {
@@ -130,8 +142,16 @@ mod tests {
     }
 
     #[test]
+    fn predictive_sleep_gate_blocks_when_ota_update_is_in_progress() {
+        let decision =
+            predictive_sleep_decision(true, Duration::from_secs(0), true, 45, 100, true, 100);
+        assert_eq!(decision, PredictiveSleepDecision::OTAUpdateInProgress);
+    }
+
+    #[test]
     fn predictive_sleep_gate_uses_valid_sleep_path() {
-        let decision = predictive_sleep_decision(true, Duration::from_secs(0), true, 45, 101, 100);
+        let decision =
+            predictive_sleep_decision(true, Duration::from_secs(0), true, 45, 101, false, 100);
         assert_eq!(decision, PredictiveSleepDecision::Sleep { sleep_secs: 45 });
     }
 

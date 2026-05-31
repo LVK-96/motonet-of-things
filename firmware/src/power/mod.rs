@@ -9,9 +9,12 @@ use crate::messages::{
     POWER_UI_IDLE_TIMEOUT_MAX_SECS, POWER_UI_IDLE_TIMEOUT_MIN_SECS, PowerSettings,
 };
 
+mod ota_sleep_block;
 mod persistence;
 mod policy;
 mod sleep;
+
+pub use ota_sleep_block::OtaUpdateGuard;
 
 static PREDICTIVE_SLEEP_ENABLED: AtomicBool =
     AtomicBool::new(DEFAULT_POWER_SETTINGS.predictive_sleep_enabled);
@@ -87,6 +90,11 @@ pub fn predictive_sleep_enabled() -> bool {
 
 pub fn notify_ui_activity() {
     policy::notify_ui_activity();
+}
+
+#[must_use]
+pub fn ota_update_in_progress() -> bool {
+    ota_sleep_block::ota_update_in_progress()
 }
 
 #[must_use]

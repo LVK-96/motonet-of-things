@@ -73,6 +73,7 @@ pub(super) fn maybe_sleep_after_publish(
         settings.predictive_sleep_enabled,
         settings.sleep_duration_secs,
         now,
+        super::ota_update_in_progress(),
         idle_deadline,
     );
 
@@ -96,6 +97,9 @@ pub(super) fn maybe_sleep_after_publish(
                 "PowerSave: skip deep sleep (UI idle deadline {}s remaining)",
                 idle_remaining_secs
             );
+        }
+        PredictiveSleepDecision::OTAUpdateInProgress => {
+            info!("PowerSave: skip deep sleep (OTA update in progress)");
         }
         PredictiveSleepDecision::Sleep { sleep_secs } => {
             info!(
