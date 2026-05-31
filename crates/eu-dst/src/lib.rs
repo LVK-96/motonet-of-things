@@ -198,7 +198,7 @@ fn last_sunday_of_month(year: u32, month: u32) -> u32 {
 
     let h = (day + ((13 * (m + 1)) / 5) + k + (k / 4) + (j / 4) + (5 * j)) % 7;
     // Convert to: 0 = Sunday, 1 = Monday, ..., 6 = Saturday
-    let dow = ((h + 6) % 7) as u32;
+    let dow = (h + 6) % 7;
 
     // Find last Sunday
     if dow == 0 {
