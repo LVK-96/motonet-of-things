@@ -2,8 +2,8 @@ use core::future::pending;
 
 use embassy_executor::Spawner;
 
-mod hw_context;
 mod hardware;
+mod hw_context;
 mod spawn;
 
 pub async fn run(spawner: Spawner) -> ! {

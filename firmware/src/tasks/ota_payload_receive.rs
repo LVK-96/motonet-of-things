@@ -1,21 +1,17 @@
 use crate::network;
-use defmt::{info, warn, Debug2Format};
-use embassy_time::{Duration};
+use defmt::{Debug2Format, info, warn};
 use embassy_net::{IpListenEndpoint, tcp::TcpSocket};
+use embassy_time::Duration;
 
 const OTA_TCP_PORT: u16 = 7777;
 
 #[embassy_executor::task]
-pub async fn ota_payload_receive_task(
-    network_stack: embassy_net::Stack<'static>
-) {
+pub async fn ota_payload_receive_task(network_stack: embassy_net::Stack<'static>) {
     network::wait_for_config_up(network_stack).await;
     ota_tcp_server(network_stack).await;
 }
 
-async fn ota_tcp_server(
-    network_stack: embassy_net::Stack<'static>
-) {
+async fn ota_tcp_server(network_stack: embassy_net::Stack<'static>) {
     let mut rx_buf = [0u8; 4096];
     let mut tx_buf = [0u8; 4096];
 
@@ -23,7 +19,11 @@ async fn ota_tcp_server(
     socket.set_timeout(Some(Duration::from_secs(10)));
 
     if let Some(config) = network_stack.config_v4() {
-        info!("Starting OTA TCP server @ {}:{}", Debug2Format(&config.address), OTA_TCP_PORT);
+        info!(
+            "Starting OTA TCP server @ {}:{}",
+            Debug2Format(&config.address),
+            OTA_TCP_PORT
+        );
     }
 
     loop {
@@ -39,7 +39,10 @@ async fn ota_tcp_server(
             .await;
 
         if let Err(e) = accept_connection {
-            warn!("Failed to accept OTA TCP connection: {:?}", Debug2Format(&e));
+            warn!(
+                "Failed to accept OTA TCP connection: {:?}",
+                Debug2Format(&e)
+            );
             continue;
         }
 
@@ -47,7 +50,7 @@ async fn ota_tcp_server(
     }
 }
 
-async fn serve_one_ota_connection(socket:&mut TcpSocket<'_>) {
+async fn serve_one_ota_connection(socket: &mut TcpSocket<'_>) {
     info!("Accepted OTA TCP connection");
     let mut payload_buf = [0u8; 1024];
     loop {

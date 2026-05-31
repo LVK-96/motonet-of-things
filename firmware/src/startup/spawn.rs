@@ -5,8 +5,8 @@ use crate::app_bus;
 use crate::startup::hw_context::HWContext;
 use crate::tasks::{
     display as display_task, led_pwm as led_pwm_task, mqtt as mqtt_task,
-    radio_433 as radio_433_task, time_sync as time_sync_task,
-    ota_payload_receive as ota_payload_receive_task,
+    ota_payload_receive as ota_payload_receive_task, radio_433 as radio_433_task,
+    time_sync as time_sync_task,
 };
 
 #[allow(clippy::expect_used)]

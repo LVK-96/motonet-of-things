@@ -8,8 +8,8 @@ pub mod display;
 pub mod led_pwm;
 pub mod mqtt;
 pub mod network_supervisor;
+pub mod ota_payload_receive;
 pub mod radio_433;
 pub mod time_sync;
-pub mod ota_payload_receive;
 
 pub type TelemetryReceiver = Receiver<'static, CriticalSectionRawMutex, RadioReading, 16>;
