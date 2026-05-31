@@ -3,7 +3,7 @@ target = "xtensa-esp32-none-elf"
 extraArgs = ["-Zbuild-std=core,alloc"]
 
 [check]
-command = "clippy"
+command = "check"
 extraArgs = ["-Zbuild-std=core,alloc"]
 allTargets = false
 
