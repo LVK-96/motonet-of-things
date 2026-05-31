@@ -24,7 +24,7 @@ use crate::tasks::network_supervisor as network_supervisor_task;
 use crate::ui_input::EC11RotaryEncoderInput;
 use crate::with_retry;
 
-pub(crate) struct StartupContext {
+pub(crate) struct HWContext {
     pub(crate) led_channel: Option<LedcChannel<'static, LowSpeed>>,
     pub(crate) network_stack: embassy_net::Stack<'static>,
     pub(crate) display: Sh1106Display<I2c<'static, Blocking>>,
@@ -38,7 +38,7 @@ pub(crate) struct StartupContext {
 }
 
 #[allow(clippy::expect_used)]
-pub(crate) async fn compose(spawner: &Spawner) -> StartupContext {
+pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
     static RADIO_CONTROLLER: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
     #[cfg(feature = "pulse_rmt")]
     static SHARED_RADIO: StaticCell<Mutex<CriticalSectionRawMutex, Cc1101Radio>> =
@@ -99,7 +99,7 @@ pub(crate) async fn compose(spawner: &Spawner) -> StartupContext {
         error!("LED hardware setup failed, skipping LED task.");
     }
 
-    StartupContext {
+    HWContext {
         led_channel,
         network_stack,
         display,
