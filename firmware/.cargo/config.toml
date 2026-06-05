@@ -4,7 +4,7 @@ target = "xtensa-esp32-none-elf"
 rustflags = ["-C", "link-arg=-nostartfiles"]
 
 [target.xtensa-esp32-none-elf]
-runner = "espflash flash --monitor --log-format defmt"
+runner = "espflash flash --monitor --log-format defmt --partition-table partitions.csv"
 
 [unstable]
 build-std = ["core", "alloc"]
