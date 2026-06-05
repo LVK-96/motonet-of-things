@@ -7,6 +7,8 @@ set -euo pipefail
 BROKER_PORT_PLAIN=1883
 BROKER_PORT_TLS=8883
 TOPIC="sensors/rubicson/#"
+DEVICE_ID="${DEVICE_ID:-test-sensor}"
+OTA_MANIFEST_FILE="${OTA_MANIFEST_FILE:-}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TLS_DIR="$SCRIPT_DIR/.mqtt-test-tls"
 CA_KEY="$TLS_DIR/ca.key"
@@ -28,13 +30,14 @@ BROKER_PID=""
 usage() {
     cat <<EOF
 Usage:
-  $0 [broker|sub|pub|all] [plain|tls]
+  $0 [broker|sub|pub|ota|all] [plain|tls]
   $0 [plain|tls]
 
 Commands:
   broker  Start broker only
   sub     Start subscriber (auto-starts broker if needed)
-  pub     Publish a test message
+  pub     Publish a telemetry test message
+  ota     Publish an OTA smoke-test manifest to motonet/\$DEVICE_ID/cmd/ota
   all     Start broker + subscriber (default)
 
 Modes:
@@ -45,8 +48,15 @@ Examples:
   $0
   $0 broker
   $0 pub plain
+  $0 ota plain
+  DEVICE_ID=test-sensor $0 ota tls
+  OTA_MANIFEST_FILE=manifest.json $0 ota plain
   $0 all tls
   $0 sub tls
+
+OTA smoke-test customization:
+  DEVICE_ID          Target device id (default: test-sensor)
+  OTA_MANIFEST_FILE  Optional manifest JSON file. If unset, sends a dummy manifest-shaped payload.
 
 TLS customization (mode=tls):
   MQTT_TEST_TLS_SERVER_CN   Certificate Common Name (default: localhost)
@@ -235,6 +245,43 @@ run_publisher() {
     echo "Done"
 }
 
+ota_command_topic() {
+    printf 'motonet/%s/cmd/ota\n' "$DEVICE_ID"
+}
+
+default_ota_manifest() {
+    cat <<EOF
+{"schema":1,"key_id":1001,"target":"motonet-of-things/esp32","chip":"esp32-wroom","version":"0.0.0-smoke","build":1,"force":false,"url":"http://127.0.0.1:8000/firmware.bin","size":1234567,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","signature":"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}
+EOF
+}
+
+run_ota_publisher() {
+    require_cmd mosquitto_pub
+
+    local ota_topic
+    ota_topic="$(ota_command_topic)"
+
+    local pub_args=(-h localhost)
+    if [[ "$MODE" == "tls" ]]; then
+        ensure_tls_assets
+        echo "Publishing OTA smoke manifest over TLS to $ota_topic ..."
+        pub_args+=(-p "$BROKER_PORT_TLS" --cafile "$CA_CERT")
+    else
+        echo "Publishing OTA smoke manifest to $ota_topic ..."
+        pub_args+=(-p "$BROKER_PORT_PLAIN")
+    fi
+
+    pub_args+=(-t "$ota_topic")
+    if [[ -n "$OTA_MANIFEST_FILE" ]]; then
+        pub_args+=(-f "$OTA_MANIFEST_FILE")
+    else
+        pub_args+=(-m "$(default_ota_manifest)")
+    fi
+
+    mosquitto_pub "${pub_args[@]}"
+    echo "Done"
+}
+
 COMMAND="${1:-all}"
 MODE="${2:-plain}"
 
@@ -249,7 +296,7 @@ if [[ "$COMMAND" == "help" || "$COMMAND" == "--help" || "$COMMAND" == "-h" ]]; t
 fi
 
 case "$COMMAND" in
-    broker|sub|pub|all)
+    broker|sub|pub|ota|all)
         ;;
     *)
         usage
@@ -277,6 +324,9 @@ case "$COMMAND" in
         ;;
     pub)
         run_publisher
+        ;;
+    ota)
+        run_ota_publisher
         ;;
     all)
         echo "Starting broker in background and subscriber in foreground..."

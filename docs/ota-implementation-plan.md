@@ -212,7 +212,7 @@ Test key only. Never trusted by release firmware.
 Add to `firmware/src/secrets.rs.example`:
 
 ```rust
-pub const DEVICE_ID: &str = "garage-sensor-01";
+pub const DEVICE_ID: &str = "test-sensor";
 ```
 
 MQTT topics:
@@ -366,7 +366,7 @@ Example flow:
 scripts/ota-build-image.sh
 scripts/ota-serve.sh target/.../firmware.bin
 scripts/ota-send-manifest.sh \
-  --device garage-sensor-01 \
+  --device test-sensor \
   --url http://HOST:PORT/firmware.bin
 ```
 

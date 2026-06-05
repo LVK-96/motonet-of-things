@@ -498,12 +498,12 @@ mod tests {
     #[test]
     fn ota_topics_are_derived_from_device_id() {
         assert_eq!(
-            status_topic("garage-sensor-01").map(|topic| topic.to_string()),
-            Ok("motonet/garage-sensor-01/status".to_owned())
+            status_topic("test-sensor").map(|topic| topic.to_string()),
+            Ok("motonet/test-sensor/status".to_owned())
         );
         assert_eq!(
-            ota_command_topic("garage-sensor-01").map(|topic| topic.to_string()),
-            Ok("motonet/garage-sensor-01/cmd/ota".to_owned())
+            ota_command_topic("test-sensor").map(|topic| topic.to_string()),
+            Ok("motonet/test-sensor/cmd/ota".to_owned())
         );
     }
 
