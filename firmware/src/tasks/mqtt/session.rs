@@ -1,3 +1,5 @@
+use core::fmt::Write;
+
 use defmt::{info, warn};
 use embassy_net::Ipv4Address;
 use embassy_net::tcp::TcpSocket;
@@ -19,16 +21,22 @@ use rust_mqtt::types::{MqttBinary, MqttString, TopicName};
 use crate::network;
 use crate::power;
 use crate::secrets::{
-    MQTT_BROKER_HOSTNAME, MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID, MQTT_PASSWORD,
-    MQTT_TLS_CA_CERT_DER, MQTT_TLS_FALLBACK_UNIX_TIME_SECS, MQTT_USERNAME,
+    DEVICE_ID, MQTT_BROKER_HOSTNAME, MQTT_BROKER_IP, MQTT_BROKER_PORT, MQTT_CLIENT_ID,
+    MQTT_PASSWORD, MQTT_TLS_CA_CERT_DER, MQTT_TLS_FALLBACK_UNIX_TIME_SECS, MQTT_USERNAME,
 };
 use crate::time_sync::TIME_WATCH;
 
 use super::{PlainClient, TlsClient};
 
 const MQTT_SOCKET_TIMEOUT_SECS: u64 = 30;
-const STATUS_TOPIC: &str = "sensors/rubicson/status";
+const MQTT_TOPIC_BUF_LEN: usize = 96;
 const MQTT_TLS_CERT_VERIFY_BUF_SIZE: usize = 4096;
+
+fn status_topic() -> Result<heapless::String<MQTT_TOPIC_BUF_LEN>, ()> {
+    let mut topic = heapless::String::new();
+    write!(topic, "motonet/{DEVICE_ID}/status").map_err(|_| ())?;
+    Ok(topic)
+}
 
 fn broker_addr() -> (Ipv4Address, u16) {
     (
@@ -42,7 +50,7 @@ fn broker_addr() -> (Ipv4Address, u16) {
     )
 }
 
-fn connect_options() -> Result<ConnectOptions<'static>, ()> {
+fn connect_options<'a>(status_topic: &'a str) -> Result<ConnectOptions<'a>, ()> {
     let user_name = MQTT_USERNAME
         .map(|name| {
             MqttString::try_from(name).map_err(|_| {
@@ -58,7 +66,7 @@ fn connect_options() -> Result<ConnectOptions<'static>, ()> {
         })
         .transpose()?;
 
-    let status_topic = MqttString::try_from(STATUS_TOPIC).map_err(|_| ())?;
+    let status_topic = MqttString::try_from(status_topic).map_err(|_| ())?;
     let status_topic_name = TopicName::new_unchecked(status_topic);
     let lwt = WillOptions::new(
         status_topic_name,
@@ -127,7 +135,8 @@ async fn connect_broker_and_publish_online<'a, N>(
 where
     N: AsyncRead + AsyncWrite,
 {
-    let connect_options = connect_options()?;
+    let status_topic = status_topic()?;
+    let connect_options = connect_options(status_topic.as_str())?;
     let client_id = MqttString::try_from(MQTT_CLIENT_ID).map_or_else(
         |_| {
             warn!("MQTT: Invalid client_id in secrets; omitting client_id in CONNECT");
@@ -164,8 +173,8 @@ where
     );
     unsafe { client.buffer_mut().reset() };
 
-    let status_topic = MqttString::try_from(STATUS_TOPIC).map_err(|_| ())?;
-    let status_topic_name = TopicName::new_unchecked(status_topic);
+    let status_topic_name =
+        TopicName::new_unchecked(MqttString::try_from(status_topic.as_str()).map_err(|_| ())?);
     let online_options = PublicationOptions::new(TopicReference::Name(status_topic_name)).retain();
     let online_publish_at = Instant::now();
 
