@@ -24,6 +24,7 @@ rubicson = { path = "../crates/rubicson" }
 eu-dst = { path = "../crates/eu-dst" }
 karu-menu = { path = "../crates/karu-menu" }
 app-core = { path = "../crates/app-core" }
+ota-core = { path = "../crates/ota-core" }
 telemetry-core = { path = "../crates/telemetry-core" }
 
 defmt = "1.1.0"

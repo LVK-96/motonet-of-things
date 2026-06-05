@@ -1,5 +1,3 @@
-use core::fmt::Write;
-
 use defmt::{info, warn};
 use embassy_net::Ipv4Address;
 use embassy_net::tcp::TcpSocket;
@@ -33,19 +31,14 @@ use crate::time_sync::TIME_WATCH;
 use super::{PlainClient, TlsClient};
 
 const MQTT_SOCKET_TIMEOUT_SECS: u64 = 30;
-const MQTT_TOPIC_BUF_LEN: usize = 96;
 const MQTT_TLS_CERT_VERIFY_BUF_SIZE: usize = 4096;
 
-fn status_topic() -> Result<heapless::String<MQTT_TOPIC_BUF_LEN>, ()> {
-    let mut topic = heapless::String::new();
-    write!(topic, "motonet/{DEVICE_ID}/status").map_err(|_| ())?;
-    Ok(topic)
+fn status_topic() -> Result<heapless::String<{ ota_core::MQTT_TOPIC_MAX_LEN }>, ()> {
+    ota_core::status_topic(DEVICE_ID).map_err(|_| ())
 }
 
-pub(super) fn ota_cmd_topic() -> Result<heapless::String<MQTT_TOPIC_BUF_LEN>, ()> {
-    let mut topic = heapless::String::new();
-    write!(topic, "motonet/{DEVICE_ID}/cmd/ota").map_err(|_| ())?;
-    Ok(topic)
+pub(super) fn ota_cmd_topic() -> Result<heapless::String<{ ota_core::MQTT_TOPIC_MAX_LEN }>, ()> {
+    ota_core::ota_command_topic(DEVICE_ID).map_err(|_| ())
 }
 
 fn broker_addr() -> (Ipv4Address, u16) {

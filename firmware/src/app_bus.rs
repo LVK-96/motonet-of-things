@@ -15,7 +15,7 @@ const MQTT_COMMAND_CHANNEL_DEPTH: usize = 16;
 const OTA_COMMAND_CHANNEL_DEPTH: usize = 1;
 const RADIO_TELEMETRY_CHANNEL_DEPTH: usize = 16;
 
-pub const OTA_MANIFEST_MAX_BYTES: usize = 1024;
+pub const OTA_MANIFEST_MAX_BYTES: usize = ota_core::MAX_MANIFEST_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MqttSessionState {

@@ -1,7 +1,15 @@
-//! OTA manifest validation and canonical JSON construction.
+#![cfg_attr(not(test), no_std)]
+
+//! Platform-independent OTA policy, state, manifest validation, and canonical JSON construction.
 //!
-//! Signature verification is abstracted behind [`SignatureVerifier`] and backed
-//! by an Ed25519 verifier for trusted manifest keyrings.
+//! Hardware-specific adapters (flash writes, boot metadata, reboot, networking)
+//! live outside this crate.
+
+extern crate alloc;
+
+use alloc::{format, string::String};
+use core::fmt::Write as _;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use ed25519_dalek::{Signature, Verifier as DalekVerifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -16,12 +24,205 @@ pub const MAX_VERSION_LEN: usize = 32;
 pub const MAX_TARGET_LEN: usize = 48;
 pub const MAX_CHIP_LEN: usize = 24;
 pub const MAX_REDIRECTS: usize = 3;
+pub const MQTT_TOPIC_MAX_LEN: usize = 96;
+pub const OTA_CONFIRMATION_DELAY_SECS: u32 = 30;
 pub const SHA256_HEX_LEN: usize = 64;
 pub const ED25519_SIGNATURE_HEX_LEN: usize = 128;
 pub const DEV_TEST_KEY_ID: u32 = 1001;
 pub const RELEASE_KEY_ID: u32 = 1;
 pub const DEV_TEST_PUBLIC_KEY_HEX: &str =
     "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
+
+static OTA_STATE: AtomicU8 = AtomicU8::new(OtaState::Inactive.as_u8());
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OtaState {
+    Inactive = 0,
+    Downloading = 1,
+    Applying = 2,
+    PendingConfirmation = 3,
+}
+
+impl OtaState {
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl From<u8> for OtaState {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::Downloading,
+            2 => Self::Applying,
+            3 => Self::PendingConfirmation,
+            _ => Self::Inactive,
+        }
+    }
+}
+
+#[must_use]
+pub fn ota_state() -> OtaState {
+    OTA_STATE.load(Ordering::Relaxed).into()
+}
+
+pub fn set_ota_state(state: OtaState) {
+    OTA_STATE.store(state.as_u8(), Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn ota_confirmation_pending() -> bool {
+    ota_state() == OtaState::PendingConfirmation
+}
+
+#[must_use]
+pub fn ota_sleep_blocked() -> bool {
+    ota_state() != OtaState::Inactive
+}
+
+#[must_use]
+pub fn ota_update_in_progress() -> bool {
+    matches!(ota_state(), OtaState::Downloading | OtaState::Applying)
+}
+
+pub fn arm_rollback_test_pending_confirmation() {
+    set_ota_state(OtaState::PendingConfirmation);
+}
+
+#[must_use]
+pub struct OtaUpdateGuard;
+
+impl OtaUpdateGuard {
+    pub fn begin_download() -> Self {
+        set_ota_state(OtaState::Downloading);
+        Self
+    }
+
+    pub fn begin_apply() -> Self {
+        set_ota_state(OtaState::Applying);
+        Self
+    }
+}
+
+impl Drop for OtaUpdateGuard {
+    fn drop(&mut self) {
+        set_ota_state(OtaState::Inactive);
+    }
+}
+
+#[must_use]
+pub struct PendingConfirmationGuard;
+
+impl PendingConfirmationGuard {
+    pub fn begin() -> Self {
+        set_ota_state(OtaState::PendingConfirmation);
+        Self
+    }
+
+    pub fn confirm(self) {
+        set_ota_state(OtaState::Inactive);
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for PendingConfirmationGuard {
+    fn drop(&mut self) {
+        set_ota_state(OtaState::PendingConfirmation);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OtaConfirmationGate {
+    required_uptime_secs: u32,
+    wifi_connected: bool,
+    mqtt_connected: bool,
+    heartbeat_published: bool,
+}
+
+impl OtaConfirmationGate {
+    #[must_use]
+    pub const fn new(required_uptime_secs: u32) -> Self {
+        Self {
+            required_uptime_secs,
+            wifi_connected: false,
+            mqtt_connected: false,
+            heartbeat_published: false,
+        }
+    }
+
+    pub fn note_wifi_connected(&mut self) {
+        self.wifi_connected = true;
+    }
+
+    pub fn note_wifi_disconnected(&mut self) {
+        self.wifi_connected = false;
+        self.mqtt_connected = false;
+        self.heartbeat_published = false;
+    }
+
+    pub fn note_mqtt_connected(&mut self) {
+        self.mqtt_connected = true;
+    }
+
+    pub fn note_mqtt_disconnected(&mut self) {
+        self.mqtt_connected = false;
+        self.heartbeat_published = false;
+    }
+
+    pub fn note_heartbeat_published(&mut self) {
+        self.heartbeat_published = true;
+    }
+
+    #[must_use]
+    pub const fn required_uptime_secs(&self) -> u32 {
+        self.required_uptime_secs
+    }
+
+    #[must_use]
+    pub const fn ready_to_confirm(&self, uptime_secs: u32) -> bool {
+        self.wifi_connected
+            && self.mqtt_connected
+            && self.heartbeat_published
+            && uptime_secs >= self.required_uptime_secs
+    }
+}
+
+impl Default for OtaConfirmationGate {
+    fn default() -> Self {
+        Self::new(OTA_CONFIRMATION_DELAY_SECS)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicError {
+    DeviceIdTooLong,
+}
+
+/// Build the retained online/offline status topic for a device.
+///
+/// # Errors
+///
+/// Returns [`TopicError::DeviceIdTooLong`] if the device id does not fit the
+/// fixed MQTT topic buffer.
+pub fn status_topic(device_id: &str) -> Result<heapless::String<MQTT_TOPIC_MAX_LEN>, TopicError> {
+    let mut topic = heapless::String::new();
+    write!(topic, "motonet/{device_id}/status").map_err(|_| TopicError::DeviceIdTooLong)?;
+    Ok(topic)
+}
+
+/// Build the signed OTA manifest command topic for a device.
+///
+/// # Errors
+///
+/// Returns [`TopicError::DeviceIdTooLong`] if the device id does not fit the
+/// fixed MQTT topic buffer.
+pub fn ota_command_topic(
+    device_id: &str,
+) -> Result<heapless::String<MQTT_TOPIC_MAX_LEN>, TopicError> {
+    let mut topic = heapless::String::new();
+    write!(topic, "motonet/{device_id}/cmd/ota").map_err(|_| TopicError::DeviceIdTooLong)?;
+    Ok(topic)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -216,7 +417,7 @@ impl OtaManifest {
     ///
     /// Returns [`ManifestError::Malformed`] if canonical JSON construction fails.
     pub fn canonical_unsigned_json(&self) -> Result<String, ManifestError> {
-        canonical_unsigned_json(self).map_err(|_| ManifestError::Malformed)
+        canonical_unsigned_json(self)
     }
 
     /// Return canonical signed JSON including the `signature` field.
@@ -225,7 +426,7 @@ impl OtaManifest {
     ///
     /// Returns [`ManifestError::Malformed`] if canonical JSON construction fails.
     pub fn canonical_signed_json(&self) -> Result<String, ManifestError> {
-        canonical_signed_json(self).map_err(|_| ManifestError::Malformed)
+        canonical_signed_json(self)
     }
 }
 
@@ -237,11 +438,11 @@ fn validate_len(field: &'static str, value: &str, max: usize) -> Result<(), Mani
     }
 }
 
-fn json_string(value: &str) -> Result<String, serde_json::Error> {
-    serde_json::to_string(value)
+fn json_string(value: &str) -> Result<String, ManifestError> {
+    serde_json::to_string(value).map_err(|_| ManifestError::Malformed)
 }
 
-fn canonical_unsigned_json(manifest: &OtaManifest) -> Result<String, serde_json::Error> {
+fn canonical_unsigned_json(manifest: &OtaManifest) -> Result<String, ManifestError> {
     Ok(format!(
         "{{\"schema\":{},\"key_id\":{},\"target\":{},\"chip\":{},\"version\":{},\"build\":{},\"force\":{},\"url\":{},\"size\":{},\"sha256\":{}}}",
         manifest.schema,
@@ -257,14 +458,19 @@ fn canonical_unsigned_json(manifest: &OtaManifest) -> Result<String, serde_json:
     ))
 }
 
-fn canonical_signed_json(manifest: &OtaManifest) -> Result<String, serde_json::Error> {
-    let unsigned = canonical_unsigned_json(manifest)?;
-    let prefix = unsigned.strip_suffix('}').ok_or_else(|| {
-        serde_json::Error::io(std::io::Error::other("canonical object missing terminator"))
-    })?;
+fn canonical_signed_json(manifest: &OtaManifest) -> Result<String, ManifestError> {
     Ok(format!(
-        "{},\"signature\":{}}}",
-        prefix,
+        "{{\"schema\":{},\"key_id\":{},\"target\":{},\"chip\":{},\"version\":{},\"build\":{},\"force\":{},\"url\":{},\"size\":{},\"sha256\":{},\"signature\":{}}}",
+        manifest.schema,
+        manifest.key_id,
+        json_string(&manifest.target)?,
+        json_string(&manifest.chip)?,
+        json_string(&manifest.version)?,
+        manifest.build,
+        manifest.force,
+        json_string(&manifest.url)?,
+        manifest.size,
+        json_string(&manifest.sha256)?,
         json_string(&manifest.signature)?
     ))
 }
@@ -287,6 +493,71 @@ mod tests {
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
             signature: "00".repeat(64),
         }
+    }
+
+    #[test]
+    fn ota_topics_are_derived_from_device_id() {
+        assert_eq!(
+            status_topic("garage-sensor-01").map(|topic| topic.to_string()),
+            Ok("motonet/garage-sensor-01/status".to_owned())
+        );
+        assert_eq!(
+            ota_command_topic("garage-sensor-01").map(|topic| topic.to_string()),
+            Ok("motonet/garage-sensor-01/cmd/ota".to_owned())
+        );
+    }
+
+    #[test]
+    fn ota_state_distinguishes_update_from_pending_confirmation() {
+        set_ota_state(OtaState::Inactive);
+        assert!(!ota_sleep_blocked());
+        assert!(!ota_update_in_progress());
+
+        set_ota_state(OtaState::Downloading);
+        assert!(ota_sleep_blocked());
+        assert!(ota_update_in_progress());
+
+        set_ota_state(OtaState::PendingConfirmation);
+        assert!(ota_sleep_blocked());
+        assert!(ota_confirmation_pending());
+        assert!(!ota_update_in_progress());
+
+        set_ota_state(OtaState::Inactive);
+    }
+
+    #[test]
+    fn confirmation_requires_all_health_signals_and_delay() {
+        let mut gate = OtaConfirmationGate::default();
+        assert!(!gate.ready_to_confirm(OTA_CONFIRMATION_DELAY_SECS));
+
+        gate.note_wifi_connected();
+        assert!(!gate.ready_to_confirm(OTA_CONFIRMATION_DELAY_SECS));
+
+        gate.note_mqtt_connected();
+        assert!(!gate.ready_to_confirm(OTA_CONFIRMATION_DELAY_SECS));
+
+        gate.note_heartbeat_published();
+        assert!(!gate.ready_to_confirm(OTA_CONFIRMATION_DELAY_SECS - 1));
+        assert!(gate.ready_to_confirm(OTA_CONFIRMATION_DELAY_SECS));
+    }
+
+    #[test]
+    fn lost_connections_clear_dependent_health() {
+        let mut gate = OtaConfirmationGate::default();
+        gate.note_wifi_connected();
+        gate.note_mqtt_connected();
+        gate.note_heartbeat_published();
+        assert!(gate.ready_to_confirm(OTA_CONFIRMATION_DELAY_SECS));
+
+        gate.note_mqtt_disconnected();
+        gate.note_mqtt_connected();
+        assert!(!gate.ready_to_confirm(OTA_CONFIRMATION_DELAY_SECS));
+        gate.note_heartbeat_published();
+        assert!(gate.ready_to_confirm(OTA_CONFIRMATION_DELAY_SECS));
+
+        gate.note_wifi_disconnected();
+        gate.note_wifi_connected();
+        assert!(!gate.ready_to_confirm(OTA_CONFIRMATION_DELAY_SECS));
     }
 
     #[test]

@@ -10,9 +10,10 @@ dev-ota = []
 release-ota = []
 
 [dependencies]
-ed25519-dalek = "2.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc", "fast"] }
+heapless = "0.9"
+serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 
 [lints]
 workspace = true

@@ -13,7 +13,9 @@ The device receives a signed OTA manifest over MQTT, downloads the app image fro
 - Assume 4 MiB ESP32-WROOM flash.
 - Use two 1.75 MiB OTA slots.
 - Leave remaining flash unused for now.
-- Use `esp_bootloader_esp_idf::ota_updater::OtaUpdater` for partition and OTA metadata handling.
+- Keep OTA policy, manifest validation, signing, state transitions, topic construction, and health confirmation in the platform-independent `crates/ota-core` crate.
+- Keep firmware limited to hardware/platform adapters: MQTT/TLS transport, HTTP client, ESP flash writes, ESP boot metadata, and reboot.
+- Use `esp_bootloader_esp_idf::ota_updater::OtaUpdater` only inside the firmware boot/flash adapter for partition and OTA metadata handling.
 - Use signed canonical JSON manifests.
 - Use Ed25519 signatures.
 - MQTT notification carries the full signed manifest.
@@ -245,19 +247,26 @@ Acceptance criteria:
 
 MQTT should hand off OTA work to a dedicated OTA task.
 
-OTA task owns:
+The dedicated OTA task is a firmware adapter around `ota-core`. `ota-core` owns platform-independent decisions and validation:
 
 - Manifest validation.
-- Maintenance mode.
-- HTTP(S) download.
-- Flash write.
-- SHA verification.
-- Slot activation.
-- Reboot/failure reporting.
+- Signature/key policy.
+- State transitions.
+- Maintenance-mode decision policy.
+- Size, SHA, image-magic, and slot-fit checks as pure policy.
+
+Firmware owns hardware/platform effects:
+
+- MQTT receive/publish adapter.
+- HTTP(S) download adapter.
+- ESP flash write adapter.
+- ESP OTA metadata/slot activation adapter.
+- Reboot/failure reporting adapter.
 
 Acceptance criteria:
 
 - MQTT and OTA responsibilities are separate.
+- Platform-independent OTA behavior is testable in `crates/ota-core` without ESP hardware.
 
 ## Phase 5: Local Dev OTA
 
