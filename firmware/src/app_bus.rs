@@ -12,7 +12,10 @@ const POWER_SETTINGS_WATCH_DEPTH: usize = 2;
 const APP_EVENT_CHANNEL_DEPTH: usize = 8;
 const APP_COMMAND_CHANNEL_DEPTH: usize = 16;
 const MQTT_COMMAND_CHANNEL_DEPTH: usize = 16;
+const OTA_COMMAND_CHANNEL_DEPTH: usize = 1;
 const RADIO_TELEMETRY_CHANNEL_DEPTH: usize = 16;
+
+pub const OTA_MANIFEST_MAX_BYTES: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MqttSessionState {
@@ -86,6 +89,11 @@ pub type MqttCommandSender =
     ChannelSender<'static, CriticalSectionRawMutex, AppCommand, MQTT_COMMAND_CHANNEL_DEPTH>;
 pub type MqttCommandReceiver =
     ChannelReceiver<'static, CriticalSectionRawMutex, AppCommand, MQTT_COMMAND_CHANNEL_DEPTH>;
+pub type OtaManifestBytes = heapless::Vec<u8, OTA_MANIFEST_MAX_BYTES>;
+pub type OtaCommandSender =
+    ChannelSender<'static, CriticalSectionRawMutex, OtaManifestBytes, OTA_COMMAND_CHANNEL_DEPTH>;
+pub type OtaCommandReceiver =
+    ChannelReceiver<'static, CriticalSectionRawMutex, OtaManifestBytes, OTA_COMMAND_CHANNEL_DEPTH>;
 pub type RadioTelemetrySender =
     ChannelSender<'static, CriticalSectionRawMutex, RadioReading, RADIO_TELEMETRY_CHANNEL_DEPTH>;
 pub type RadioTelemetryReceiver =
@@ -114,6 +122,11 @@ pub static MQTT_COMMAND_CHANNEL: Channel<
     CriticalSectionRawMutex,
     AppCommand,
     MQTT_COMMAND_CHANNEL_DEPTH,
+> = Channel::new();
+pub static OTA_COMMAND_CHANNEL: Channel<
+    CriticalSectionRawMutex,
+    OtaManifestBytes,
+    OTA_COMMAND_CHANNEL_DEPTH,
 > = Channel::new();
 pub static RADIO_TELEMETRY_CHANNEL: Channel<
     CriticalSectionRawMutex,

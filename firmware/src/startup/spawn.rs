@@ -4,7 +4,7 @@ use embassy_executor::{SpawnError, SpawnToken, Spawner};
 use crate::app_bus;
 use crate::startup::hw_context::HWContext;
 use crate::tasks::{
-    display as display_task, led_pwm as led_pwm_task, mqtt as mqtt_task,
+    display as display_task, led_pwm as led_pwm_task, mqtt as mqtt_task, ota as ota_task,
     ota_payload_receive as ota_payload_receive_task, radio_433 as radio_433_task,
     time_sync as time_sync_task,
 };
@@ -101,8 +101,18 @@ pub(crate) fn spawn_tasks(spawner: &Spawner, context: HWContext) {
 
     spawn_task(
         spawner,
-        mqtt_task::mqtt_task(network_stack, app_bus::MQTT_COMMAND_CHANNEL.receiver()),
+        mqtt_task::mqtt_task(
+            network_stack,
+            app_bus::MQTT_COMMAND_CHANNEL.receiver(),
+            app_bus::OTA_COMMAND_CHANNEL.sender(),
+        ),
         "Failed to spawn mqtt task",
+    );
+
+    spawn_task(
+        spawner,
+        ota_task::ota_task(app_bus::OTA_COMMAND_CHANNEL.receiver()),
+        "Failed to spawn OTA task",
     );
 
     spawn_task(

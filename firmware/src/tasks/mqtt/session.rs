@@ -14,10 +14,14 @@ use rand_core::RngCore;
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
-use rust_mqtt::client::options::{ConnectOptions, PublicationOptions, TopicReference, WillOptions};
+use rust_mqtt::client::event::Event;
+use rust_mqtt::client::options::{
+    ConnectOptions, PublicationOptions, SubscriptionOptions, TopicReference, WillOptions,
+};
 use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
-use rust_mqtt::types::{MqttBinary, MqttString, TopicName};
+use rust_mqtt::types::{MqttBinary, MqttString, QoS, TopicFilter, TopicName};
 
+use crate::app_bus;
 use crate::network;
 use crate::power;
 use crate::secrets::{
@@ -35,6 +39,12 @@ const MQTT_TLS_CERT_VERIFY_BUF_SIZE: usize = 4096;
 fn status_topic() -> Result<heapless::String<MQTT_TOPIC_BUF_LEN>, ()> {
     let mut topic = heapless::String::new();
     write!(topic, "motonet/{DEVICE_ID}/status").map_err(|_| ())?;
+    Ok(topic)
+}
+
+pub(super) fn ota_cmd_topic() -> Result<heapless::String<MQTT_TOPIC_BUF_LEN>, ()> {
+    let mut topic = heapless::String::new();
+    write!(topic, "motonet/{DEVICE_ID}/cmd/ota").map_err(|_| ())?;
     Ok(topic)
 }
 
@@ -131,6 +141,7 @@ async fn connect_tcp<'a>(
 async fn connect_broker_and_publish_online<'a, N>(
     client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
     transport: N,
+    ota_sender: &app_bus::OtaCommandSender,
 ) -> Result<(), ()>
 where
     N: AsyncRead + AsyncWrite,
@@ -196,7 +207,63 @@ where
         power::wake_reason_class(),
         online_publish_at.elapsed().as_millis()
     );
+
+    subscribe_ota_command_topic(client, ota_sender).await?;
     Ok(())
+}
+
+async fn subscribe_ota_command_topic<'a, N>(
+    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
+    ota_sender: &app_bus::OtaCommandSender,
+) -> Result<(), ()>
+where
+    N: AsyncRead + AsyncWrite,
+{
+    let ota_topic = ota_cmd_topic()?;
+    let topic_filter =
+        TopicFilter::new(MqttString::try_from(ota_topic.as_str()).map_err(|_| ())?).ok_or(())?;
+    let packet_identifier = client
+        .subscribe(
+            topic_filter,
+            SubscriptionOptions::new().qos(QoS::AtLeastOnce),
+        )
+        .await
+        .map_err(|e| {
+            warn!(
+                "MQTT: Failed to subscribe OTA command topic: {:?}",
+                defmt::Debug2Format(&e)
+            );
+        })?;
+
+    loop {
+        match client.poll().await.map_err(|e| {
+            warn!(
+                "MQTT: Failed while waiting for OTA SUBACK: {:?}",
+                defmt::Debug2Format(&e)
+            );
+        })? {
+            Event::Suback(suback) if suback.packet_identifier == packet_identifier => {
+                unsafe { client.buffer_mut().reset() };
+                if suback.reason_code.is_success() {
+                    info!("MQTT: Subscribed OTA command topic");
+                    return Ok(());
+                }
+                warn!(
+                    "MQTT: OTA command subscription rejected: {:?}",
+                    defmt::Debug2Format(&suback.reason_code)
+                );
+                return Err(());
+            }
+            Event::Publish(publish) => {
+                if let Some(manifest) = super::copy_ota_manifest(&publish, ota_topic.as_str()) {
+                    info!("MQTT: Received early OTA manifest command during subscribe setup");
+                    ota_sender.send(manifest).await;
+                }
+                unsafe { client.buffer_mut().reset() };
+            }
+            _ => unsafe { client.buffer_mut().reset() },
+        }
+    }
 }
 
 /// Sets up the MQTT client over plain TCP.
@@ -205,10 +272,11 @@ pub(super) async fn establish_mqtt_session_plain<'a>(
     rx_buffer: &'a mut [u8],
     tx_buffer: &'a mut [u8],
     client: &mut PlainClient<'a>,
+    ota_sender: &app_bus::OtaCommandSender,
 ) -> Result<(), ()> {
     info!("MQTT: Establishing plaintext MQTT session");
     let socket = connect_tcp(network_stack, rx_buffer, tx_buffer).await?;
-    connect_broker_and_publish_online(client, socket).await
+    connect_broker_and_publish_online(client, socket, ota_sender).await
 }
 
 struct MqttTlsClock;
@@ -291,6 +359,7 @@ pub(super) async fn establish_mqtt_session_tls<'a>(
     tls_record_read_buffer: &'a mut [u8],
     tls_record_write_buffer: &'a mut [u8],
     client: &mut TlsClient<'a>,
+    ota_sender: &app_bus::OtaCommandSender,
 ) -> Result<(), ()> {
     #[allow(clippy::const_is_empty)]
     if MQTT_TLS_CA_CERT_DER.is_empty() {
@@ -330,5 +399,5 @@ pub(super) async fn establish_mqtt_session_tls<'a>(
         "MQTT[TLS]: TLS handshake complete in {}ms",
         tls_open_at.elapsed().as_millis()
     );
-    connect_broker_and_publish_online(client, tls_socket).await
+    connect_broker_and_publish_online(client, tls_socket, ota_sender).await
 }
