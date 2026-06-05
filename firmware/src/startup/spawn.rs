@@ -5,8 +5,7 @@ use crate::app_bus;
 use crate::startup::hw_context::HWContext;
 use crate::tasks::{
     display as display_task, led_pwm as led_pwm_task, mqtt as mqtt_task, ota as ota_task,
-    ota_payload_receive as ota_payload_receive_task, radio_433 as radio_433_task,
-    time_sync as time_sync_task,
+    radio_433 as radio_433_task, time_sync as time_sync_task,
 };
 
 #[allow(clippy::expect_used, clippy::trivially_copy_pass_by_ref)]
@@ -113,12 +112,6 @@ pub(crate) fn spawn_tasks(spawner: &Spawner, context: HWContext) {
         spawner,
         ota_task::ota_task(app_bus::OTA_COMMAND_CHANNEL.receiver()),
         "Failed to spawn OTA task",
-    );
-
-    spawn_task(
-        spawner,
-        ota_payload_receive_task::ota_payload_receive_task(network_stack),
-        "Failed to spawn OTA payload receiver task",
     );
 
     spawn_task(

@@ -130,8 +130,8 @@ Verification matrix:
 
 | Command | Validates |
 | --- | --- |
-| `just test-host` | host `fmt`, host `clippy`, and host tests for `rubicson`, `eu-dst`, `karu-menu`, `app-core`, and `telemetry-core` |
+| `just test-host` | host `fmt`, host `clippy`, and host tests for `rubicson`, `eu-dst`, `karu-menu`, `app-core`, `telemetry-core`, and `ota-core` |
 | `just check-firmware` | firmware `cargo check` for `xtensa-esp32-none-elf` |
 | `just verify` | full host + firmware verification bundle |
-| `cargo clippy -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu -- -D warnings` | strict lint gate for host-only architecture/core crates |
-| `cargo test -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu` | host regression suite for core logic, including NTP list parsing |
+| `cargo clippy -p app-core -p telemetry-core -p ota-core --target x86_64-unknown-linux-gnu -- -D warnings` | strict lint gate for host-only architecture/core crates |
+| `cargo test -p app-core -p telemetry-core -p ota-core --target x86_64-unknown-linux-gnu` | host regression suite for core logic, including NTP list parsing and OTA policy/signing |

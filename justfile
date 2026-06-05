@@ -10,8 +10,8 @@ install-hooks:
 test-host:
     cp -n firmware/src/secrets.rs.example firmware/src/secrets.rs
     cargo +stable fmt --all --check
-    cargo +stable clippy -p rubicson -p eu-dst -p karu-menu -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu -- -D warnings
-    cargo +stable test -p rubicson -p eu-dst -p karu-menu -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu
+    cargo +stable clippy -p rubicson -p eu-dst -p karu-menu -p app-core -p telemetry-core -p ota-core --target x86_64-unknown-linux-gnu -- -D warnings
+    cargo +stable test -p rubicson -p eu-dst -p karu-menu -p app-core -p telemetry-core -p ota-core --target x86_64-unknown-linux-gnu
 
 esp-check:
     cp -n firmware/src/secrets.rs.example firmware/src/secrets.rs
