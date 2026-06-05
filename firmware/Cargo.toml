@@ -17,6 +17,7 @@ doctest = false
 default = ["pulse_rmt"]
 pulse_sw = []
 pulse_rmt = []
+ota-rollback-test = []
 
 [dependencies]
 rubicson = { path = "../crates/rubicson" }
@@ -35,6 +36,7 @@ esp-rtos = { version = "0.3.0", features = [
   "esp-radio",
 ] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["defmt", "esp32"] }
+embedded-storage = "0.3"
 embassy-executor = { version = "0.10.0", features = ["defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime-ms"] }
 embassy-sync = { version = "0.8.0", features = ["defmt"] }

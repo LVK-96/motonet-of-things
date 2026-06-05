@@ -6,6 +6,7 @@ pub enum OtaState {
     Inactive = 0,
     Downloading = 1,
     Applying = 2,
+    PendingConfirmation = 3,
 }
 
 impl OtaState {
@@ -17,6 +18,7 @@ impl OtaState {
         match value {
             1 => Self::Downloading,
             2 => Self::Applying,
+            3 => Self::PendingConfirmation,
             _ => Self::Inactive,
         }
     }
@@ -32,8 +34,24 @@ pub fn set_ota_state(state: OtaState) {
     OTA_STATE.store(state.as_u8(), Ordering::Relaxed);
 }
 
-pub fn ota_update_in_progress() -> bool {
+#[must_use]
+pub fn ota_confirmation_pending() -> bool {
+    ota_state() == OtaState::PendingConfirmation
+}
+
+#[must_use]
+pub fn ota_sleep_blocked() -> bool {
     ota_state() != OtaState::Inactive
+}
+
+#[must_use]
+pub fn ota_update_in_progress() -> bool {
+    matches!(ota_state(), OtaState::Downloading | OtaState::Applying)
+}
+
+#[cfg(feature = "ota-rollback-test")]
+pub fn arm_rollback_test_pending_confirmation() {
+    set_ota_state(OtaState::PendingConfirmation);
 }
 
 #[must_use]
@@ -51,6 +69,27 @@ impl OtaUpdateGuard {
 
     pub fn begin_apply() -> Self {
         Self::begin(OtaState::Applying)
+    }
+}
+
+#[must_use]
+pub struct PendingConfirmationGuard;
+
+impl PendingConfirmationGuard {
+    pub fn begin() -> Self {
+        set_ota_state(OtaState::PendingConfirmation);
+        Self
+    }
+
+    pub fn confirm(self) {
+        set_ota_state(OtaState::Inactive);
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for PendingConfirmationGuard {
+    fn drop(&mut self) {
+        set_ota_state(OtaState::PendingConfirmation);
     }
 }
 

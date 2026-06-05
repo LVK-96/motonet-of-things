@@ -70,7 +70,7 @@ pub fn maybe_sleep_after_publish(queue_empty: bool, time_since_mesaurement_recei
         settings.predictive_sleep_enabled,
         settings.sleep_duration_secs,
         now,
-        crate::ota::ota_update_in_progress(),
+        crate::ota::ota_sleep_blocked(),
         idle_deadline,
     );
 
@@ -96,7 +96,11 @@ pub fn maybe_sleep_after_publish(queue_empty: bool, time_since_mesaurement_recei
             );
         }
         PredictiveSleepDecision::OTAUpdateInProgress => {
-            info!("PowerSave: skip deep sleep (OTA update in progress)");
+            if crate::ota::ota_confirmation_pending() {
+                info!("PowerSave: skip deep sleep (OTA confirmation pending)");
+            } else {
+                info!("PowerSave: skip deep sleep (OTA update in progress)");
+            }
         }
         PredictiveSleepDecision::Sleep { sleep_secs } => {
             info!(
