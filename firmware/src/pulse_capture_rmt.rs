@@ -1,4 +1,5 @@
 use defmt::{info, warn};
+use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender as ChannelSender;
 use embassy_sync::mutex::Mutex;
@@ -7,6 +8,7 @@ use embassy_time::{Duration, Instant, Timer};
 use esp_hal::Async;
 use esp_hal::gpio::Level;
 use esp_hal::rmt::{Channel as RmtChannel, Error, PulseCode, Rx};
+use ota_core::{OtaState, is_radio_capture_allowed};
 
 use crate::messages::RadioReading;
 use crate::radio_433::Radio433;
@@ -91,25 +93,48 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
         }
     }
 
-    pub async fn run(&mut self) -> ! {
+    pub async fn run(&mut self, mut ota_state_receiver: crate::app_bus::OtaStateReceiver) -> ! {
         // Each symbol encodes two level-duration entries.
         let mut symbols = [PulseCode::default(); 512];
+        let mut quiesced = false;
 
         info!("PulseCapture(RMT): Ready, waiting for signal...");
 
         loop {
-            let symbol_count = match self.channel.receive(&mut symbols).await {
-                Ok(count) => count,
-                Err(Error::ReceiverError) => {
-                    // ReceiverError, assume buffer overflow and treat as end of capture
-                    // Even if the error was something else, we'll just try to decode what we got
-                    info!("RMT ReceiverError, treating as end of capture...");
-                    symbols.len()
+            while !is_radio_capture_allowed(
+                ota_state_receiver.try_get().unwrap_or(OtaState::Inactive),
+            ) {
+                if !quiesced {
+                    info!("PulseCapture(RMT): OTA active; pausing capture");
+                    quiesced = true;
                 }
-                Err(e) => {
-                    warn!("RMT error: {:?}", e);
-                    continue;
-                }
+                ota_state_receiver.changed().await;
+            }
+            if quiesced {
+                info!("PulseCapture(RMT): OTA inactive; resuming capture");
+                quiesced = false;
+            }
+
+            let receive_result = select(
+                self.channel.receive(&mut symbols),
+                ota_state_receiver.changed(),
+            )
+            .await;
+            let symbol_count = match receive_result {
+                Either::First(result) => match result {
+                    Ok(count) => count,
+                    Err(Error::ReceiverError) => {
+                        // ReceiverError, assume buffer overflow and treat as end of capture
+                        // Even if the error was something else, we'll just try to decode what we got
+                        info!("RMT ReceiverError, treating as end of capture...");
+                        symbols.len()
+                    }
+                    Err(e) => {
+                        warn!("RMT error: {:?}", e);
+                        continue;
+                    }
+                },
+                Either::Second(_) => continue,
             };
 
             if symbol_count >= (12 * 36) {
@@ -165,7 +190,14 @@ impl<'d, R: Radio433 + 'static> PulseCapture<'d, R> {
                         // Since the sensor sends 12 packets in a burst
                         // we want to avoid capturing the next packet in the same burst
                         // which would cause duplicate readings
-                        Timer::after(Duration::from_secs(45)).await;
+                        match select(
+                            Timer::after(Duration::from_secs(45)),
+                            ota_state_receiver.changed(),
+                        )
+                        .await
+                        {
+                            Either::First(()) | Either::Second(_) => {}
+                        }
                     }
                     Err(e) => {
                         info!("Decode failed: {:?}", e);

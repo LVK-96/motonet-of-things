@@ -192,12 +192,14 @@ Acceptance criteria:
 
 ### 9. Add committed dev test keypair
 
-Suggested path:
+Committed local-dev key material:
 
 ```text
-tools/ota/keys/dev_ed25519.key
-tools/ota/keys/dev_ed25519.pub
+tools/ota/keys/dev_ed25519.seed.hex
+tools/ota/keys/dev_ed25519.pub.hex
 ```
+
+The seed file is a raw 32-byte Ed25519 seed encoded as hex. Local shell tooling can wrap it as temporary PKCS#8 key material for `openssl` signing.
 
 Document clearly:
 
@@ -234,9 +236,9 @@ Current MQTT flow is publish-oriented. Add subscription/receive support.
 On OTA manifest received:
 
 1. Pass manifest bytes to the OTA task/channel.
-2. Publish `ota accepted` status if validation passes far enough.
-3. Publish `ota starting`.
-4. Disconnect/stand down for OTA maintenance mode.
+2. OTA task validates manifest authenticity/policy before entering maintenance mode.
+3. If the manifest is accepted, OTA task sets `RuntimeMode::OtaDownloading`.
+4. MQTT observes runtime mode, disconnects/stands down, and publishes `MqttSessionState::Disconnected` to a watch.
 
 Acceptance criteria:
 
@@ -272,52 +274,101 @@ Acceptance criteria:
 
 ### 13. Add OTA maintenance mode
 
-During OTA, keep only required systems active:
+Use two separate concepts:
 
-- Wi-Fi/network stack.
-- OTA HTTP client.
-- Flash writer.
-- Hash/signature verifier.
-- Minimal display/progress if useful.
+- `ota-core::OtaState`: OTA lifecycle/power policy (`Inactive`, `Downloading`, `Applying`, `PendingConfirmation`).
+- `app-core::RuntimeMode`: app-wide coordination surface observed by firmware tasks.
 
-Pause or suppress:
+Add `RuntimeMode` to `crates/app-core`:
 
-- 433MHz radio ingest.
-- Telemetry publishing.
-- MQTT reconnect loop.
-- Time sync.
-- UI menu interactions.
-- Deep sleep/power-saving decisions.
-- Verbose payload logging.
+```rust
+pub enum RuntimeMode {
+    Normal,
+    OtaDownloading,
+    OtaApplying,
+}
+```
+
+Add host-tested policy helpers in `app-core`, for example:
+
+```rust
+runtime_mode_allows_mqtt(mode)
+runtime_mode_allows_radio_capture(mode)
+runtime_mode_allows_ui_input(mode)
+runtime_mode_display_message(mode)
+```
+
+Expose runtime mode in firmware through a single watch in `firmware/src/app_bus.rs`. The OTA task is the only writer during OTA; MQTT, radio, display, and UI input are observers. This avoids direct OTA dependencies in those tasks.
+
+During `RuntimeMode::OtaDownloading`:
+
+- Wi-Fi/network stack remains active.
+- MQTT disconnects/stands down before HTTP download.
+- OTA task waits up to 5 seconds for `MqttSessionState::Disconnected`; if the timeout expires, it logs a warning and proceeds with HTTP download.
+- 433MHz radio capture/decoding pauses at task level. Add local radio quiesce/resume hooks that are initially no-ops/logging, so CC1101 sleep/reinitialization can be added later without changing OTA coordination.
+- Display shows a static OTA screen, e.g. `OTA download...`.
+- UI navigation/settings input is ignored.
+- Deep sleep remains blocked by the existing OTA state/guard.
+- Normal mode is restored after download verification succeeds or fails.
 
 Acceptance criteria:
 
-- Tasks observe `ota_update_in_progress()` and go quiet where needed.
+- Tasks depend on `app-core::RuntimeMode`/policy helpers, not on OTA task internals.
+- MQTT publishes `MqttSessionState` to a watch; OTA can wait for MQTT stand-down.
 - Device does not enter sleep during OTA.
+- Normal MQTT/radio/display/UI behavior resumes after OTA download verification ends.
 
 ### 14. Implement local HTTP download for dev OTA
 
 Dev OTA profile:
 
-- Allows `http://` local URLs.
-- Requires signed manifest using dev key.
-- Anti-rollback disabled.
+- Requires signed manifest using the committed dev key for this slice.
+- Anti-rollback is disabled/ignored for dev download verification.
+- URL policy is strict local HTTP only: `http://<ipv4>:<port>/<path>`.
+- Reject hostnames, HTTPS, missing port, empty path, query, fragment, and userinfo.
+- Use `reqwless` high-level `HttpClient` behind a firmware OTA download adapter.
+- Start with an IPv4-literal-only resolver boundary, structured so DNS support can be added later.
 - Streams body; never buffers full image.
+- Keeps the first 64 bytes of the image for header validation.
 
-Use 4 KiB chunks initially.
+HTTP response policy:
 
-Checks:
+- Accept `HTTP/1.0` or `HTTP/1.1` responses via the client.
+- Require status `200 OK`.
+- Require `Content-Length` exactly equal to manifest `size`.
+- Reject missing/mismatched `Content-Length`.
+- Reject `Transfer-Encoding: chunked` for this slice.
+- Reject redirects/non-200 responses.
 
+Pure policy in `ota-core`:
+
+- OTA URL policy validation.
+- ESP image prefix validation for the retained 64-byte prefix.
+
+ESP image prefix validation is conservative plausibility only:
+
+- Prefix is long enough for the basic image header.
+- Magic byte is `0xE9`.
+- Segment count is sane (`1..=16`).
+- Flash mode byte is a known ESP mode.
+- Flash size/frequency byte uses known nibbles.
+- Entry address is nonzero.
+
+Download verification checks:
+
+- Manifest parses and verifies before entering `RuntimeMode::OtaDownloading`.
 - Byte count equals manifest `size`.
 - SHA-256 matches manifest.
-- First byte is ESP image magic `0xE9`.
-- Image fits inactive slot.
+- Retained prefix passes `ota-core` ESP image prefix validation.
 
-Acceptance criteria:
+Download-only acceptance criteria:
 
+- Invalid/unsigned manifest is rejected without entering maintenance mode.
 - Failed download does not switch boot slot.
 - SHA mismatch is rejected.
-- Oversized image is rejected.
+- Size mismatch is rejected.
+- Invalid ESP image prefix is rejected.
+- Success/failure is logged only for this slice; MQTT OTA status publishing is deferred.
 
 ### 15. Write inactive OTA slot
 
@@ -350,29 +401,47 @@ Acceptance criteria:
 - Device boots into the new image.
 - New image confirms after health gate.
 
-### 17. Add local OTA scripts
+### 17. Add local OTA helper script commands
 
-Suggested scripts:
+Keep local OTA helper commands in `scripts/mqtt-test.sh` instead of adding separate scripts.
+
+Subcommands:
 
 ```text
-scripts/ota-build-image.sh
-scripts/ota-serve.sh
-scripts/ota-send-manifest.sh
+scripts/mqtt-test.sh ota-smoke [plain|tls]
+scripts/mqtt-test.sh ota-build
+scripts/mqtt-test.sh ota-serve [--file target/ota/firmware.bin] [--port 8000]
+scripts/mqtt-test.sh ota-send [plain|tls] --url http://HOST:8000/firmware.bin [--file target/ota/firmware.bin]
 ```
+
+Behavior:
+
+- Rename the current dummy `ota` MQTT smoke command to `ota-smoke`; no backwards-compatible `ota` alias is needed.
+- `ota-build` builds release firmware and uses `espflash save-image --chip esp32` to write an app image to `target/ota/firmware.bin`.
+- `ota-serve` defaults to `target/ota/firmware.bin`, creates a temporary served directory, exposes it as `/firmware.bin`, binds to `0.0.0.0`, and prints LAN URL hints plus a warning that the file is openly served on the LAN.
+- `ota-send` defaults to `target/ota/firmware.bin` if it exists and prints the file path, size, and SHA-256 being signed.
+- `ota-send` requires `--url`; if omitted, print suggested LAN URLs and fail instead of guessing on multi-interface hosts.
+- `ota-send` computes size with `wc -c`, SHA-256 with `sha256sum`, canonical JSON with `jq -cn`, signs with `openssl` using Ed25519, hex-encodes with `xxd`, and publishes with `mosquitto_pub`.
+- Dev signing defaults to `tools/ota/keys/dev_ed25519.seed.hex`, with an override for a different seed file.
+- `version` defaults to `git describe --always --dirty`; `build` defaults to `git rev-list --count HEAD`; both can be overridden.
+- The production manifest path can remain shell-based later, using CI-provided release key material instead of the committed dev seed.
 
 Example flow:
 
 ```bash
-scripts/ota-build-image.sh
-scripts/ota-serve.sh target/.../firmware.bin
-scripts/ota-send-manifest.sh \
-  --device test-sensor \
-  --url http://HOST:PORT/firmware.bin
+scripts/mqtt-test.sh broker tls
+scripts/mqtt-test.sh ota-build
+scripts/mqtt-test.sh ota-serve --port 8000
+scripts/mqtt-test.sh ota-send tls --url http://HOST:8000/firmware.bin
 ```
 
 Acceptance criteria:
 
-- Local script can OTA-update from dev build A to dev build B.
+- `ota-smoke` can still verify MQTT OTA routing with a dummy manifest-shaped payload.
+- `ota-build` produces an ESP app image suitable as an OTA payload.
+- `ota-serve` serves the built image as `/firmware.bin` from a LAN-reachable address.
+- `ota-send` publishes a signed dev manifest whose size/SHA match the served image.
+- Local script flow supports dev build A downloading and verifying dev build B before flash-writing is implemented.
 
 ## Phase 6: Hardware Rollback Verification
 
@@ -473,22 +542,39 @@ Acceptance criteria:
 - Dev/test private key is never used for release firmware.
 - Dev/test public key is not trusted by release firmware.
 
-## Minimum Local OTA Success Test
+## Minimum Local OTA Success Tests
+
+### Download-only local OTA success test
 
 1. USB flash dev-OTA build A.
-2. Build dev-OTA build B.
-3. Serve build B from local HTTP server.
+2. Build dev-OTA build B as `target/ota/firmware.bin`.
+3. Serve build B from local HTTP server as `/firmware.bin`.
 4. Send signed manifest over MQTT to:
 
 ```text
 motonet/<DEVICE_ID>/cmd/ota
 ```
 
+5. Device verifies manifest signature and URL policy.
+6. Device enters `RuntimeMode::OtaDownloading`.
+7. MQTT disconnects/stands down, or OTA proceeds after the 5 second stand-down timeout with a warning.
+8. Radio capture pauses, UI input is ignored, and display shows static OTA screen.
+9. Device downloads image over local HTTP.
+10. Device verifies status/content-length, final byte count, SHA-256, and 64-byte ESP image prefix.
+11. Device logs success/failure and returns to `RuntimeMode::Normal`.
+12. Device does not write flash, activate a slot, or reboot in this slice.
+
+### Full local OTA success test
+
+1. USB flash dev-OTA build A.
+2. Build dev-OTA build B.
+3. Serve build B from local HTTP server.
+4. Send signed manifest over MQTT to `motonet/<DEVICE_ID>/cmd/ota`.
 5. Device verifies manifest signature.
 6. Device enters OTA maintenance mode.
-7. Device downloads image.
+7. Device downloads and verifies image.
 8. Device writes inactive slot.
-9. Device verifies size, SHA-256, magic byte, and slot fit.
+9. Device verifies size, SHA-256, image header, and slot fit.
 10. Device activates inactive slot.
 11. Device reboots.
 12. Build B boots.
@@ -504,8 +590,12 @@ motonet/<DEVICE_ID>/cmd/ota
 5. Manifest/signature host-tested code.
 6. MQTT command subscription.
 7. Dedicated OTA task.
-8. Local HTTP dev OTA.
-9. Hardware rollback verification.
-10. Release anti-rollback.
-11. HTTPS/GitHub support.
-12. GitHub Actions release pipeline.
+8. Download-only local OTA slice, split into:
+   1. Runtime mode quiet-mode plumbing, local helper script subcommands, URL policy validation, and ESP image prefix validation.
+   2. `reqwless` firmware HTTP download integration and streaming size/SHA/header verification.
+9. Inactive slot flash write.
+10. Activate/reboot local OTA.
+11. Hardware rollback verification.
+12. Release anti-rollback.
+13. HTTPS/GitHub support.
+14. GitHub Actions release pipeline.

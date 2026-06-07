@@ -8,6 +8,7 @@ use embedded_tls::{
     Aes128GcmSha256, Certificate, CryptoProvider, MaxFragmentLength, TlsConfig, TlsConnection,
     TlsContext, TlsError,
 };
+use ota_core::{OtaManifestDeliveryAction, OtaState, classify_ota_manifest_delivery};
 use rand_core::RngCore;
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
@@ -53,7 +54,7 @@ fn broker_addr() -> (Ipv4Address, u16) {
     )
 }
 
-fn connect_options<'a>(status_topic: &'a str) -> Result<ConnectOptions<'a>, ()> {
+fn connect_options(status_topic: &str) -> Result<ConnectOptions<'_>, ()> {
     let user_name = MQTT_USERNAME
         .map(|name| {
             MqttString::try_from(name).map_err(|_| {
@@ -135,6 +136,7 @@ async fn connect_broker_and_publish_online<'a, N>(
     client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
     transport: N,
     ota_sender: &app_bus::OtaCommandSender,
+    ota_state: OtaState,
 ) -> Result<(), ()>
 where
     N: AsyncRead + AsyncWrite,
@@ -201,13 +203,14 @@ where
         online_publish_at.elapsed().as_millis()
     );
 
-    subscribe_ota_command_topic(client, ota_sender).await?;
+    subscribe_ota_command_topic(client, ota_sender, ota_state).await?;
     Ok(())
 }
 
 async fn subscribe_ota_command_topic<'a, N>(
     client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
     ota_sender: &app_bus::OtaCommandSender,
+    ota_state: OtaState,
 ) -> Result<(), ()>
 where
     N: AsyncRead + AsyncWrite,
@@ -249,8 +252,27 @@ where
             }
             Event::Publish(publish) => {
                 if let Some(manifest) = super::copy_ota_manifest(&publish, ota_topic.as_str()) {
-                    info!("MQTT: Received early OTA manifest command during subscribe setup");
-                    ota_sender.send(manifest).await;
+                    match classify_ota_manifest_delivery(ota_state, manifest.retained) {
+                        OtaManifestDeliveryAction::ForwardOnly => {
+                            info!(
+                                "MQTT: Received early live OTA manifest command during subscribe setup"
+                            );
+                            ota_sender.send(manifest.bytes).await;
+                        }
+                        OtaManifestDeliveryAction::ForwardAndClearRetained => {
+                            info!(
+                                "MQTT: Received early retained OTA manifest command during subscribe setup; forwarding once and clearing"
+                            );
+                            ota_sender.send(manifest.bytes).await;
+                            super::publish::clear_ota_retained(client, ota_topic.as_str()).await;
+                        }
+                        OtaManifestDeliveryAction::ClearRetainedOnly => {
+                            info!(
+                                "MQTT: Clearing early retained OTA manifest during pending confirmation without re-running OTA"
+                            );
+                            super::publish::clear_ota_retained(client, ota_topic.as_str()).await;
+                        }
+                    }
                 }
                 unsafe { client.buffer_mut().reset() };
             }
@@ -266,10 +288,11 @@ pub(super) async fn establish_mqtt_session_plain<'a>(
     tx_buffer: &'a mut [u8],
     client: &mut PlainClient<'a>,
     ota_sender: &app_bus::OtaCommandSender,
+    ota_state: OtaState,
 ) -> Result<(), ()> {
     info!("MQTT: Establishing plaintext MQTT session");
     let socket = connect_tcp(network_stack, rx_buffer, tx_buffer).await?;
-    connect_broker_and_publish_online(client, socket, ota_sender).await
+    connect_broker_and_publish_online(client, socket, ota_sender, ota_state).await
 }
 
 struct MqttTlsClock;
@@ -345,6 +368,7 @@ impl CryptoProvider for MqttTlsProvider {
 }
 
 /// Sets up the MQTT client over TLS using server certificate validation.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn establish_mqtt_session_tls<'a>(
     network_stack: embassy_net::Stack<'static>,
     rx_buffer: &'a mut [u8],
@@ -353,6 +377,7 @@ pub(super) async fn establish_mqtt_session_tls<'a>(
     tls_record_write_buffer: &'a mut [u8],
     client: &mut TlsClient<'a>,
     ota_sender: &app_bus::OtaCommandSender,
+    ota_state: OtaState,
 ) -> Result<(), ()> {
     #[allow(clippy::const_is_empty)]
     if MQTT_TLS_CA_CERT_DER.is_empty() {
@@ -392,5 +417,5 @@ pub(super) async fn establish_mqtt_session_tls<'a>(
         "MQTT[TLS]: TLS handshake complete in {}ms",
         tls_open_at.elapsed().as_millis()
     );
-    connect_broker_and_publish_online(client, tls_socket, ota_sender).await
+    connect_broker_and_publish_online(client, tls_socket, ota_sender, ota_state).await
 }

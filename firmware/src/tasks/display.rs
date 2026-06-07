@@ -2,6 +2,7 @@ use defmt::{error, info};
 use esp_hal::Blocking;
 use esp_hal::i2c::master::I2c;
 use karu_menu::MenuRenderer;
+use ota_core::{OtaState, display_message, is_ui_input_allowed};
 
 use crate::app_bus::{self, AppEvent, UiInputEvent};
 use crate::display_driver::{Display, Sh1106Display};
@@ -20,14 +21,17 @@ use state::{DisplayState, RadioState};
 pub async fn ui_input_task(
     mut ui: EC11RotaryEncoderInput,
     app_event_sender: app_bus::AppEventSender,
+    mut ota_state_receiver: app_bus::OtaStateReceiver,
 ) {
     loop {
         let event = ui
             .next_event(UiEvent::NextScreen, UiEvent::PrevScreen)
             .await;
-        app_event_sender
-            .send(AppEvent::UiInput(UiInputEvent::Navigation(event)))
-            .await;
+        if is_ui_input_allowed(ota_state_receiver.try_get().unwrap_or(OtaState::Inactive)) {
+            app_event_sender
+                .send(AppEvent::UiInput(UiInputEvent::Navigation(event)))
+                .await;
+        }
     }
 }
 
@@ -40,6 +44,7 @@ pub async fn display_task(
     mut radio_settings_receiver: app_bus::RadioSettingsReceiver,
     mut power_settings_receiver: app_bus::PowerSettingsReceiver,
     app_command_sender: app_bus::AppCommandSender,
+    mut ota_state_receiver: app_bus::OtaStateReceiver,
 ) {
     info!("Display task started");
 
@@ -71,6 +76,15 @@ pub async fn display_task(
             radio_settings_receiver.try_get(),
             power_settings_receiver.try_get(),
         );
+
+        if let Some(message) =
+            display_message(ota_state_receiver.try_get().unwrap_or(OtaState::Inactive))
+        {
+            if let Err(e) = display.show_status(message) {
+                error!("Display: Failed to show OTA status: {:?}", e);
+            }
+            continue;
+        }
 
         let current_time = time_receiver.try_get().flatten();
         let frame =

@@ -1,10 +1,11 @@
 use defmt::info;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Sender as ChannelSender;
 use embassy_sync::watch::{Receiver, Sender as WatchSender};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::Input;
+use ota_core::{OtaState, is_radio_capture_allowed};
 
 use crate::messages::{RadioReading, RadioSettings};
 use crate::pulse_capture::apply_pending_settings;
@@ -87,25 +88,42 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
         gap_count
     }
 
-    pub async fn run(&mut self) -> ! {
+    pub async fn run(&mut self, mut ota_state_receiver: crate::app_bus::OtaStateReceiver) -> ! {
         // Buffer for gap durations
         // 12 repetitions × 36 bits = 432 gaps, plus some margin
         let mut gap_buffer = [0u32; 512];
+        let mut quiesced = false;
 
         info!("PulseCapture: Ready, waiting for signal...");
 
         loop {
-            match select(
+            while !is_radio_capture_allowed(
+                ota_state_receiver.try_get().unwrap_or(OtaState::Inactive),
+            ) {
+                if !quiesced {
+                    info!("PulseCapture: OTA active; pausing capture");
+                    quiesced = true;
+                }
+                ota_state_receiver.changed().await;
+            }
+            if quiesced {
+                info!("PulseCapture: OTA inactive; resuming capture");
+                quiesced = false;
+            }
+
+            match select3(
                 self.pin.wait_for_rising_edge(),
                 self.settings_receiver.changed(),
+                ota_state_receiver.changed(),
             )
             .await
             {
-                Either::First(()) => {}
-                Either::Second(_) => {
+                Either3::First(()) => {}
+                Either3::Second(_) => {
                     apply_pending_settings(&mut *self.radio, &mut self.settings_receiver).await;
                     continue;
                 }
+                Either3::Third(()) => continue,
             }
 
             // Capture raw radio frame
@@ -155,7 +173,14 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
                                 );
                             }
                         }
-                        Timer::after(Duration::from_secs(45)).await;
+                        match select(
+                            Timer::after(Duration::from_secs(45)),
+                            ota_state_receiver.changed(),
+                        )
+                        .await
+                        {
+                            Either::First(()) | Either::Second(_) => {}
+                        }
                     }
                     Err(e) => {
                         info!("Decode failed: {:?}", e);
@@ -166,8 +191,15 @@ impl<'d, R: Radio433> PulseCapture<'d, R> {
             }
 
             // Delay 1s before listening again (debounce)
-            // Also check for settings changes during this quiet period
-            Timer::after(Duration::from_millis(1000)).await;
+            // Also check for state changes during this quiet period
+            match select(
+                Timer::after(Duration::from_millis(1000)),
+                ota_state_receiver.changed(),
+            )
+            .await
+            {
+                Either::First(()) | Either::Second(_) => {}
+            }
 
             apply_pending_settings(&mut *self.radio, &mut self.settings_receiver).await;
 

@@ -8,6 +8,7 @@ pub mod led_pwm;
 pub mod mqtt;
 pub mod network_supervisor;
 pub mod ota;
+pub mod ota_confirm;
 pub mod radio_433;
 pub mod time_sync;
 

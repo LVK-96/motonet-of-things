@@ -1,6 +1,11 @@
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Channel, Receiver as ChannelReceiver, Sender as ChannelSender};
+use embassy_sync::mutex::Mutex;
 use embassy_sync::watch::{Receiver as WatchReceiver, Sender as WatchSender, Watch};
+use esp_storage::FlashStorage;
+use static_cell::StaticCell;
+
+use ota_core::OtaState;
 
 use crate::messages::{PowerSettings, RadioReading, RadioSettings};
 use crate::power;
@@ -9,6 +14,8 @@ use crate::ui_input::UiEvent;
 const READINGS_WATCH_DEPTH: usize = 2;
 const RADIO_SETTINGS_WATCH_DEPTH: usize = 2;
 const POWER_SETTINGS_WATCH_DEPTH: usize = 2;
+const OTA_STATE_WATCH_DEPTH: usize = 6;
+const MQTT_HEALTH_WATCH_DEPTH: usize = 2;
 const APP_EVENT_CHANNEL_DEPTH: usize = 8;
 const APP_COMMAND_CHANNEL_DEPTH: usize = 16;
 const MQTT_COMMAND_CHANNEL_DEPTH: usize = 16;
@@ -54,6 +61,7 @@ pub enum AppCommand {
         power: PowerSettings,
     },
     PublishTelemetry(RadioReading),
+    OtaConfirmed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +71,14 @@ pub enum ControlDispatch {
         power: PowerSettings,
     },
     Ignore,
+}
+
+/// Health signal from the MQTT task, observed by the OTA confirmation gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MqttHealth {
+    Disconnected,
+    Connected,
+    HeartbeatPublished,
 }
 
 pub type ReadingSender =
@@ -77,6 +93,14 @@ pub type PowerSettingsSender =
     WatchSender<'static, CriticalSectionRawMutex, PowerSettings, POWER_SETTINGS_WATCH_DEPTH>;
 pub type PowerSettingsReceiver =
     WatchReceiver<'static, CriticalSectionRawMutex, PowerSettings, POWER_SETTINGS_WATCH_DEPTH>;
+pub type OtaStateSender =
+    WatchSender<'static, CriticalSectionRawMutex, OtaState, OTA_STATE_WATCH_DEPTH>;
+pub type OtaStateReceiver =
+    WatchReceiver<'static, CriticalSectionRawMutex, OtaState, OTA_STATE_WATCH_DEPTH>;
+pub type MqttHealthSender =
+    WatchSender<'static, CriticalSectionRawMutex, MqttHealth, MQTT_HEALTH_WATCH_DEPTH>;
+pub type MqttHealthReceiver =
+    WatchReceiver<'static, CriticalSectionRawMutex, MqttHealth, MQTT_HEALTH_WATCH_DEPTH>;
 pub type AppEventSender =
     ChannelSender<'static, CriticalSectionRawMutex, AppEvent, APP_EVENT_CHANNEL_DEPTH>;
 pub type AppEventReceiver =
@@ -111,6 +135,10 @@ pub static POWER_SETTINGS_WATCH: Watch<
     PowerSettings,
     POWER_SETTINGS_WATCH_DEPTH,
 > = Watch::new();
+pub static OTA_STATE_WATCH: Watch<CriticalSectionRawMutex, OtaState, OTA_STATE_WATCH_DEPTH> =
+    Watch::new();
+pub static MQTT_HEALTH_WATCH: Watch<CriticalSectionRawMutex, MqttHealth, MQTT_HEALTH_WATCH_DEPTH> =
+    Watch::new();
 pub static APP_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, AppEvent, APP_EVENT_CHANNEL_DEPTH> =
     Channel::new();
 pub static APP_COMMAND_CHANNEL: Channel<
@@ -133,6 +161,8 @@ pub static RADIO_TELEMETRY_CHANNEL: Channel<
     RadioReading,
     RADIO_TELEMETRY_CHANNEL_DEPTH,
 > = Channel::new();
+pub static FLASH: StaticCell<Mutex<CriticalSectionRawMutex, FlashStorage<'static>>> =
+    StaticCell::new();
 
 #[must_use]
 pub fn route_event(event: AppEvent) -> Option<AppCommand> {
@@ -154,7 +184,7 @@ pub fn route_event_to_control_command(event: AppEvent) -> Option<AppCommand> {
         Some(AppCommand::ApplySettings { radio, power }) => {
             Some(AppCommand::ApplySettings { radio, power })
         }
-        Some(AppCommand::PublishTelemetry(_)) | None => None,
+        Some(AppCommand::PublishTelemetry(_) | AppCommand::OtaConfirmed) | None => None,
     }
 }
 
@@ -162,6 +192,7 @@ pub fn route_event_to_control_command(event: AppEvent) -> Option<AppCommand> {
 pub fn route_event_to_mqtt_command(event: AppEvent) -> Option<AppCommand> {
     match route_event(event) {
         Some(AppCommand::PublishTelemetry(reading)) => Some(AppCommand::PublishTelemetry(reading)),
+        Some(AppCommand::OtaConfirmed) => Some(AppCommand::OtaConfirmed),
         Some(AppCommand::ApplySettings { .. }) | None => None,
     }
 }
@@ -172,7 +203,7 @@ pub fn classify_control_dispatch(command: AppCommand) -> ControlDispatch {
         AppCommand::ApplySettings { radio, power } => {
             ControlDispatch::ApplySettings { radio, power }
         }
-        AppCommand::PublishTelemetry(_) => ControlDispatch::Ignore,
+        AppCommand::PublishTelemetry(_) | AppCommand::OtaConfirmed => ControlDispatch::Ignore,
     }
 }
 

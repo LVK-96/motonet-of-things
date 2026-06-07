@@ -4,11 +4,14 @@ use app_core::runtime_policy::{
     MQTT_MIN_BACKOFF_SECS, next_mqtt_backoff_secs, should_reconnect_before_publish,
 };
 use defmt::{debug, info, trace, warn};
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::{Either4, select4};
 use embassy_net::tcp::TcpSocket;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read as AsyncRead, Write as AsyncWrite};
 use embedded_tls::{Aes128GcmSha256, TlsConnection};
+use ota_core::{
+    OtaManifestDeliveryAction, OtaState, classify_ota_manifest_delivery, is_mqtt_allowed,
+};
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
 use rust_mqtt::client::event::{Event, Publish};
@@ -31,13 +34,6 @@ const MQTT_TLS_RECORD_WRITE_BUF_SIZE: usize = 4096;
 enum ReadingOutcome {
     Continue,
     Reconnect(RadioReading),
-}
-
-fn telemetry_from_command(command: AppCommand) -> Option<RadioReading> {
-    match command {
-        AppCommand::PublishTelemetry(reading) => Some(reading),
-        AppCommand::ApplySettings { .. } => None,
-    }
 }
 
 async fn handle_reading<'a, N>(
@@ -77,10 +73,12 @@ where
     }
 }
 
-fn copy_ota_manifest(
-    publish: &Publish<'_, 0>,
-    ota_topic: &str,
-) -> Option<app_bus::OtaManifestBytes> {
+struct IncomingOtaManifest {
+    bytes: app_bus::OtaManifestBytes,
+    retained: bool,
+}
+
+fn copy_ota_manifest(publish: &Publish<'_, 0>, ota_topic: &str) -> Option<IncomingOtaManifest> {
     if publish.topic.as_ref().as_ref() != ota_topic {
         trace!(
             "MQTT: Ignoring incoming publish on {}",
@@ -105,14 +103,18 @@ fn copy_ota_manifest(
         return None;
     }
 
-    Some(owned)
+    Some(IncomingOtaManifest {
+        bytes: owned,
+        retained: publish.retain,
+    })
 }
 
 async fn handle_mqtt_event(
     event: Event<'_, 0>,
     ota_topic: &str,
     ota_sender: &app_bus::OtaCommandSender,
-) {
+    ota_state: OtaState,
+) -> bool {
     let manifest = match event {
         Event::Publish(publish) => copy_ota_manifest(&publish, ota_topic),
         Event::Pingresp => {
@@ -123,23 +125,48 @@ async fn handle_mqtt_event(
             debug!("MQTT: Publish acknowledged by broker");
             None
         }
-        Event::Suback(_) | Event::Unsuback(_) | Event::Ignored | Event::Duplicate => None,
-        Event::PublishRejected(_)
+        Event::Suback(_)
+        | Event::Unsuback(_)
+        | Event::Ignored
+        | Event::Duplicate
+        | Event::PublishRejected(_)
         | Event::PublishReceived(_)
         | Event::PublishReleased(_)
         | Event::PublishComplete(_) => None,
     };
 
     if let Some(manifest) = manifest {
-        info!("MQTT: Received OTA manifest command, handing off to OTA task");
-        ota_sender.send(manifest).await;
+        match classify_ota_manifest_delivery(ota_state, manifest.retained) {
+            OtaManifestDeliveryAction::ForwardOnly => {
+                info!("MQTT: Received live OTA manifest command, handing off to OTA task");
+                ota_sender.send(manifest.bytes).await;
+                false
+            }
+            OtaManifestDeliveryAction::ForwardAndClearRetained => {
+                info!(
+                    "MQTT: Received retained OTA manifest command, handing off once and clearing retained copy"
+                );
+                ota_sender.send(manifest.bytes).await;
+                true
+            }
+            OtaManifestDeliveryAction::ClearRetainedOnly => {
+                info!(
+                    "MQTT: Clearing retained OTA manifest during pending confirmation without re-running OTA"
+                );
+                true
+            }
+        }
+    } else {
+        false
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_connected_loop<'a, N>(
     client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
     receiver: &app_bus::MqttCommandReceiver,
     ota_sender: &app_bus::OtaCommandSender,
+    ota_state_receiver: &mut app_bus::OtaStateReceiver,
     mut deferred_reading: Option<RadioReading>,
 ) -> Option<RadioReading>
 where
@@ -168,27 +195,37 @@ where
         }
 
         let timeout = Duration::from_secs(PING_INTERVAL_SECS);
-        match select3(
+        match select4(
             receiver.receive(),
             client.poll_header(),
             Timer::after(timeout),
+            ota_state_receiver.changed(),
         )
         .await
         {
-            Either3::First(command) => {
-                let Some(reading) = telemetry_from_command(command) else {
-                    trace!("MQTT: Ignoring non-telemetry command");
-                    continue;
-                };
-                match handle_reading(client, receiver, reading, &mut last_activity).await {
-                    ReadingOutcome::Continue => {}
-                    ReadingOutcome::Reconnect(reading) => {
-                        deferred_reading = Some(reading);
-                        break;
+            Either4::First(command) => match command {
+                AppCommand::PublishTelemetry(reading) => {
+                    match handle_reading(client, receiver, reading, &mut last_activity).await {
+                        ReadingOutcome::Continue => {}
+                        ReadingOutcome::Reconnect(reading) => {
+                            deferred_reading = Some(reading);
+                            break;
+                        }
                     }
                 }
-            }
-            Either3::Second(header) => {
+                AppCommand::OtaConfirmed => {
+                    info!("MQTT: publishing OTA confirmed status");
+                    if publish::publish_ota_confirmed(client).await.is_err() {
+                        warn!("MQTT: failed to publish OTA confirmation, reconnecting");
+                        break;
+                    }
+                    last_activity = Instant::now();
+                }
+                AppCommand::ApplySettings { .. } => {
+                    trace!("MQTT: Ignoring non-telemetry command");
+                }
+            },
+            Either4::Second(header) => {
                 let header = match header {
                     Ok(header) => header,
                     Err(e) => {
@@ -201,7 +238,16 @@ where
                 };
                 match client.poll_body(header).await {
                     Ok(event) => {
-                        handle_mqtt_event(event, ota_topic.as_str(), ota_sender).await;
+                        let clear_retained = handle_mqtt_event(
+                            event,
+                            ota_topic.as_str(),
+                            ota_sender,
+                            ota_state_receiver.try_get().unwrap_or(OtaState::Inactive),
+                        )
+                        .await;
+                        if clear_retained {
+                            publish::clear_ota_retained(client, ota_topic.as_str()).await;
+                        }
                         unsafe { client.buffer_mut().reset() };
                         last_activity = Instant::now();
                     }
@@ -214,12 +260,18 @@ where
                     }
                 }
             }
-            Either3::Third(()) => {
+            Either4::Third(()) => {
                 if publish::ping(client).await.is_err() {
                     break;
                 }
 
                 last_activity = Instant::now();
+            }
+            Either4::Fourth(state) => {
+                if !is_mqtt_allowed(state) {
+                    info!("MQTT: OTA state changed; disconnecting");
+                    break;
+                }
             }
         }
     }
@@ -237,12 +289,19 @@ pub async fn mqtt_task(
     network_stack: embassy_net::Stack<'static>,
     receiver: app_bus::MqttCommandReceiver,
     ota_sender: app_bus::OtaCommandSender,
+    mut ota_state_receiver: app_bus::OtaStateReceiver,
+    mqtt_health_sender: app_bus::MqttHealthSender,
 ) {
     let mut backoff_secs = MQTT_MIN_BACKOFF_SECS;
     let mut deferred_reading: Option<RadioReading> = None;
 
     // TODO: Persist MQTT sessions
+    mqtt_health_sender.send(app_bus::MqttHealth::Disconnected);
     loop {
+        while !is_mqtt_allowed(ota_state_receiver.try_get().unwrap_or(OtaState::Inactive)) {
+            info!("MQTT: OTA active; standing down");
+            ota_state_receiver.changed().await;
+        }
         info!(
             "MQTT: Opening new session (tls={}, backoff={}s, deferred_reading={})",
             MQTT_USE_TLS,
@@ -269,6 +328,7 @@ pub async fn mqtt_task(
                 &mut tls_write_buf,
                 &mut client,
                 &ota_sender,
+                ota_state_receiver.try_get().unwrap_or(OtaState::Inactive),
             )
             .await
             .is_err()
@@ -283,8 +343,15 @@ pub async fn mqtt_task(
             }
 
             backoff_secs = MQTT_MIN_BACKOFF_SECS;
-            deferred_reading =
-                run_connected_loop(&mut client, &receiver, &ota_sender, deferred_reading).await;
+            mqtt_health_sender.send(app_bus::MqttHealth::HeartbeatPublished);
+            deferred_reading = run_connected_loop(
+                &mut client,
+                &receiver,
+                &ota_sender,
+                &mut ota_state_receiver,
+                deferred_reading,
+            )
+            .await;
         } else {
             let mut client = PlainClient::new(&mut mqtt_buffer);
             if session::establish_mqtt_session_plain(
@@ -293,6 +360,7 @@ pub async fn mqtt_task(
                 &mut tx_buf,
                 &mut client,
                 &ota_sender,
+                ota_state_receiver.try_get().unwrap_or(OtaState::Inactive),
             )
             .await
             .is_err()
@@ -307,11 +375,18 @@ pub async fn mqtt_task(
             }
 
             backoff_secs = MQTT_MIN_BACKOFF_SECS;
-            deferred_reading =
-                run_connected_loop(&mut client, &receiver, &ota_sender, deferred_reading).await;
+            mqtt_health_sender.send(app_bus::MqttHealth::HeartbeatPublished);
+            deferred_reading = run_connected_loop(
+                &mut client,
+                &receiver,
+                &ota_sender,
+                &mut ota_state_receiver,
+                deferred_reading,
+            )
+            .await;
         }
 
-        // Backoff before reconnecting
+        mqtt_health_sender.send(app_bus::MqttHealth::Disconnected);
         info!(
             "MQTT: Connection lost or reconnect requested, retrying in {}s (deferred_reading={})",
             backoff_secs,

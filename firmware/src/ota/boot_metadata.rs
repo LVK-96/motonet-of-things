@@ -89,7 +89,10 @@ where
     ///
     /// Returns an OTA metadata error if the current state cannot be read.
     pub fn current_app_pending_confirmation(&mut self) -> Result<bool, Error> {
-        Ok(self.current_state()? == OtaImageState::PendingVerify)
+        Ok(matches!(
+            self.current_state()?,
+            OtaImageState::New | OtaImageState::PendingVerify
+        ))
     }
 
     /// Return the inactive OTA app partition that would be activated next.
@@ -118,6 +121,16 @@ where
     pub fn activate_next_partition(&mut self) -> Result<(), Error> {
         info!("OTA boot metadata: activating next OTA partition");
         self.updater.activate_next_partition()
+    }
+
+    /// Mark the currently selected app as new in OTA metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OTA metadata error if the state cannot be written.
+    pub fn mark_current_app_new(&mut self) -> Result<(), Error> {
+        info!("OTA boot metadata: marking current app new");
+        self.updater.set_current_ota_state(OtaImageState::New)
     }
 
     /// Mark the current app valid in OTA metadata.

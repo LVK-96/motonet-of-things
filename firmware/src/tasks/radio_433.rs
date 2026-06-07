@@ -18,6 +18,7 @@ use crate::pulse_capture::apply_pending_settings;
 use crate::radio_433::{Cc1101Radio, Radio433};
 
 use app_core::rtc_schema;
+use ota_core::{OtaState, is_radio_capture_allowed};
 
 type ReadingSender = app_bus::ReadingSender;
 type MqttSender = app_bus::RadioTelemetrySender;
@@ -367,6 +368,7 @@ pub async fn radio_433_rx_task(
     mqtt_sender: MqttSender,
     settings_sender: SettingsSender,
     settings_receiver: SettingsReceiver,
+    ota_state_receiver: app_bus::OtaStateReceiver,
 ) {
     let Ok(current_settings) = prepare_radio_for_capture(&mut radio).await else {
         return;
@@ -386,7 +388,7 @@ pub async fn radio_433_rx_task(
         mqtt_sender,
         settings_receiver,
     );
-    capture.run().await;
+    capture.run(ota_state_receiver).await;
 }
 
 #[cfg(feature = "pulse_rmt")]
@@ -397,6 +399,7 @@ pub async fn radio_433_rx_task(
     reading_sender: ReadingSender,
     mqtt_sender: MqttSender,
     settings_sender: SettingsSender,
+    ota_state_receiver: app_bus::OtaStateReceiver,
 ) {
     let current_settings = {
         let mut radio = shared_radio.lock().await;
@@ -408,15 +411,30 @@ pub async fn radio_433_rx_task(
     settings_sender.send(current_settings);
 
     let mut capture = PulseCapture::new(rmt_rx, shared_radio, reading_sender, mqtt_sender);
-    capture.run().await;
+    capture.run(ota_state_receiver).await;
 }
 
 #[embassy_executor::task]
 pub async fn radio_433_event_router_task(
     telemetry_receiver: RadioTelemetryReceiver,
     mqtt_command_sender: MqttCommandSender,
+    mut ota_state_receiver: app_bus::OtaStateReceiver,
 ) {
+    let mut quiesced = false;
     loop {
+        while !is_radio_capture_allowed(ota_state_receiver.try_get().unwrap_or(OtaState::Inactive))
+        {
+            if !quiesced {
+                info!("Radio 433: OTA active; quiescing capture pipeline");
+                quiesced = true;
+            }
+            ota_state_receiver.changed().await;
+        }
+        if quiesced {
+            info!("Radio 433: OTA inactive; resuming capture pipeline");
+            quiesced = false;
+        }
+
         let reading = telemetry_receiver.receive().await;
         if let Some(command) =
             app_bus::route_event_to_mqtt_command(AppEvent::RadioFrameDecoded(reading))

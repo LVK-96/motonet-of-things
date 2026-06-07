@@ -1,7 +1,7 @@
 [package]
 edition = "2024"
 name = "esp32-rust-project"
-rust-version = "1.88"
+rust-version = "1.95"
 version = "0.1.0"
 
 [[bin]]
@@ -37,6 +37,7 @@ esp-rtos = { version = "0.3.0", features = [
   "esp-radio",
 ] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["defmt", "esp32"] }
+esp-storage = { version = "0.9", features = ["esp32", "defmt"] }
 embedded-storage = "0.3"
 embassy-executor = { version = "0.10.0", features = ["defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime-ms"] }
@@ -60,6 +61,9 @@ embedded-io-async = "0.7.0"
 cc1101 = { git = "https://github.com/dsvensson/cc1101.git", branch = "main" }
 rust-mqtt = { version = "0.5", default-features = false, features = ["defmt", "v5", "bump"] }
 embedded-tls = { version = "0.18.0", default-features = false, features = ["defmt", "rustpki"] }
+reqwless = { version = "0.14", default-features = false, features = ["defmt"] }
+sha2 = { version = "0.10", default-features = false }
+embedded-nal-async = "0.9.0"
 rand_core = { version = "0.6.4", default-features = false }
 der = { version = "0.8.0", default-features = false, features = ["heapless"] }
 heapless = "0.9.3"

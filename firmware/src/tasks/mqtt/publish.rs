@@ -1,6 +1,6 @@
 use core::fmt::Write;
 
-use defmt::{debug, trace, warn};
+use defmt::{debug, info, trace, warn};
 use embedded_io_async::{Read as AsyncRead, Write as AsyncWrite};
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
@@ -107,6 +107,62 @@ where
     }
 
     PublishOutcome::Published
+}
+
+pub(super) async fn publish_ota_confirmed<'a, N>(
+    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
+) -> Result<(), ()>
+where
+    N: AsyncRead + AsyncWrite,
+{
+    unsafe { client.buffer_mut().reset() };
+
+    let mut topic: heapless::String<{ ota_core::MQTT_TOPIC_MAX_LEN }> = heapless::String::new();
+    core::write!(
+        &mut topic,
+        "motonet/{}/ota/status",
+        crate::secrets::DEVICE_ID
+    )
+    .map_err(|_| ())?;
+
+    let topic_str = MqttString::from_str(topic.as_str()).map_err(|_| ())?;
+    let topic_name = TopicName::new_unchecked(topic_str);
+    let pub_options = PublicationOptions::new(TopicReference::Name(topic_name))
+        .retain()
+        .qos(QoS::AtLeastOnce);
+
+    let payload = b"{\"status\":\"confirmed\"}";
+    client
+        .publish(&pub_options, Bytes::from(payload.as_slice()))
+        .await
+        .map_err(|e| {
+            warn!(
+                "MQTT: Failed to publish OTA confirmation: {:?}",
+                defmt::Debug2Format(&e)
+            );
+        })?;
+
+    info!("MQTT: OTA confirmation published");
+    Ok(())
+}
+
+pub(super) async fn clear_ota_retained<'a, N>(
+    client: &mut Client<'a, N, BumpBuffer<'a>, 4, 2, 2, 0>,
+    ota_topic: &str,
+) where
+    N: AsyncRead + AsyncWrite,
+{
+    unsafe { client.buffer_mut().reset() };
+    let Ok(topic_str) = MqttString::from_str(ota_topic) else {
+        return;
+    };
+    let topic_name = TopicName::new_unchecked(topic_str);
+    let pub_options = PublicationOptions::new(TopicReference::Name(topic_name))
+        .retain()
+        .qos(QoS::AtLeastOnce);
+    let _ = client
+        .publish(&pub_options, Bytes::from(&[] as &[u8]))
+        .await;
 }
 
 pub(super) async fn ping<'a, N>(

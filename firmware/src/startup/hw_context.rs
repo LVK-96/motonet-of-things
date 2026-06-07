@@ -1,7 +1,6 @@
 use defmt::{error, info};
 use embassy_executor::{SpawnError, SpawnToken, Spawner};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-#[cfg(feature = "pulse_rmt")]
 use embassy_sync::mutex::Mutex;
 #[cfg(feature = "pulse_rmt")]
 use esp_hal::Async;
@@ -12,6 +11,7 @@ use esp_hal::ledc::{LowSpeed, channel::Channel as LedcChannel};
 #[cfg(feature = "pulse_rmt")]
 use esp_hal::rmt::{Channel as RmtChannel, Rx};
 use esp_hal::timer::timg::TimerGroup;
+use esp_storage::FlashStorage;
 use static_cell::StaticCell;
 
 use crate::app_bus;
@@ -38,6 +38,7 @@ pub(crate) struct HWContext {
     pub(crate) network_stack: embassy_net::Stack<'static>,
     pub(crate) display: Sh1106Display<I2c<'static, Blocking>>,
     pub(crate) ui_input: EC11RotaryEncoderInput,
+    pub(crate) flash_mutex: &'static Mutex<CriticalSectionRawMutex, FlashStorage<'static>>,
     #[cfg(feature = "pulse_sw")]
     pub(crate) radio: Cc1101Radio,
     #[cfg(feature = "pulse_rmt")]
@@ -53,6 +54,9 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
         StaticCell::new();
 
     let peripherals = hardware::system_setup();
+
+    // Initialize OTA flash storage singleton before any task uses it.
+    let flash_mutex = &*app_bus::FLASH.init(Mutex::new(FlashStorage::new(peripherals.FLASH)));
 
     power::log_wakeup_cause();
     let initial_power_settings = power::load_settings_or_default();
@@ -109,6 +113,7 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
         network_stack,
         display,
         ui_input,
+        flash_mutex,
         #[cfg(feature = "pulse_sw")]
         radio,
         #[cfg(feature = "pulse_rmt")]

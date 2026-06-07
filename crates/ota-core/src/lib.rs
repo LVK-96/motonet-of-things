@@ -198,6 +198,131 @@ pub enum TopicError {
     DeviceIdTooLong,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtaUrlPolicyError {
+    InvalidScheme,
+    UserInfoNotAllowed,
+    HostMustBeIpv4,
+    MissingPort,
+    EmptyPath,
+    QueryNotAllowed,
+    FragmentNotAllowed,
+}
+
+/// Validate the firmware OTA download URL policy.
+///
+/// Only local, explicit-port HTTP URLs are accepted:
+/// `http://<ipv4>:<port>/<path>`.
+///
+/// # Errors
+///
+/// Returns [`OtaUrlPolicyError`] when the URL is outside the firmware's
+/// intentionally narrow OTA download policy.
+pub fn validate_ota_url_policy(url: &str) -> Result<(), OtaUrlPolicyError> {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Err(OtaUrlPolicyError::InvalidScheme);
+    };
+    if rest.contains('#') {
+        return Err(OtaUrlPolicyError::FragmentNotAllowed);
+    }
+    if rest.contains('?') {
+        return Err(OtaUrlPolicyError::QueryNotAllowed);
+    }
+
+    let Some((authority, path)) = rest.split_once('/') else {
+        return Err(OtaUrlPolicyError::EmptyPath);
+    };
+    if authority.contains('@') {
+        return Err(OtaUrlPolicyError::UserInfoNotAllowed);
+    }
+    if path.is_empty() {
+        return Err(OtaUrlPolicyError::EmptyPath);
+    }
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return Err(OtaUrlPolicyError::MissingPort);
+    };
+    if !valid_port(port) {
+        return Err(OtaUrlPolicyError::MissingPort);
+    }
+    validate_ipv4_host(host)
+}
+
+fn valid_port(port: &str) -> bool {
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let mut value: u32 = 0;
+    for byte in port.bytes() {
+        value = value * 10 + u32::from(byte - b'0');
+        if value > 65_535 {
+            return false;
+        }
+    }
+    value != 0
+}
+
+fn validate_ipv4_host(host: &str) -> Result<(), OtaUrlPolicyError> {
+    if host.is_empty() || host.split('.').count() != 4 {
+        return Err(OtaUrlPolicyError::HostMustBeIpv4);
+    }
+    for octet in host.split('.') {
+        if octet.is_empty() || octet.len() > 3 || !octet.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(OtaUrlPolicyError::HostMustBeIpv4);
+        }
+        let mut value: u16 = 0;
+        for byte in octet.bytes() {
+            value = value * 10 + u16::from(byte - b'0');
+        }
+        if value > 255 {
+            return Err(OtaUrlPolicyError::HostMustBeIpv4);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EspImagePrefixError {
+    TooShort,
+    WrongMagic,
+    InvalidSegmentCount,
+    InvalidFlashMode,
+    InvalidFlashSizeFrequency,
+    ZeroEntryAddress,
+}
+
+/// Validate a retained ESP image prefix for conservative OTA plausibility.
+///
+/// The function accepts any byte slice but only inspects the basic ESP image
+/// header fields present in the first 8 bytes.
+///
+/// # Errors
+///
+/// Returns [`EspImagePrefixError`] when a required header field is implausible.
+pub fn validate_esp_image_prefix(prefix: &[u8]) -> Result<(), EspImagePrefixError> {
+    if prefix.len() < 8 {
+        return Err(EspImagePrefixError::TooShort);
+    }
+    if prefix[0] != 0xe9 {
+        return Err(EspImagePrefixError::WrongMagic);
+    }
+    if !(1..=16).contains(&prefix[1]) {
+        return Err(EspImagePrefixError::InvalidSegmentCount);
+    }
+    if !matches!(prefix[2], 0x00..=0x03) {
+        return Err(EspImagePrefixError::InvalidFlashMode);
+    }
+    let frequency = prefix[3] & 0x0f;
+    let size = prefix[3] >> 4;
+    if !matches!(frequency, 0x0 | 0x1 | 0x2 | 0xf) || !matches!(size, 0x0..=0x8) {
+        return Err(EspImagePrefixError::InvalidFlashSizeFrequency);
+    }
+    let entry = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]);
+    if entry == 0 {
+        return Err(EspImagePrefixError::ZeroEntryAddress);
+    }
+    Ok(())
+}
+
 /// Build the retained online/offline status topic for a device.
 ///
 /// # Errors
@@ -475,6 +600,64 @@ fn canonical_signed_json(manifest: &OtaManifest) -> Result<String, ManifestError
     ))
 }
 
+// ── Runtime coordination helpers ──────────────────────────────────────────
+
+/// MQTT-side action for an incoming OTA manifest command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OtaManifestDeliveryAction {
+    /// Forward a live/non-retained command to the OTA task.
+    ForwardOnly,
+    /// Forward a retained command once, then clear the broker's retained copy.
+    ForwardAndClearRetained,
+    /// Clear an obsolete retained command without re-running OTA.
+    ClearRetainedOnly,
+}
+
+/// Decide how MQTT should handle an incoming OTA manifest command.
+///
+/// During post-reboot confirmation, a retained command is the manifest that
+/// triggered the just-booted image. Forwarding it would start OTA again before
+/// the image can confirm, so clear it without handoff.
+#[must_use]
+pub const fn classify_ota_manifest_delivery(
+    state: OtaState,
+    retained: bool,
+) -> OtaManifestDeliveryAction {
+    match (state, retained) {
+        (OtaState::PendingConfirmation, true) => OtaManifestDeliveryAction::ClearRetainedOnly,
+        (_, true) => OtaManifestDeliveryAction::ForwardAndClearRetained,
+        (_, false) => OtaManifestDeliveryAction::ForwardOnly,
+    }
+}
+
+/// Returns `true` when MQTT is permitted to connect and publish.
+#[must_use]
+pub const fn is_mqtt_allowed(state: OtaState) -> bool {
+    matches!(state, OtaState::Inactive | OtaState::PendingConfirmation)
+}
+
+/// Returns `true` when radio capture is permitted.
+#[must_use]
+pub const fn is_radio_capture_allowed(state: OtaState) -> bool {
+    matches!(state, OtaState::Inactive)
+}
+
+/// Returns `true` when UI input handling is permitted.
+#[must_use]
+pub const fn is_ui_input_allowed(state: OtaState) -> bool {
+    matches!(state, OtaState::Inactive)
+}
+
+/// Returns an optional status message for the display during OTA operations.
+#[must_use]
+pub const fn display_message(state: OtaState) -> Option<&'static str> {
+    match state {
+        OtaState::Downloading => Some("OTA download..."),
+        OtaState::Applying => Some("OTA applying..."),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,6 +819,194 @@ mod tests {
     }
 
     #[test]
+    fn ota_url_policy_accepts_strict_local_http_ipv4_with_port_and_path() {
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10:8000/firmware.bin"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_rejects_https_scheme() {
+        assert_eq!(
+            validate_ota_url_policy("https://192.168.1.10:8000/firmware.bin"),
+            Err(OtaUrlPolicyError::InvalidScheme)
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_rejects_hostnames() {
+        assert_eq!(
+            validate_ota_url_policy("http://ota.local:8000/firmware.bin"),
+            Err(OtaUrlPolicyError::HostMustBeIpv4)
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_rejects_missing_port() {
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10/firmware.bin"),
+            Err(OtaUrlPolicyError::MissingPort)
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_rejects_invalid_port_numbers() {
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10:0/firmware.bin"),
+            Err(OtaUrlPolicyError::MissingPort)
+        );
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10:65536/firmware.bin"),
+            Err(OtaUrlPolicyError::MissingPort)
+        );
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10:999999999999/firmware.bin"),
+            Err(OtaUrlPolicyError::MissingPort)
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_accepts_max_valid_port() {
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10:65535/firmware.bin"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_rejects_empty_path() {
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10:8000"),
+            Err(OtaUrlPolicyError::EmptyPath)
+        );
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10:8000/"),
+            Err(OtaUrlPolicyError::EmptyPath)
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_rejects_query() {
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10:8000/firmware.bin?x=1"),
+            Err(OtaUrlPolicyError::QueryNotAllowed)
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_rejects_fragment() {
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10:8000/firmware.bin#frag"),
+            Err(OtaUrlPolicyError::FragmentNotAllowed)
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_rejects_userinfo() {
+        assert_eq!(
+            validate_ota_url_policy("http://user@192.168.1.10:8000/firmware.bin"),
+            Err(OtaUrlPolicyError::UserInfoNotAllowed)
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_allows_at_sign_in_path() {
+        assert_eq!(
+            validate_ota_url_policy("http://192.168.1.10:8000/releases/build@2.bin"),
+            Ok(())
+        );
+    }
+
+    fn valid_esp_prefix() -> [u8; 64] {
+        let mut prefix = [0_u8; 64];
+        prefix[0] = 0xe9;
+        prefix[1] = 4;
+        prefix[2] = 0x02;
+        prefix[3] = 0x1f;
+        prefix[4..8].copy_from_slice(&0x4008_0000_u32.to_le_bytes());
+        prefix
+    }
+
+    #[test]
+    fn esp_image_prefix_accepts_plausible_esp_app_image_header() {
+        let prefix = valid_esp_prefix();
+        assert_eq!(validate_esp_image_prefix(&prefix), Ok(()));
+    }
+
+    #[test]
+    fn esp_image_prefix_rejects_too_short_prefix() {
+        assert_eq!(
+            validate_esp_image_prefix(&valid_esp_prefix()[..7]),
+            Err(EspImagePrefixError::TooShort)
+        );
+    }
+
+    #[test]
+    fn esp_image_prefix_rejects_wrong_magic() {
+        let mut prefix = valid_esp_prefix();
+        prefix[0] = 0xea;
+        assert_eq!(
+            validate_esp_image_prefix(&prefix),
+            Err(EspImagePrefixError::WrongMagic)
+        );
+    }
+
+    #[test]
+    fn esp_image_prefix_rejects_invalid_segment_count() {
+        let mut prefix = valid_esp_prefix();
+        prefix[1] = 0;
+        assert_eq!(
+            validate_esp_image_prefix(&prefix),
+            Err(EspImagePrefixError::InvalidSegmentCount)
+        );
+
+        let mut prefix = valid_esp_prefix();
+        prefix[1] = 17;
+        assert_eq!(
+            validate_esp_image_prefix(&prefix),
+            Err(EspImagePrefixError::InvalidSegmentCount)
+        );
+    }
+
+    #[test]
+    fn esp_image_prefix_rejects_invalid_flash_mode() {
+        let mut prefix = valid_esp_prefix();
+        prefix[2] = 0xff;
+        assert_eq!(
+            validate_esp_image_prefix(&prefix),
+            Err(EspImagePrefixError::InvalidFlashMode)
+        );
+    }
+
+    #[test]
+    fn esp_image_prefix_rejects_invalid_flash_size_frequency() {
+        let mut prefix = valid_esp_prefix();
+        prefix[3] = 0xff;
+        assert_eq!(
+            validate_esp_image_prefix(&prefix),
+            Err(EspImagePrefixError::InvalidFlashSizeFrequency)
+        );
+    }
+
+    #[test]
+    fn esp_image_prefix_accepts_known_large_flash_size_nibble() {
+        let mut prefix = valid_esp_prefix();
+        prefix[3] = 0x70;
+        assert_eq!(validate_esp_image_prefix(&prefix), Ok(()));
+    }
+
+    #[test]
+    fn esp_image_prefix_rejects_zero_entry_address() {
+        let mut prefix = valid_esp_prefix();
+        prefix[4..8].copy_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            validate_esp_image_prefix(&prefix),
+            Err(EspImagePrefixError::ZeroEntryAddress)
+        );
+    }
+
+    #[test]
     fn ed25519_verifier_accepts_dev_test_signed_manifest() {
         let signed_manifest = sign_manifest(manifest());
         let signed = signed_manifest
@@ -762,6 +1133,67 @@ mod tests {
         assert_eq!(
             OtaManifest::parse_and_verify(signed.as_bytes(), &verifier),
             Err(ManifestError::SignatureRejected)
+        );
+    }
+
+    // ── Runtime coordination helpers ───────────────────────────────────
+
+    #[test]
+    fn inactive_state_allows_regular_runtime_work() {
+        assert!(is_mqtt_allowed(OtaState::Inactive));
+        assert!(is_radio_capture_allowed(OtaState::Inactive));
+        assert!(is_ui_input_allowed(OtaState::Inactive));
+        assert_eq!(display_message(OtaState::Inactive), None);
+    }
+
+    #[test]
+    fn downloading_state_quiets_runtime_work_and_shows_status() {
+        assert!(!is_mqtt_allowed(OtaState::Downloading));
+        assert!(!is_radio_capture_allowed(OtaState::Downloading));
+        assert!(!is_ui_input_allowed(OtaState::Downloading));
+        assert_eq!(
+            display_message(OtaState::Downloading),
+            Some("OTA download...")
+        );
+    }
+
+    #[test]
+    fn applying_state_quiets_runtime_work_and_shows_status() {
+        assert!(!is_mqtt_allowed(OtaState::Applying));
+        assert!(!is_radio_capture_allowed(OtaState::Applying));
+        assert!(!is_ui_input_allowed(OtaState::Applying));
+        assert_eq!(display_message(OtaState::Applying), Some("OTA applying..."));
+    }
+
+    #[test]
+    fn pending_confirmation_quiets_runtime_work_with_no_display_message() {
+        assert!(is_mqtt_allowed(OtaState::PendingConfirmation));
+        assert!(!is_radio_capture_allowed(OtaState::PendingConfirmation));
+        assert!(!is_ui_input_allowed(OtaState::PendingConfirmation));
+        assert_eq!(display_message(OtaState::PendingConfirmation), None);
+    }
+
+    #[test]
+    fn retained_manifest_during_pending_confirmation_is_cleared_without_forwarding() {
+        assert_eq!(
+            classify_ota_manifest_delivery(OtaState::PendingConfirmation, true),
+            OtaManifestDeliveryAction::ClearRetainedOnly
+        );
+    }
+
+    #[test]
+    fn retained_manifest_while_inactive_is_forwarded_once_and_cleared() {
+        assert_eq!(
+            classify_ota_manifest_delivery(OtaState::Inactive, true),
+            OtaManifestDeliveryAction::ForwardAndClearRetained
+        );
+    }
+
+    #[test]
+    fn live_manifest_is_forwarded_without_retained_clear() {
+        assert_eq!(
+            classify_ota_manifest_delivery(OtaState::Inactive, false),
+            OtaManifestDeliveryAction::ForwardOnly
         );
     }
 }

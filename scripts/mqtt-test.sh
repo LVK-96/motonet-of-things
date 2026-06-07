@@ -26,21 +26,27 @@ TLS_KEY_TYPE="${MQTT_TEST_TLS_KEY_TYPE:-ec}"
 
 CONF_FILE=""
 BROKER_PID=""
+SERVE_TMPDIR=""
 
 usage() {
     cat <<EOF
 Usage:
-  $0 [broker|sub|pub|ota|all] [plain|tls]
+  $0 [broker|sub|pub|ota-smoke|ota-build|ota-serve|ota-send|all] [plain|tls]
   $0 [plain|tls]
 
 Commands:
-  broker  Start broker only
-  sub     Start subscriber (auto-starts broker if needed)
-  pub     Publish a telemetry test message
-  ota     Publish an OTA smoke-test manifest to motonet/\$DEVICE_ID/cmd/ota
-  all     Start broker + subscriber (default)
+  broker     Start broker only
+  sub        Start subscriber (auto-starts broker if needed)
+  pub        Publish a telemetry test message
+  ota-smoke  Publish an OTA smoke-test manifest to motonet/\$DEVICE_ID/cmd/ota
+  ota-build  Build firmware and package into target/ota/firmware.bin
+  ota-serve  Serve firmware.bin over HTTP (for device OTA download)
+  ota-send   Build, sign, and publish a real OTA manifest via MQTT
+  all        Start broker + subscriber (default)
 
-Modes:
+  (The legacy 'ota' command is an alias for 'ota-smoke'.)
+
+Modes (for broker, sub, pub, ota-smoke, ota-send, all):
   plain   Use plaintext MQTT on port $BROKER_PORT_PLAIN (default)
   tls     Use server-TLS-only MQTT on port $BROKER_PORT_TLS (local CA + server cert)
 
@@ -48,15 +54,29 @@ Examples:
   $0
   $0 broker
   $0 pub plain
-  $0 ota plain
-  DEVICE_ID=test-sensor $0 ota tls
-  OTA_MANIFEST_FILE=manifest.json $0 ota plain
+  $0 ota-smoke plain
+  $0 ota-build
+  $0 ota-serve --port 9000
+  $0 ota-send plain --url http://192.168.1.10:8000/firmware.bin
+  DEVICE_ID=test-sensor $0 ota-send tls --url https://... --output manifest.json
   $0 all tls
   $0 sub tls
 
-OTA smoke-test customization:
+OTA ota-smoke customization:
   DEVICE_ID          Target device id (default: test-sensor)
   OTA_MANIFEST_FILE  Optional manifest JSON file. If unset, sends a dummy manifest-shaped payload.
+
+OTA ota-send options:
+  --file FILE        Firmware binary (default: target/ota/firmware.bin)
+  --url URL          Download URL for the device (required)
+  --version VER      Firmware version (default: git describe --always --dirty)
+  --build NUM        Build number (default: git rev-list --count HEAD)
+  --seed-hex-file F  Ed25519 signing seed hex file (default: tools/ota/keys/dev_ed25519.seed.hex)
+  --output FILE      Save signed manifest JSON to file (does not publish)
+
+OTA ota-serve options:
+  --file FILE        Firmware binary to serve (default: target/ota/firmware.bin)
+  --port PORT        HTTP port (default: 8000)
 
 TLS customization (mode=tls):
   MQTT_TEST_TLS_SERVER_CN   Certificate Common Name (default: localhost)
@@ -71,6 +91,9 @@ cleanup() {
     fi
     if [[ -n "$CONF_FILE" && -f "$CONF_FILE" ]]; then
         rm -f "$CONF_FILE"
+    fi
+    if [[ -n "$SERVE_TMPDIR" && -d "$SERVE_TMPDIR" ]]; then
+        rm -rf "$SERVE_TMPDIR"
     fi
 }
 trap cleanup EXIT INT TERM
@@ -255,7 +278,26 @@ default_ota_manifest() {
 EOF
 }
 
-run_ota_publisher() {
+# ---- helper: print LAN URLs for serving ----
+suggested_lan_urls() {
+    local port="${1:-8000}"
+    local filename="${2:-firmware.bin}"
+    echo "Suggested LAN URLs:"
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 addr show scope global 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | while read -r ip; do
+            echo "  http://$ip:$port/$filename"
+        done
+    elif command -v hostname >/dev/null 2>&1; then
+        hostname -I 2>/dev/null | tr ' ' '\n' | while read -r ip; do
+            [[ -n "$ip" ]] && echo "  http://$ip:$port/$filename"
+        done
+    else
+        echo "  (could not detect LAN IPs)"
+    fi
+}
+
+# ---- ota-smoke ----
+run_ota_smoke() {
     require_cmd mosquitto_pub
 
     local ota_topic
@@ -282,6 +324,221 @@ run_ota_publisher() {
     echo "Done"
 }
 
+# ---- ota-build ----
+run_ota_build() {
+    local project_root
+    project_root="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+    require_cmd cargo
+    require_cmd espflash
+
+    echo "Building firmware (release)..."
+    (cd "$project_root/firmware" && cargo build --release)
+
+    echo "Preparing OTA image directory..."
+    mkdir -p "$project_root/target/ota"
+
+    echo "Saving OTA firmware image..."
+    espflash save-image --chip esp32 \
+        --partition-table "$project_root/firmware/partitions.csv" \
+        --target-app-partition ota_0 \
+        "$project_root/target/xtensa-esp32-none-elf/release/esp32-rust-project" \
+        "$project_root/target/ota/firmware.bin"
+
+    echo "OTA firmware saved to $project_root/target/ota/firmware.bin"
+}
+
+# ---- ota-serve ----
+run_ota_serve() {
+    local file=""
+    local port="8000"
+    local project_root
+    project_root="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --file) file="$2"; shift 2 ;;
+            --port) port="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [[ -z "$file" ]]; then
+        file="$project_root/target/ota/firmware.bin"
+    fi
+
+    if [[ ! -f "$file" ]]; then
+        echo "Error: firmware file not found: $file" >&2
+        echo "Run '$0 ota-build' first or specify --file." >&2
+        exit 1
+    fi
+
+    require_cmd python3
+
+    SERVE_TMPDIR="$(mktemp -d)"
+    cp "$file" "$SERVE_TMPDIR/firmware.bin"
+
+    echo "=============================================="
+    echo " Serving OTA firmware over HTTP"
+    echo " File:    $file ($(wc -c < "$file") bytes)"
+    echo " Port:    $port"
+    echo " TempDir: $SERVE_TMPDIR"
+    echo "=============================================="
+    echo ""
+    echo " WARNING: This serves the firmware openly over HTTP."
+    echo "          Only use on a trusted local network!"
+    echo ""
+    suggested_lan_urls "$port" "firmware.bin"
+    echo ""
+    echo " Press Ctrl+C to stop the server."
+    echo "=============================================="
+
+    python3 -m http.server "$port" --directory "$SERVE_TMPDIR" --bind 0.0.0.0
+}
+
+# ---- ota-send ----
+run_ota_send() {
+    local mode="$1"
+    shift
+
+    local file=""
+    local url=""
+    local version=""
+    local build_num=""
+    local seed_hex_file=""
+    local output=""
+    local project_root
+    project_root="$(cd "$SCRIPT_DIR/.." && pwd)"
+    seed_hex_file="$project_root/tools/ota/keys/dev_ed25519.seed.hex"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --file) file="$2"; shift 2 ;;
+            --url) url="$2"; shift 2 ;;
+            --version) version="$2"; shift 2 ;;
+            --build) build_num="$2"; shift 2 ;;
+            --seed-hex-file) seed_hex_file="$2"; shift 2 ;;
+            --output) output="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    # Default file
+    if [[ -z "$file" ]]; then
+        if [[ -f "$project_root/target/ota/firmware.bin" ]]; then
+            file="$project_root/target/ota/firmware.bin"
+        else
+            echo "Error: --file not specified and $project_root/target/ota/firmware.bin not found" >&2
+            echo "Run '$0 ota-build' first or specify --file." >&2
+            exit 1
+        fi
+    fi
+    echo "Using firmware file: $file"
+
+    # URL is required
+    if [[ -z "$url" ]]; then
+        echo "Error: --url is required" >&2
+        echo ""
+        suggested_lan_urls 8000 "firmware.bin"
+        exit 1
+    fi
+
+    # Default version
+    if [[ -z "$version" ]]; then
+        version="$(cd "$project_root" && git describe --always --dirty 2>/dev/null || echo "unknown")"
+    fi
+
+    # Default build
+    if [[ -z "$build_num" ]]; then
+        build_num="$(cd "$project_root" && git rev-list --count HEAD 2>/dev/null || echo "0")"
+    fi
+
+    # Compute size and sha256
+    local size sha256
+    size="$(wc -c < "$file")"
+    require_cmd sha256sum
+    sha256="$(sha256sum "$file" | cut -d' ' -f1)"
+
+    # Build unsigned JSON
+    require_cmd jq
+    local unsigned_json
+    unsigned_json="$(jq -cn \
+        --arg version "$version" \
+        --argjson build "$build_num" \
+        --arg url "$url" \
+        --argjson size "$size" \
+        --arg sha256 "$sha256" \
+        '{schema:1, key_id:1001, target:"motonet-of-things/esp32", chip:"esp32-wroom", $version, $build, force:false, $url, $size, $sha256}')"
+
+    # Sign with Ed25519 seed
+    require_cmd openssl
+    require_cmd xxd
+
+    if [[ ! -f "$seed_hex_file" ]]; then
+        echo "Error: seed file not found: $seed_hex_file" >&2
+        exit 1
+    fi
+
+    local tmpkey_pem tmpkey_der
+    tmpkey_pem="$(mktemp)"
+    tmpkey_der="$(mktemp)"
+
+    local seed_hex
+    seed_hex="$(tr -d '[:space:]' < "$seed_hex_file")"
+
+    # PKCS8 DER for Ed25519 private key:
+    # 302e (SEQUENCE 46) 020100 (INTEGER 0) 300506032b6570 (SEQUENCE + OID 1.3.101.112)
+    # 0422 (OCTET STRING 34) 0420 (OCTET STRING 32) + seed (32 bytes)
+    local der_hex="302e020100300506032b657004220420${seed_hex}"
+    printf '%s' "$der_hex" | xxd -r -p > "$tmpkey_der"
+
+    if ! openssl pkey -inform DER -in "$tmpkey_der" -out "$tmpkey_pem" 2>/dev/null; then
+        echo "Error: failed to parse Ed25519 seed as PKCS8 key" >&2
+        rm -f "$tmpkey_pem" "$tmpkey_der"
+        exit 1
+    fi
+
+    local signature_hex unsigned_file
+    unsigned_file="$(mktemp)"
+    printf '%s' "$unsigned_json" > "$unsigned_file"
+    signature_hex="$(openssl pkeyutl -sign -rawin -in "$unsigned_file" -inkey "$tmpkey_pem" | xxd -p | tr -d '\n')"
+    rm -f "$unsigned_file"
+
+    rm -f "$tmpkey_pem" "$tmpkey_der"
+
+    # Build final signed manifest
+    local manifest_json
+    manifest_json="$(printf '%s' "$unsigned_json" | jq -c --arg sig "$signature_hex" '. + {signature: $sig}')"
+
+    # Save to output file if requested
+    if [[ -n "$output" ]]; then
+        printf '%s\n' "$manifest_json" > "$output"
+        echo "Manifest saved to: $output"
+        echo "(Not publishing; use without --output to publish via MQTT)"
+        return 0
+    fi
+
+    # Publish via MQTT
+    require_cmd mosquitto_pub
+
+    local ota_topic pub_args
+    ota_topic="$(ota_command_topic)"
+
+    pub_args=(-h localhost)
+    if [[ "$mode" == "tls" ]]; then
+        ensure_tls_assets
+        echo "Publishing OTA manifest over TLS to $ota_topic ..."
+        pub_args+=(-p "$BROKER_PORT_TLS" --cafile "$CA_CERT")
+    else
+        echo "Publishing OTA manifest to $ota_topic ..."
+        pub_args+=(-p "$BROKER_PORT_PLAIN")
+    fi
+
+    pub_args+=(-t "$ota_topic" -m "$manifest_json" -r)
+    mosquitto_pub "${pub_args[@]}"
+    echo "Done"
+}
+
 COMMAND="${1:-all}"
 MODE="${2:-plain}"
 
@@ -296,7 +553,7 @@ if [[ "$COMMAND" == "help" || "$COMMAND" == "--help" || "$COMMAND" == "-h" ]]; t
 fi
 
 case "$COMMAND" in
-    broker|sub|pub|ota|all)
+    broker|sub|pub|ota|ota-smoke|all|ota-build|ota-serve|ota-send)
         ;;
     *)
         usage
@@ -304,12 +561,19 @@ case "$COMMAND" in
         ;;
 esac
 
-case "$MODE" in
-    plain|tls)
+# Mode validation: skip for commands that don't use MQTT mode
+case "$COMMAND" in
+    ota-build|ota-serve)
         ;;
     *)
-        usage
-        exit 1
+        case "$MODE" in
+            plain|tls)
+                ;;
+            *)
+                usage
+                exit 1
+                ;;
+        esac
         ;;
 esac
 
@@ -325,8 +589,17 @@ case "$COMMAND" in
     pub)
         run_publisher
         ;;
-    ota)
-        run_ota_publisher
+    ota|ota-smoke)
+        run_ota_smoke
+        ;;
+    ota-build)
+        run_ota_build
+        ;;
+    ota-serve)
+        run_ota_serve "${@:2}"
+        ;;
+    ota-send)
+        run_ota_send "$MODE" "${@:3}"
         ;;
     all)
         echo "Starting broker in background and subscriber in foreground..."
