@@ -349,6 +349,21 @@ pub fn ota_command_topic(
     Ok(topic)
 }
 
+/// Build the OTA status topic a device publishes post-reboot confirmation
+/// results to.
+///
+/// # Errors
+///
+/// Returns [`TopicError::DeviceIdTooLong`] if the device id does not fit the
+/// fixed MQTT topic buffer.
+pub fn ota_status_topic(
+    device_id: &str,
+) -> Result<heapless::String<MQTT_TOPIC_MAX_LEN>, TopicError> {
+    let mut topic = heapless::String::new();
+    write!(topic, "motonet/{device_id}/ota/status").map_err(|_| TopicError::DeviceIdTooLong)?;
+    Ok(topic)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OtaManifest {
@@ -687,6 +702,10 @@ mod tests {
         assert_eq!(
             ota_command_topic("test-sensor").map(|topic| topic.to_string()),
             Ok("motonet/test-sensor/cmd/ota".to_owned())
+        );
+        assert_eq!(
+            ota_status_topic("test-sensor").map(|topic| topic.to_string()),
+            Ok("motonet/test-sensor/ota/status".to_owned())
         );
     }
 
@@ -1194,6 +1213,37 @@ mod tests {
         assert_eq!(
             classify_ota_manifest_delivery(OtaState::Inactive, false),
             OtaManifestDeliveryAction::ForwardOnly
+        );
+    }
+
+    #[test]
+    fn live_manifest_during_active_phases_is_forwarded_without_retained_clear() {
+        // A live (non-retained) command during Downloading or Applying is
+        // forwarded; we don't try to clear a retained copy that doesn't
+        // exist.
+        assert_eq!(
+            classify_ota_manifest_delivery(OtaState::Downloading, false),
+            OtaManifestDeliveryAction::ForwardOnly
+        );
+        assert_eq!(
+            classify_ota_manifest_delivery(OtaState::Applying, false),
+            OtaManifestDeliveryAction::ForwardOnly
+        );
+    }
+
+    #[test]
+    fn retained_manifest_during_active_phases_is_forwarded_once_and_cleared() {
+        // A retained command during Downloading or Applying is forwarded
+        // (the channel is depth-1, so the OTA task will only see the
+        // latest) and the retained copy is cleared to avoid re-delivery
+        // on reconnect.
+        assert_eq!(
+            classify_ota_manifest_delivery(OtaState::Downloading, true),
+            OtaManifestDeliveryAction::ForwardAndClearRetained
+        );
+        assert_eq!(
+            classify_ota_manifest_delivery(OtaState::Applying, true),
+            OtaManifestDeliveryAction::ForwardAndClearRetained
         );
     }
 }

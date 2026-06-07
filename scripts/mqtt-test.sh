@@ -345,6 +345,19 @@ run_ota_build() {
         "$project_root/target/xtensa-esp32-none-elf/release/esp32-rust-project" \
         "$project_root/target/ota/firmware.bin"
 
+    # The plan calls for a max OTA image size of 0x1C0000 (1,835,008 bytes);
+    # the inactive partition is the same. Reject oversized images so the
+    # device side gets a clean ImageTooLargeForSlot error rather than a
+    # silent erase/write failure.
+    local max_ota_size=$((0x1C0000))
+    local size
+    size="$(wc -c < "$project_root/target/ota/firmware.bin")"
+    if [[ $size -gt $max_ota_size ]]; then
+        echo "Error: firmware image $size bytes exceeds OTA slot size $max_ota_size" >&2
+        exit 1
+    fi
+    echo "OTA firmware size: $size bytes (max $max_ota_size)"
+
     echo "OTA firmware saved to $project_root/target/ota/firmware.bin"
 }
 
@@ -479,12 +492,26 @@ run_ota_send() {
         exit 1
     fi
 
+    # `openssl pkeyutl -sign -rawin` is required for Ed25519; this is
+    # OpenSSL >= 1.1.1 only. macOS ships LibreSSL by default which does
+    # not support `-rawin` for Ed25519.
+    if ! openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+        echo "Error: openssl does not support 'pkeyutl -rawin' (need OpenSSL >= 1.1.1)" >&2
+        exit 1
+    fi
+
     local tmpkey_pem tmpkey_der
     tmpkey_pem="$(mktemp)"
     tmpkey_der="$(mktemp)"
 
     local seed_hex
     seed_hex="$(tr -d '[:space:]' < "$seed_hex_file")"
+
+    if [[ ${#seed_hex} -ne 64 ]]; then
+        echo "Error: dev seed must be 32 bytes (64 hex chars), got ${#seed_hex}" >&2
+        rm -f "$tmpkey_pem" "$tmpkey_der"
+        exit 1
+    fi
 
     # PKCS8 DER for Ed25519 private key:
     # 302e (SEQUENCE 46) 020100 (INTEGER 0) 300506032b6570 (SEQUENCE + OID 1.3.101.112)

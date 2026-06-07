@@ -77,7 +77,6 @@ pub enum ControlDispatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MqttHealth {
     Disconnected,
-    Connected,
     HeartbeatPublished,
 }
 
@@ -192,8 +191,7 @@ pub fn route_event_to_control_command(event: AppEvent) -> Option<AppCommand> {
 pub fn route_event_to_mqtt_command(event: AppEvent) -> Option<AppCommand> {
     match route_event(event) {
         Some(AppCommand::PublishTelemetry(reading)) => Some(AppCommand::PublishTelemetry(reading)),
-        Some(AppCommand::OtaConfirmed) => Some(AppCommand::OtaConfirmed),
-        Some(AppCommand::ApplySettings { .. }) | None => None,
+        Some(AppCommand::OtaConfirmed | AppCommand::ApplySettings { .. }) | None => None,
     }
 }
 

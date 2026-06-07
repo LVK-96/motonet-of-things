@@ -1,11 +1,20 @@
 //! Flash-aware OTA download that streams firmware directly into the inactive
 //! partition, verifies integrity, activates the new slot, and reboots.
 
+use core::convert::Infallible;
 use core::fmt::Write as _;
+use core::mem::MaybeUninit;
+use core::net::{IpAddr, Ipv4Addr};
+use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use defmt::{info, warn};
-use embassy_net::{Stack, tcp::client::TcpClient};
+use embassy_net::{
+    Stack,
+    tcp::client::{TcpClient, TcpClientState},
+};
 use embedded_io_async::BufRead as _;
+use embedded_nal_async::{AddrType, Dns};
 use embedded_storage::ReadStorage;
 use embedded_storage::Storage;
 use embedded_storage::nor_flash::NorFlash;
@@ -22,7 +31,6 @@ use sha2::{Digest, Sha256};
 
 use crate::network;
 use crate::ota::OtaBootMetadata;
-use crate::ota::download::{Ipv4LiteralDns, tcp_client_state};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -43,6 +51,12 @@ pub enum OtaFlashWriteError {
     ShaMismatch,
     InvalidImagePrefix(EspImagePrefixError),
     FlashVerifyFailed,
+    /// Manifest `size` does not fit in the inactive OTA slot even after
+    /// sector alignment.
+    ImageTooLargeForSlot {
+        size: u32,
+        slot_size: u32,
+    },
 }
 
 impl From<PartitionError> for OtaFlashWriteError {
@@ -64,12 +78,83 @@ impl From<EspImagePrefixError> for OtaFlashWriteError {
 }
 
 // ---------------------------------------------------------------------------
-// SHA-256 hex helpers
+// IPv4-literal DNS adapter
+// ---------------------------------------------------------------------------
+
+/// DNS resolver that parses IPv4 address literals directly.
+///
+/// The OTA URL policy guarantees the download URL contains an IPv4 host,
+/// so we never need to perform a real DNS lookup. Using a dedicated adapter
+/// keeps the boundary explicit so a real DNS resolver can be slotted in
+/// later without changing the download pipeline.
+struct Ipv4LiteralDns;
+
+impl Dns for Ipv4LiteralDns {
+    type Error = Infallible;
+
+    async fn get_host_by_name(
+        &self,
+        host: &str,
+        _addr_type: AddrType,
+    ) -> Result<IpAddr, Infallible> {
+        // The URL policy in ota-core already validated this is a
+        // dotted-decimal IPv4 address; defensively fall back to 0.0.0.0 if
+        // the contract is ever violated.
+        let mut octets = [0u8; 4];
+        for (i, part) in host.split('.').enumerate() {
+            if i >= 4 {
+                break;
+            }
+            octets[i] = part.parse().unwrap_or(0);
+        }
+        Ok(IpAddr::V4(Ipv4Addr::from(octets)))
+    }
+
+    async fn get_host_by_address(
+        &self,
+        _addr: IpAddr,
+        _result: &mut [u8],
+    ) -> Result<usize, Infallible> {
+        Ok(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared TCP client pool (one concurrent connection)
+// ---------------------------------------------------------------------------
+
+/// Buffer size for each direction of the OTA download TCP socket.
+const OTA_TCP_BUF_SIZE: usize = 4096;
+/// ESP32 flash sector size used for erase alignment.
+const FLASH_SECTOR_SIZE: u32 = 4096;
+
+static TCP_CLIENT_READY: AtomicBool = AtomicBool::new(false);
+static mut TCP_CLIENT_BUF: MaybeUninit<TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE>> =
+    MaybeUninit::uninit();
+
+fn tcp_client_state() -> &'static mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE> {
+    // addr_of_mut! for static mut produces a raw pointer (safe in edition 2024);
+    // we guard initialization with TCP_CLIENT_READY.
+    let raw: *mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE> =
+        addr_of_mut!(TCP_CLIENT_BUF).cast();
+    if !TCP_CLIENT_READY.swap(true, Ordering::AcqRel) {
+        // SAFETY: first call, exclusive access before the bool is set.
+        unsafe {
+            raw.write(TcpClientState::new());
+        }
+    }
+    // SAFETY: initialized either in this call or a previous one (guarded by atomic).
+    unsafe { &mut *raw }
+}
+
+// ---------------------------------------------------------------------------
+// SHA-256 hex helper
 // ---------------------------------------------------------------------------
 
 fn sha256_hex(digest: &[u8; 32]) -> String<64> {
     let mut out = String::new();
     for byte in digest {
+        // write! into a fixed-capacity heapless::String is infallible.
         write!(out, "{byte:02x}").ok();
     }
     out
@@ -82,6 +167,10 @@ fn sha256_hex(digest: &[u8; 32]) -> String<64> {
 /// Download the OTA firmware image and stream it directly to the inactive
 /// flash partition. On success, activates the new slot and reboots.
 ///
+/// The ESP image prefix (first 8 bytes) is validated as soon as those bytes
+/// are available, before any data is written to flash, so a corrupt manifest
+/// never touches the inactive slot.
+///
 /// The `partition_table_buf` is a caller-provided buffer used temporarily
 /// for reading the partition table. It must be at least
 /// [`PARTITION_TABLE_MAX_LEN`] bytes.
@@ -89,14 +178,14 @@ fn sha256_hex(digest: &[u8; 32]) -> String<64> {
 /// # Errors
 ///
 /// Returns [`OtaFlashWriteError`] on any flash, HTTP, or verification failure.
-/// On success this function never returns (it reboots the chip).
+/// On success the function never returns — it reboots the chip.
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 pub async fn download_and_write_to_flash(
     network_stack: Stack<'static>,
     manifest: &OtaManifest,
     flash: &mut FlashStorage<'static>,
     partition_table_buf: &mut [u8; PARTITION_TABLE_MAX_LEN],
-) -> Result<(), OtaFlashWriteError> {
+) -> Result<Infallible, OtaFlashWriteError> {
     network::wait_for_config_up(network_stack).await;
 
     // ── 1.  Parse partition table + get inactive slot ──────────────────
@@ -108,31 +197,33 @@ pub async fn download_and_write_to_flash(
             .inactive_partition()
             .map_err(OtaFlashWriteError::from)?;
 
+        let slot_size = region.partition_size();
         info!(
             "OTA: writing to inactive slot {:?} (size={})",
-            slot,
-            region.partition_size()
+            slot, slot_size
         );
 
-        // ── Erase sectors needed for the image ─────────────────────
+        // ── Early size check ─────────────────────────────────────────
         let image_bytes = manifest.size;
-        // ESP32 flash sector size = 4096 bytes
-        let sector: u32 = 4096;
-        let erase_len = if region.partition_size() > 0 {
-            let aligned = image_bytes.div_ceil(sector) * sector;
-            aligned.min((region.partition_size() - 1) as u32)
-        } else {
-            return Err(OtaFlashWriteError::Partition(
-                esp_bootloader_esp_idf::partitions::Error::OutOfBounds,
-            ));
-        };
+        // Reserve one sector at the tail of the partition so we never
+        // accidentally span a partial sector.
+        let max_writable = (slot_size as u32).saturating_sub(FLASH_SECTOR_SIZE);
+        if image_bytes > max_writable {
+            return Err(OtaFlashWriteError::ImageTooLargeForSlot {
+                size: image_bytes,
+                slot_size: slot_size as u32,
+            });
+        }
+        let aligned = image_bytes.div_ceil(FLASH_SECTOR_SIZE) * FLASH_SECTOR_SIZE;
+
+        // ── Erase sectors needed for the image ─────────────────────
         info!(
             "OTA: erasing {} bytes ({} sectors) for {} byte image...",
-            erase_len,
-            erase_len / sector,
+            aligned,
+            aligned / FLASH_SECTOR_SIZE,
             image_bytes
         );
-        NorFlash::erase(&mut region, 0, erase_len).map_err(OtaFlashWriteError::from)?;
+        NorFlash::erase(&mut region, 0, aligned).map_err(OtaFlashWriteError::from)?;
         info!("OTA: erase complete");
 
         // ── Download via HTTP, write to flash, hash on the fly ─────────
@@ -188,6 +279,7 @@ pub async fn download_and_write_to_flash(
         let mut body = response.body().reader();
         let mut first_bytes = [0u8; 64];
         let mut first_filled: usize = 0;
+        let mut prefix_validated = false;
         let mut total: usize = 0;
         let mut flash_offset: u32 = 0;
         let mut hasher = Sha256::new();
@@ -202,17 +294,22 @@ pub async fn download_and_write_to_flash(
             }
             let chunk = buf.len();
 
-            // Capture the first 64 bytes for ESP prefix validation.
+            // Capture the first 64 bytes for ESP prefix validation, then
+            // validate as soon as we have at least 8 bytes (the basic
+            // image header) — before writing anything to flash.
             let remaining = 64usize.saturating_sub(first_filled);
             let copy = chunk.min(remaining);
             if copy > 0 {
                 first_bytes[first_filled..first_filled + copy].copy_from_slice(&buf[..copy]);
                 first_filled += copy;
             }
+            if !prefix_validated && first_filled >= 8 {
+                validate_esp_image_prefix(&first_bytes[..first_filled])?;
+                prefix_validated = true;
+            }
 
-            // Write chunk to flash and hash.
+            // Hash the chunk and write it to flash.
             hasher.update(&buf[..chunk]);
-
             Storage::write(&mut region, flash_offset, &buf[..chunk])
                 .map_err(OtaFlashWriteError::from)?;
 
@@ -239,8 +336,6 @@ pub async fn download_and_write_to_flash(
             );
             return Err(OtaFlashWriteError::ShaMismatch);
         }
-
-        validate_esp_image_prefix(&first_bytes[..first_filled])?;
 
         // ── Read back first 256 bytes from flash and compare ───────────
         let readback_len = 256.min(total);

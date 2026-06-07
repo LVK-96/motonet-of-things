@@ -8,9 +8,11 @@ use esp_bootloader_esp_idf::{
 
 /// Minimal wrapper around ESP-IDF OTA boot metadata.
 ///
-/// This is intentionally not wired into startup yet because flash ownership is
-/// platform-specific. Startup code can create this once it owns a flash storage
-/// instance that implements [`embedded_storage::Storage`].
+/// The OTA task and the post-reboot health confirmation task each create
+/// their own instance from a flash storage handle owned by the caller
+/// (currently the shared `app_bus::FLASH` mutex). The wrapper does not retain
+/// the storage; the caller must keep it alive for the lifetime of the
+/// `OtaBootMetadata`.
 pub struct OtaBootMetadata<'a, F>
 where
     F: Storage,
@@ -124,6 +126,12 @@ where
     }
 
     /// Mark the currently selected app as new in OTA metadata.
+    ///
+    /// `activate_next_partition` already points the otadata record at the
+    /// newly written slot, so this is a defensive write to make the `New`
+    /// state explicit before the post-reboot confirm task inspects it.
+    /// Leaving the call in place keeps the state intent obvious to readers
+    /// and avoids relying on undocumented bootloader defaults.
     ///
     /// # Errors
     ///

@@ -237,8 +237,8 @@ On OTA manifest received:
 
 1. Pass manifest bytes to the OTA task/channel.
 2. OTA task validates manifest authenticity/policy before entering maintenance mode.
-3. If the manifest is accepted, OTA task sets `RuntimeMode::OtaDownloading`.
-4. MQTT observes runtime mode, disconnects/stands down, and publishes `MqttSessionState::Disconnected` to a watch.
+3. If the manifest is accepted, OTA task sets `OtaState::Downloading`.
+4. MQTT observes the OTA state, disconnects/stands down, and publishes `MqttHealth::Disconnected` to a watch.
 
 Acceptance criteria:
 
@@ -274,49 +274,57 @@ Acceptance criteria:
 
 ### 13. Add OTA maintenance mode
 
-Use two separate concepts:
+Use `ota-core::OtaState` directly as the OTA lifecycle / coordination surface
+observed by firmware tasks. Values: `Inactive`, `Downloading`, `Applying`,
+`PendingConfirmation`.
 
-- `ota-core::OtaState`: OTA lifecycle/power policy (`Inactive`, `Downloading`, `Applying`, `PendingConfirmation`).
-- `app-core::RuntimeMode`: app-wide coordination surface observed by firmware tasks.
-
-Add `RuntimeMode` to `crates/app-core`:
-
-```rust
-pub enum RuntimeMode {
-    Normal,
-    OtaDownloading,
-    OtaApplying,
-}
-```
-
-Add host-tested policy helpers in `app-core`, for example:
+Host-tested policy helpers live in `ota-core`:
 
 ```rust
-runtime_mode_allows_mqtt(mode)
-runtime_mode_allows_radio_capture(mode)
-runtime_mode_allows_ui_input(mode)
-runtime_mode_display_message(mode)
+is_mqtt_allowed(state)
+is_radio_capture_allowed(state)
+is_ui_input_allowed(state)
+display_message(state)
+classify_ota_manifest_delivery(state, retained)
 ```
 
-Expose runtime mode in firmware through a single watch in `firmware/src/app_bus.rs`. The OTA task is the only writer during OTA; MQTT, radio, display, and UI input are observers. This avoids direct OTA dependencies in those tasks.
+Expose OTA state in firmware through a single watch in
+`firmware/src/app_bus.rs` (`OTA_STATE_WATCH`). The OTA task is the only
+writer during OTA; MQTT, radio, display, and UI input are observers. This
+avoids direct OTA dependencies in those tasks.
 
-During `RuntimeMode::OtaDownloading`:
+State phases during an OTA update:
+
+- `Downloading` — HTTP fetch in progress, no flash writes yet.
+- `Applying` — image verified, streaming to flash, slot activation pending.
+- `Inactive` — no OTA activity.
+- `PendingConfirmation` — new image booted, awaiting health gate.
+
+During `OtaState::Downloading` and `OtaState::Applying`:
 
 - Wi-Fi/network stack remains active.
-- MQTT disconnects/stands down before HTTP download.
-- OTA task waits up to 5 seconds for `MqttSessionState::Disconnected`; if the timeout expires, it logs a warning and proceeds with HTTP download.
-- 433MHz radio capture/decoding pauses at task level. Add local radio quiesce/resume hooks that are initially no-ops/logging, so CC1101 sleep/reinitialization can be added later without changing OTA coordination.
-- Display shows a static OTA screen, e.g. `OTA download...`.
+- MQTT disconnects/stands down before HTTP download. OTA task races a
+  5 second timeout against the actual `MqttHealth::Disconnected`
+  transition so it doesn't burn the full timeout on a fast teardown.
+- 433MHz radio capture/decoding pauses at task level. Add local radio
+  quiesce/resume hooks that are initially no-ops/logging, so CC1101
+  sleep/reinitialization can be added later without changing OTA
+  coordination.
+- Display shows a static OTA screen (`OTA download...` /
+  `OTA applying...`).
 - UI navigation/settings input is ignored.
 - Deep sleep remains blocked by the existing OTA state/guard.
 - Normal mode is restored after download verification succeeds or fails.
 
 Acceptance criteria:
 
-- Tasks depend on `app-core::RuntimeMode`/policy helpers, not on OTA task internals.
-- MQTT publishes `MqttSessionState` to a watch; OTA can wait for MQTT stand-down.
+- Tasks depend on `ota-core::OtaState` / policy helpers, not on OTA
+  task internals.
+- MQTT publishes `MqttHealth` to a watch; OTA can wait for MQTT
+  stand-down via that watch.
 - Device does not enter sleep during OTA.
-- Normal MQTT/radio/display/UI behavior resumes after OTA download verification ends.
+- Normal MQTT/radio/display/UI behavior resumes after OTA download
+  verification ends.
 
 ### 14. Implement local HTTP download for dev OTA
 
@@ -356,7 +364,7 @@ ESP image prefix validation is conservative plausibility only:
 
 Download verification checks:
 
-- Manifest parses and verifies before entering `RuntimeMode::OtaDownloading`.
+- Manifest parses and verifies before entering `OtaState::Downloading`.
 - Byte count equals manifest `size`.
 - SHA-256 matches manifest.
 - Retained prefix passes `ota-core` ESP image prefix validation.
@@ -393,6 +401,11 @@ After verification:
 
 ```rust
 ota_updater.activate_next_partition()?;
+// Defensive explicit write of OtaImageState::New — activate_next_partition
+// already points otadata at the new slot, but this makes the intent
+// obvious to readers and avoids relying on undocumented bootloader
+// defaults.
+ota_updater.set_current_ota_state(OtaImageState::New)?;
 reboot();
 ```
 
@@ -556,12 +569,12 @@ motonet/<DEVICE_ID>/cmd/ota
 ```
 
 5. Device verifies manifest signature and URL policy.
-6. Device enters `RuntimeMode::OtaDownloading`.
+6. Device enters `OtaState::Downloading`.
 7. MQTT disconnects/stands down, or OTA proceeds after the 5 second stand-down timeout with a warning.
 8. Radio capture pauses, UI input is ignored, and display shows static OTA screen.
 9. Device downloads image over local HTTP.
 10. Device verifies status/content-length, final byte count, SHA-256, and 64-byte ESP image prefix.
-11. Device logs success/failure and returns to `RuntimeMode::Normal`.
+11. Device logs success/failure and returns to `OtaState::Inactive`.
 12. Device does not write flash, activate a slot, or reboot in this slice.
 
 ### Full local OTA success test

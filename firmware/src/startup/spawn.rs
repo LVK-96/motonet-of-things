@@ -58,13 +58,16 @@ pub(crate) fn spawn_tasks(spawner: &Spawner, context: HWContext) {
         .expect("Failed to get OTA state receiver for display");
     let ota_state_sender_confirm = app_bus::OTA_STATE_WATCH.sender();
 
-    // MQTT health watch for OTA confirmation
+    // MQTT health watch for OTA confirmation + stand-down detection.
     let mqtt_health_sender = app_bus::MQTT_HEALTH_WATCH.sender();
-    let mqtt_health_receiver = app_bus::MQTT_HEALTH_WATCH
+    let mqtt_health_receiver_confirm = app_bus::MQTT_HEALTH_WATCH
         .receiver()
         .expect("Failed to get MQTT health receiver for OTA confirmation");
     let mqtt_health_receiver_ref: &'static mut app_bus::MqttHealthReceiver =
-        MQTT_HEALTH_RX_STORAGE.init_with(move || mqtt_health_receiver);
+        MQTT_HEALTH_RX_STORAGE.init_with(move || mqtt_health_receiver_confirm);
+    let mqtt_health_receiver_ota = app_bus::MQTT_HEALTH_WATCH
+        .receiver()
+        .expect("Failed to get MQTT health receiver for OTA task");
 
     if let Some(channel) = led_channel {
         info!("LED hardware configured! Spawning task...");
@@ -165,6 +168,7 @@ pub(crate) fn spawn_tasks(spawner: &Spawner, context: HWContext) {
         ota_task::ota_task(
             app_bus::OTA_COMMAND_CHANNEL.receiver(),
             ota_state_sender,
+            mqtt_health_receiver_ota,
             network_stack,
             flash_mutex,
         ),

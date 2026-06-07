@@ -117,13 +117,7 @@ where
 {
     unsafe { client.buffer_mut().reset() };
 
-    let mut topic: heapless::String<{ ota_core::MQTT_TOPIC_MAX_LEN }> = heapless::String::new();
-    core::write!(
-        &mut topic,
-        "motonet/{}/ota/status",
-        crate::secrets::DEVICE_ID
-    )
-    .map_err(|_| ())?;
+    let topic = ota_core::ota_status_topic(crate::secrets::DEVICE_ID).map_err(|_| ())?;
 
     let topic_str = MqttString::from_str(topic.as_str()).map_err(|_| ())?;
     let topic_name = TopicName::new_unchecked(topic_str);
