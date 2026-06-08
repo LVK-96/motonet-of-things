@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use ed25519_dalek::{Signature, Verifier as DalekVerifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-pub const SCHEMA_VERSION: u8 = 1;
+pub const SCHEMA_VERSION: u8 = 2;
 pub const TARGET: &str = "motonet-of-things/esp32";
 pub const CHIP: &str = "esp32-wroom";
 
@@ -24,10 +24,14 @@ pub const MAX_VERSION_LEN: usize = 32;
 pub const MAX_TARGET_LEN: usize = 48;
 pub const MAX_CHIP_LEN: usize = 24;
 pub const MAX_REDIRECTS: usize = 3;
+pub const MAX_REDIRECT_URL_LEN: usize = 2048;
 pub const MQTT_TOPIC_MAX_LEN: usize = 96;
 pub const OTA_CONFIRMATION_DELAY_SECS: u32 = 30;
 pub const SHA256_HEX_LEN: usize = 64;
 pub const ED25519_SIGNATURE_HEX_LEN: usize = 128;
+pub const ENC_NONCE_PREFIX_HEX_LEN: usize = 24;
+pub const ENC_CHUNK_SIZE: u32 = 4096;
+pub const ENC_ALG: &str = "AES-256-CTR-HMAC-SHA256";
 pub const DEV_TEST_KEY_ID: u32 = 1001;
 pub const RELEASE_KEY_ID: u32 = 1;
 pub const DEV_TEST_PUBLIC_KEY_HEX: &str =
@@ -203,6 +207,7 @@ pub enum OtaUrlPolicyError {
     InvalidScheme,
     UserInfoNotAllowed,
     HostMustBeIpv4,
+    InvalidHttpsHost,
     MissingPort,
     EmptyPath,
     QueryNotAllowed,
@@ -211,17 +216,30 @@ pub enum OtaUrlPolicyError {
 
 /// Validate the firmware OTA download URL policy.
 ///
-/// Only local, explicit-port HTTP URLs are accepted:
-/// `http://<ipv4>:<port>/<path>`.
+/// The firmware accepts two download profiles:
+///
+/// - local dev OTA: `http://<ipv4>:<port>/<path>` with no query string.
+/// - GitHub/release OTA: `https://<hostname>[:port]/<path>[?query]`.
+///
+/// Redirect targets are validated with the same policy by the firmware
+/// downloader; HTTPS query strings are allowed because GitHub release asset
+/// redirects use signed query parameters.
 ///
 /// # Errors
 ///
-/// Returns [`OtaUrlPolicyError`] when the URL is outside the firmware's
-/// intentionally narrow OTA download policy.
+/// Returns [`OtaUrlPolicyError`] when the URL is outside the firmware's OTA
+/// download policy.
 pub fn validate_ota_url_policy(url: &str) -> Result<(), OtaUrlPolicyError> {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return Err(OtaUrlPolicyError::InvalidScheme);
-    };
+    if let Some(rest) = url.strip_prefix("http://") {
+        return validate_local_http_url(rest);
+    }
+    if let Some(rest) = url.strip_prefix("https://") {
+        return validate_https_url(rest);
+    }
+    Err(OtaUrlPolicyError::InvalidScheme)
+}
+
+fn validate_local_http_url(rest: &str) -> Result<(), OtaUrlPolicyError> {
     if rest.contains('#') {
         return Err(OtaUrlPolicyError::FragmentNotAllowed);
     }
@@ -245,6 +263,38 @@ pub fn validate_ota_url_policy(url: &str) -> Result<(), OtaUrlPolicyError> {
         return Err(OtaUrlPolicyError::MissingPort);
     }
     validate_ipv4_host(host)
+}
+
+fn validate_https_url(rest: &str) -> Result<(), OtaUrlPolicyError> {
+    if rest.contains('#') {
+        return Err(OtaUrlPolicyError::FragmentNotAllowed);
+    }
+
+    let Some((authority, path_and_query)) = rest.split_once('/') else {
+        return Err(OtaUrlPolicyError::EmptyPath);
+    };
+    if authority.contains('@') {
+        return Err(OtaUrlPolicyError::UserInfoNotAllowed);
+    }
+    if path_and_query.is_empty() || path_and_query.starts_with('?') {
+        return Err(OtaUrlPolicyError::EmptyPath);
+    }
+
+    let (host, port) = authority
+        .rsplit_once(':')
+        .map_or((authority, None), |(host, port)| {
+            if port.bytes().all(|byte| byte.is_ascii_digit()) {
+                (host, Some(port))
+            } else {
+                (authority, None)
+            }
+        });
+    if let Some(port) = port
+        && !valid_port(port)
+    {
+        return Err(OtaUrlPolicyError::MissingPort);
+    }
+    validate_https_host(host)
 }
 
 fn valid_port(port: &str) -> bool {
@@ -275,6 +325,26 @@ fn validate_ipv4_host(host: &str) -> Result<(), OtaUrlPolicyError> {
         }
         if value > 255 {
             return Err(OtaUrlPolicyError::HostMustBeIpv4);
+        }
+    }
+    Ok(())
+}
+
+fn validate_https_host(host: &str) -> Result<(), OtaUrlPolicyError> {
+    if host.is_empty()
+        || host.len() > 253
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return Err(OtaUrlPolicyError::InvalidHttpsHost);
+    }
+
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-') {
+            return Err(OtaUrlPolicyError::InvalidHttpsHost);
         }
     }
     Ok(())
@@ -364,6 +434,17 @@ pub fn ota_status_topic(
     Ok(topic)
 }
 
+// ── v2 manifest model ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncMetadata {
+    pub alg: String,
+    pub key_id: u32,
+    pub chunk_size: u32,
+    pub nonce_prefix: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OtaManifest {
@@ -375,8 +456,10 @@ pub struct OtaManifest {
     pub build: u32,
     pub force: bool,
     pub url: String,
-    pub size: u32,
-    pub sha256: String,
+    pub download_size: u32,
+    pub image_size: u32,
+    pub image_sha256: String,
+    pub enc: EncMetadata,
     pub signature: String,
 }
 
@@ -388,9 +471,14 @@ pub enum ManifestError {
     WrongTarget,
     WrongChip,
     FieldTooLong(&'static str),
-    InvalidSha256,
+    InvalidImageSha256,
     MissingSignature,
     SignatureRejected,
+    InvalidEncAlgorithm,
+    InvalidEncChunkSize,
+    InvalidEncNoncePrefix,
+    InvalidImageSize,
+    InvalidDownloadSize,
 }
 
 pub trait SignatureVerifier {
@@ -516,7 +604,8 @@ impl OtaManifest {
         }
     }
 
-    /// Validate manifest schema, target identity, fixed limits, and hash shape.
+    /// Validate manifest schema, target identity, fixed limits, hash shape,
+    /// encryption metadata, and download-size consistency.
     ///
     /// # Errors
     ///
@@ -535,10 +624,13 @@ impl OtaManifest {
         validate_len("chip", &self.chip, MAX_CHIP_LEN)?;
         validate_len("version", &self.version, MAX_VERSION_LEN)?;
         validate_len("url", &self.url, MAX_URL_LEN)?;
-        if self.sha256.len() != SHA256_HEX_LEN
-            || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        if self.image_sha256.len() != SHA256_HEX_LEN
+            || !self
+                .image_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
         {
-            return Err(ManifestError::InvalidSha256);
+            return Err(ManifestError::InvalidImageSha256);
         }
         if self.signature.is_empty() {
             return Err(ManifestError::MissingSignature);
@@ -547,6 +639,32 @@ impl OtaManifest {
             || !self.signature.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(ManifestError::SignatureRejected);
+        }
+        // Encryption metadata validation.
+        if self.enc.alg != ENC_ALG {
+            return Err(ManifestError::InvalidEncAlgorithm);
+        }
+        if self.enc.chunk_size != ENC_CHUNK_SIZE {
+            return Err(ManifestError::InvalidEncChunkSize);
+        }
+        if self.enc.nonce_prefix.len() != ENC_NONCE_PREFIX_HEX_LEN
+            || !self
+                .enc
+                .nonce_prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(ManifestError::InvalidEncNoncePrefix);
+        }
+        if self.image_size == 0 {
+            return Err(ManifestError::InvalidImageSize);
+        }
+        // download_size = 16 (OTA header) + image_size + num_chunks * 36 (HMAC per chunk)
+        let chunk_size = u64::from(ENC_CHUNK_SIZE);
+        let num_chunks = u64::from(self.image_size).div_ceil(chunk_size);
+        let expected_download = 16u64 + u64::from(self.image_size) + num_chunks * 36;
+        if u64::from(self.download_size) != expected_download {
+            return Err(ManifestError::InvalidDownloadSize);
         }
         Ok(())
     }
@@ -582,9 +700,19 @@ fn json_string(value: &str) -> Result<String, ManifestError> {
     serde_json::to_string(value).map_err(|_| ManifestError::Malformed)
 }
 
+fn canonical_enc_json(enc: &EncMetadata) -> Result<String, ManifestError> {
+    Ok(format!(
+        "{{\"alg\":{},\"key_id\":{},\"chunk_size\":{},\"nonce_prefix\":{}}}",
+        json_string(&enc.alg)?,
+        enc.key_id,
+        enc.chunk_size,
+        json_string(&enc.nonce_prefix)?,
+    ))
+}
+
 fn canonical_unsigned_json(manifest: &OtaManifest) -> Result<String, ManifestError> {
     Ok(format!(
-        "{{\"schema\":{},\"key_id\":{},\"target\":{},\"chip\":{},\"version\":{},\"build\":{},\"force\":{},\"url\":{},\"size\":{},\"sha256\":{}}}",
+        "{{\"schema\":{},\"key_id\":{},\"target\":{},\"chip\":{},\"version\":{},\"build\":{},\"force\":{},\"url\":{},\"download_size\":{},\"image_size\":{},\"image_sha256\":{},\"enc\":{}}}",
         manifest.schema,
         manifest.key_id,
         json_string(&manifest.target)?,
@@ -593,14 +721,16 @@ fn canonical_unsigned_json(manifest: &OtaManifest) -> Result<String, ManifestErr
         manifest.build,
         manifest.force,
         json_string(&manifest.url)?,
-        manifest.size,
-        json_string(&manifest.sha256)?,
+        manifest.download_size,
+        manifest.image_size,
+        json_string(&manifest.image_sha256)?,
+        canonical_enc_json(&manifest.enc)?,
     ))
 }
 
 fn canonical_signed_json(manifest: &OtaManifest) -> Result<String, ManifestError> {
     Ok(format!(
-        "{{\"schema\":{},\"key_id\":{},\"target\":{},\"chip\":{},\"version\":{},\"build\":{},\"force\":{},\"url\":{},\"size\":{},\"sha256\":{},\"signature\":{}}}",
+        "{{\"schema\":{},\"key_id\":{},\"target\":{},\"chip\":{},\"version\":{},\"build\":{},\"force\":{},\"url\":{},\"download_size\":{},\"image_size\":{},\"image_sha256\":{},\"enc\":{},\"signature\":{}}}",
         manifest.schema,
         manifest.key_id,
         json_string(&manifest.target)?,
@@ -609,8 +739,10 @@ fn canonical_signed_json(manifest: &OtaManifest) -> Result<String, ManifestError
         manifest.build,
         manifest.force,
         json_string(&manifest.url)?,
-        manifest.size,
-        json_string(&manifest.sha256)?,
+        manifest.download_size,
+        manifest.image_size,
+        json_string(&manifest.image_sha256)?,
+        canonical_enc_json(&manifest.enc)?,
         json_string(&manifest.signature)?
     ))
 }
@@ -678,6 +810,9 @@ mod tests {
     use super::*;
 
     fn manifest() -> OtaManifest {
+        let image_size: u32 = 1_048_576;
+        let num_chunks = image_size.div_ceil(ENC_CHUNK_SIZE);
+        let download_size = 16 + image_size + num_chunks * 36;
         OtaManifest {
             schema: SCHEMA_VERSION,
             key_id: DEV_TEST_KEY_ID,
@@ -687,8 +822,16 @@ mod tests {
             build: 42,
             force: false,
             url: "http://192.168.1.10:8000/firmware.bin".to_owned(),
-            size: 1_234_567,
-            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            download_size,
+            image_size,
+            image_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            enc: EncMetadata {
+                alg: ENC_ALG.to_owned(),
+                key_id: DEV_TEST_KEY_ID,
+                chunk_size: ENC_CHUNK_SIZE,
+                nonce_prefix: "abcdef0123456789abcdef01".to_owned(),
+            },
             signature: "00".repeat(64),
         }
     }
@@ -769,9 +912,19 @@ mod tests {
             .expect("canonical json");
         assert_eq!(
             canonical,
-            "{\"schema\":1,\"key_id\":1001,\"target\":\"motonet-of-things/esp32\",\"chip\":\"esp32-wroom\",\"version\":\"0.2.0\",\"build\":42,\"force\":false,\"url\":\"http://192.168.1.10:8000/firmware.bin\",\"size\":1234567,\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}"
+            "{\"schema\":2,\"key_id\":1001,\"target\":\"motonet-of-things/esp32\",\"chip\":\"esp32-wroom\",\"version\":\"0.2.0\",\"build\":42,\"force\":false,\"url\":\"http://192.168.1.10:8000/firmware.bin\",\"download_size\":1057808,\"image_size\":1048576,\"image_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"enc\":{\"alg\":\"AES-256-CTR-HMAC-SHA256\",\"key_id\":1001,\"chunk_size\":4096,\"nonce_prefix\":\"abcdef0123456789abcdef01\"}}"
         );
         assert!(!canonical.contains("signature"));
+    }
+
+    #[test]
+    fn canonical_signed_json_includes_signature_last() {
+        let signed = manifest().canonical_signed_json().expect("signed json");
+        assert!(signed.ends_with("00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"}"));
+        // The unsigned prefix should be present and signature must be the last field.
+        let unsigned = manifest().canonical_unsigned_json().expect("unsigned json");
+        assert!(signed.starts_with(&unsigned[..unsigned.len() - 1])); // strip trailing }
+        assert!(signed.contains(",\"signature\":"));
     }
 
     #[test]
@@ -784,7 +937,7 @@ mod tests {
     #[test]
     fn validation_rejects_wrong_shape() {
         let mut wrong_schema = manifest();
-        wrong_schema.schema = 2;
+        wrong_schema.schema = 1;
         assert_eq!(wrong_schema.validate(), Err(ManifestError::WrongSchema));
 
         let mut wrong_target = manifest();
@@ -796,8 +949,68 @@ mod tests {
         assert_eq!(wrong_chip.validate(), Err(ManifestError::WrongChip));
 
         let mut bad_hash = manifest();
-        bad_hash.sha256 = "not-a-sha".to_owned();
-        assert_eq!(bad_hash.validate(), Err(ManifestError::InvalidSha256));
+        bad_hash.image_sha256 = "not-a-sha".to_owned();
+        assert_eq!(bad_hash.validate(), Err(ManifestError::InvalidImageSha256));
+    }
+
+    #[test]
+    fn validation_rejects_bad_enc_algorithm() {
+        let mut m = manifest();
+        m.enc.alg = "CHACHA20-POLY1305".to_owned();
+        assert_eq!(m.validate(), Err(ManifestError::InvalidEncAlgorithm));
+    }
+
+    #[test]
+    fn validation_rejects_bad_enc_chunk_size() {
+        let mut m = manifest();
+        m.enc.chunk_size = 8192;
+        assert_eq!(m.validate(), Err(ManifestError::InvalidEncChunkSize));
+    }
+
+    #[test]
+    fn validation_rejects_bad_enc_nonce_prefix() {
+        let mut m = manifest();
+        m.enc.nonce_prefix = "tooshort".to_owned();
+        assert_eq!(m.validate(), Err(ManifestError::InvalidEncNoncePrefix));
+
+        let mut m = manifest();
+        m.enc.nonce_prefix = "gggggggggggggggggggggggg".to_owned(); // 24 non-hex chars
+        assert_eq!(m.validate(), Err(ManifestError::InvalidEncNoncePrefix));
+    }
+
+    #[test]
+    fn validation_rejects_zero_image_size() {
+        let mut m = manifest();
+        m.image_size = 0;
+        assert_eq!(m.validate(), Err(ManifestError::InvalidImageSize));
+    }
+
+    #[test]
+    fn validation_rejects_mismatched_download_size() {
+        let mut m = manifest();
+        m.download_size += 1;
+        assert_eq!(m.validate(), Err(ManifestError::InvalidDownloadSize));
+
+        let mut m = manifest();
+        m.download_size = 0;
+        assert_eq!(m.validate(), Err(ManifestError::InvalidDownloadSize));
+    }
+
+    #[test]
+    fn validation_accepts_correct_download_size_for_exact_chunk_boundary() {
+        // When image_size is an exact multiple of chunk_size (4096), the formula still holds.
+        let mut m = manifest();
+        m.image_size = 4096; // exactly 1 chunk
+        m.download_size = 16 + 4096 + 1 * 36; // = 4148
+        assert_eq!(m.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validation_accepts_correct_download_size_for_partial_last_chunk() {
+        let mut m = manifest();
+        m.image_size = 4097; // 2 chunks
+        m.download_size = 16 + 4097 + 2 * 36; // = 16 + 4097 + 72 = 4185
+        assert_eq!(m.validate(), Ok(()));
     }
 
     #[test]
@@ -808,6 +1021,21 @@ mod tests {
             Err(ManifestError::Oversized)
         );
         assert_eq!(OtaManifest::parse(b"{"), Err(ManifestError::Malformed));
+    }
+
+    #[test]
+    fn parser_rejects_unknown_fields_on_enc_metadata() {
+        // EncMetadata has deny_unknown_fields, so an extra field inside "enc" is malformed.
+        let json = format!(
+            r#"{{"schema":2,"key_id":1001,"target":"motonet-of-things/esp32","chip":"esp32-wroom","version":"0.2.0","build":42,"force":false,"url":"http://192.168.1.10:8000/firmware.bin","download_size":{},"image_size":{},"image_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","enc":{{"alg":"AES-256-CTR-HMAC-SHA256","key_id":1001,"chunk_size":4096,"nonce_prefix":"abcdef0123456789abcdef01","extra":true}},"signature":"{}"}}"#,
+            manifest().download_size,
+            manifest().image_size,
+            "00".repeat(64),
+        );
+        assert_eq!(
+            OtaManifest::parse(json.as_bytes()),
+            Err(ManifestError::Malformed)
+        );
     }
 
     fn sign_manifest(mut manifest: OtaManifest) -> OtaManifest {
@@ -846,15 +1074,35 @@ mod tests {
     }
 
     #[test]
-    fn ota_url_policy_rejects_https_scheme() {
+    fn ota_url_policy_accepts_github_https_release_urls() {
         assert_eq!(
-            validate_ota_url_policy("https://192.168.1.10:8000/firmware.bin"),
+            validate_ota_url_policy(
+                "https://github.com/leo/motonet-of-things/releases/download/v0.2.0/firmware.bin"
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_accepts_https_query_strings_for_github_redirects() {
+        assert_eq!(
+            validate_ota_url_policy(
+                "https://release-assets.githubusercontent.com/github-production-release-asset/123/firmware.bin?sp=r&sig=abc"
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_rejects_unsupported_schemes() {
+        assert_eq!(
+            validate_ota_url_policy("ftp://192.168.1.10:8000/firmware.bin"),
             Err(OtaUrlPolicyError::InvalidScheme)
         );
     }
 
     #[test]
-    fn ota_url_policy_rejects_hostnames() {
+    fn ota_url_policy_rejects_http_hostnames() {
         assert_eq!(
             validate_ota_url_policy("http://ota.local:8000/firmware.bin"),
             Err(OtaUrlPolicyError::HostMustBeIpv4)
@@ -926,6 +1174,24 @@ mod tests {
         assert_eq!(
             validate_ota_url_policy("http://user@192.168.1.10:8000/firmware.bin"),
             Err(OtaUrlPolicyError::UserInfoNotAllowed)
+        );
+        assert_eq!(
+            validate_ota_url_policy(
+                "https://user@github.com/owner/repo/releases/download/v1/fw.bin"
+            ),
+            Err(OtaUrlPolicyError::UserInfoNotAllowed)
+        );
+    }
+
+    #[test]
+    fn ota_url_policy_rejects_invalid_https_hosts() {
+        assert_eq!(
+            validate_ota_url_policy("https://bad_host.example/releases/fw.bin"),
+            Err(OtaUrlPolicyError::InvalidHttpsHost)
+        );
+        assert_eq!(
+            validate_ota_url_policy("https://-github.com/releases/fw.bin"),
+            Err(OtaUrlPolicyError::InvalidHttpsHost)
         );
     }
 
@@ -1048,7 +1314,7 @@ mod tests {
             .expect("signed json");
 
         let tamper_cases: &[fn(&mut OtaManifest)] = &[
-            |manifest| manifest.schema = 2,
+            |manifest| manifest.schema = 1,
             |manifest| manifest.key_id = 42,
             |manifest| manifest.target = "other-target".to_owned(),
             |manifest| manifest.chip = "esp32-s3".to_owned(),
@@ -1056,10 +1322,18 @@ mod tests {
             |manifest| manifest.build += 1,
             |manifest| manifest.force = !manifest.force,
             |manifest| manifest.url = "http://192.168.1.10:8000/other.bin".to_owned(),
-            |manifest| manifest.size += 1,
+            |manifest| manifest.download_size += 1,
+            |manifest| manifest.image_size += 1,
             |manifest| {
-                manifest.sha256 =
+                manifest.image_sha256 =
                     "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned();
+            },
+            // Tamper enc metadata fields individually.
+            |manifest| manifest.enc.alg = "WRONG".to_owned(),
+            |manifest| manifest.enc.key_id = 999,
+            |manifest| manifest.enc.chunk_size = 1,
+            |manifest| {
+                manifest.enc.nonce_prefix = "ffffffffffffffffffffffff".to_owned();
             },
         ];
 
@@ -1078,10 +1352,15 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_unknown_fields() {
+    fn parser_rejects_unknown_fields_on_outer_manifest() {
         assert_eq!(
             OtaManifest::parse(
-                br#"{"schema":1,"key_id":1001,"target":"motonet-of-things/esp32","chip":"esp32-wroom","version":"0.2.0","build":42,"force":false,"url":"http://192.168.1.10:8000/firmware.bin","size":1234567,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","signature":"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","extra":true}"#,
+                format!(
+                    r#"{{"schema":2,"key_id":1001,"target":"motonet-of-things/esp32","chip":"esp32-wroom","version":"0.2.0","build":42,"force":false,"url":"http://192.168.1.10:8000/firmware.bin","download_size":{},"image_size":{},"image_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","enc":{{"alg":"AES-256-CTR-HMAC-SHA256","key_id":1001,"chunk_size":4096,"nonce_prefix":"abcdef0123456789abcdef01"}},"signature":"{}","extra":true}}"#,
+                    manifest().download_size,
+                    manifest().image_size,
+                    "00".repeat(64),
+                ).as_bytes(),
             ),
             Err(ManifestError::Malformed)
         );
