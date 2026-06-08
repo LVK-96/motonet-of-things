@@ -12,4 +12,4 @@ build-std = ["core", "alloc"]
 [env]
 # Production-friendly default. Override per run for development:
 # DEFMT_LOG=info|debug|trace cargo run --release
-DEFMT_LOG = "warn"
+DEFMT_LOG = "info"

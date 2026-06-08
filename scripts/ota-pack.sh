@@ -20,6 +20,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CHUNK_SIZE=4096
+# Keep these limits in sync with crates/ota-core/src/lib.rs.
+MAX_MANIFEST_BYTES=1024
+MAX_VERSION_LEN=32
+MAX_U32=4294967295
 TARGET="motonet-of-things/esp32"
 CHIP="esp32-wroom"
 
@@ -53,6 +57,7 @@ Required (one of):
 Optional:
   --signing-key-id NUM          Manifest signing key_id (default 1001)
   --nonce-prefix-hex HEX        24-char hex nonce prefix (auto-gen if unset)
+  -f, --force                   Set manifest force=true
 
 Examples:
   # dev manifest (key_id 1001)
@@ -104,6 +109,7 @@ ota_key_id=""
 master_key_hex=""
 signing_key_id=""
 nonce_prefix=""
+force_flag=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -118,6 +124,8 @@ while [[ $# -gt 0 ]]; do
         --ota-key-id) ota_key_id="$2"; shift 2 ;;
         --ota-master-key-hex-file) master_key_hex="$(tr -d '[:space:]' < "$2")"; shift 2 ;;
         --nonce-prefix-hex) nonce_prefix="$2"; shift 2 ;;
+        --force) force_flag=true; shift ;;
+        -f) force_flag=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Error: unknown option: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -143,6 +151,14 @@ fi
 
 if [[ ! "$build_num" =~ ^[0-9]+$ ]]; then
     echo "Error: --build must be a non-negative integer, got: $build_num" >&2
+    exit 1
+fi
+if (( build_num > MAX_U32 )); then
+    echo "Error: --build must fit u32 (<= $MAX_U32), got: $build_num" >&2
+    exit 1
+fi
+if (( ${#version} > MAX_VERSION_LEN )); then
+    echo "Error: --version must be <= $MAX_VERSION_LEN bytes for firmware manifest parsing, got ${#version}: $version" >&2
     exit 1
 fi
 
@@ -243,7 +259,7 @@ unsigned_json="$(jq -cn \
     --arg chip "$CHIP" \
     --arg version "$version" \
     --argjson build "$build_num" \
-    --argjson force false \
+    --argjson force "$force_flag" \
     --arg url "$url" \
     --argjson download_size "$download_size" \
     --argjson image_size "$image_size" \
@@ -290,6 +306,11 @@ validate_hex_chars "signature" "$signature_hex" 128
 
 # Build final signed manifest JSON (signature last field)
 signed_json="$(printf '%s' "$unsigned_json" | jq -c --arg sig "$signature_hex" '. + {signature:$sig}')"
+manifest_bytes="$(printf '%s' "$signed_json" | wc -c)"
+if (( manifest_bytes > MAX_MANIFEST_BYTES )); then
+    echo "Error: signed manifest must be <= $MAX_MANIFEST_BYTES bytes for firmware MQTT ingestion, got $manifest_bytes" >&2
+    exit 1
+fi
 
 # ── Write encrypted container ──────────────────────────────────────────────
 

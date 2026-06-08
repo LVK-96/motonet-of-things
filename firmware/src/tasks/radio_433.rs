@@ -16,6 +16,7 @@ use crate::pulse_capture::PulseCapture;
 #[cfg(feature = "pulse_rmt")]
 use crate::pulse_capture::apply_pending_settings;
 use crate::radio_433::{Cc1101Radio, Radio433};
+use crate::radio_settings;
 
 use app_core::rtc_schema;
 use ota_core::{OtaState, is_radio_capture_allowed};
@@ -341,6 +342,23 @@ async fn prepare_radio_for_capture(radio: &mut Cc1101Radio) -> Result<RadioSetti
             "Wake {}: no persisted RF profile, skipping sweep and using defaults",
             wake_class
         );
+    }
+
+    if let Some(settings) = radio_settings::load_settings() {
+        if let Err(e) = radio.apply_settings(settings) {
+            warn!(
+                "Failed to restore persisted radio settings after RF profile: {:?}",
+                e
+            );
+        } else {
+            info!(
+                "Restored persisted radio settings: threshold={}dB magn_target={} bandwidth={}kHz carrier_sense={}",
+                settings.detection_threshold_db,
+                settings.magn_target,
+                crate::messages::channel_bandwidth_hz(settings.channel_bandwidth_index) / 1000,
+                settings.carrier_sense_threshold
+            );
+        }
     }
 
     let stats = sample_signal_stats(radio, 60, Duration::from_millis(50)).await;

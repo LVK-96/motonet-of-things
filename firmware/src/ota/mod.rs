@@ -1,6 +1,60 @@
+use core::mem::MaybeUninit;
+use core::ptr::addr_of_mut;
+
 mod boot_metadata;
 pub mod encrypted;
 pub mod flash_write;
+
+/// AES peripheral handle, initialised during `hw_setup` before any task runs.
+/// SAFETY: initialised exactly once before any task accesses it.
+#[allow(improper_ctypes_definitions)]
+static mut AES_PERIPHERAL: MaybeUninit<esp_hal::peripherals::AES<'static>> = MaybeUninit::uninit();
+/// SHA peripheral handle, initialised during `hw_setup` before any task runs.
+/// SAFETY: initialised exactly once before any task accesses it.
+#[allow(improper_ctypes_definitions)]
+static mut SHA_PERIPHERAL: MaybeUninit<esp_hal::peripherals::SHA<'static>> = MaybeUninit::uninit();
+
+/// # Safety
+/// Call exactly once during `hw_setup`, before any task accesses the peripheral.
+pub(crate) unsafe fn init_crypto_peripherals(
+    aes: esp_hal::peripherals::AES<'static>,
+    sha: esp_hal::peripherals::SHA<'static>,
+) {
+    unsafe {
+        addr_of_mut!(AES_PERIPHERAL).write(MaybeUninit::new(aes));
+        addr_of_mut!(SHA_PERIPHERAL).write(MaybeUninit::new(sha));
+    }
+}
+
+/// # Safety
+/// Must only be called after `init_crypto_peripherals` has been called.
+pub(crate) unsafe fn take_aes() -> esp_hal::peripherals::AES<'static> {
+    unsafe {
+        addr_of_mut!(AES_PERIPHERAL)
+            .read()
+            .assume_init()
+            .clone_unchecked()
+    }
+}
+
+/// # Safety
+/// Must only be called after `init_crypto_peripherals` has been called.
+pub(crate) unsafe fn take_sha() -> esp_hal::peripherals::SHA<'static> {
+    unsafe {
+        addr_of_mut!(SHA_PERIPHERAL)
+            .read()
+            .assume_init()
+            .clone_unchecked()
+    }
+}
+
+/// Get a reference to the SHA peripheral without consuming it.
+///
+/// # Safety
+/// Must only be called after `init_crypto_peripherals`.
+pub(crate) unsafe fn sha_ref() -> &'static esp_hal::peripherals::SHA<'static> {
+    unsafe { (*addr_of_mut!(SHA_PERIPHERAL)).assume_init_ref() }
+}
 
 pub use boot_metadata::OtaBootMetadata;
 pub use flash_write::OtaFlashWriteError;

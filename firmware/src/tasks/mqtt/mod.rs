@@ -10,7 +10,8 @@ use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::{Read as AsyncRead, Write as AsyncWrite};
 use embedded_tls::{Aes128GcmSha256, TlsConnection};
 use ota_core::{
-    OtaManifestDeliveryAction, OtaState, classify_ota_manifest_delivery, is_mqtt_allowed,
+    Ed25519ManifestVerifier, OtaManifest, OtaManifestDeliveryAction, OtaState,
+    classify_ota_manifest_delivery, is_mqtt_allowed,
 };
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
@@ -20,6 +21,16 @@ use crate::app_bus::{self, AppCommand};
 use crate::messages::RadioReading;
 use crate::power;
 use crate::secrets::MQTT_USE_TLS;
+
+#[cfg(feature = "release-ota")]
+fn ota_manifest_verifier() -> Ed25519ManifestVerifier {
+    Ed25519ManifestVerifier::release_ota()
+}
+
+#[cfg(not(feature = "release-ota"))]
+fn ota_manifest_verifier() -> Ed25519ManifestVerifier {
+    Ed25519ManifestVerifier::dev_test()
+}
 
 mod publish;
 mod session;
@@ -136,7 +147,24 @@ async fn handle_mqtt_event(
     };
 
     if let Some(manifest) = manifest {
-        match classify_ota_manifest_delivery(ota_state, manifest.retained) {
+        let mut action = classify_ota_manifest_delivery(ota_state, manifest.retained);
+
+        // Special case: if we're in PendingConfirmation with a retained manifest
+        // but the manifest has force=true, we should treat it as ForwardAndClearRetained
+        if matches!(action, OtaManifestDeliveryAction::ClearRetainedOnly) {
+            // Try to parse the manifest to check the force flag
+            if let Ok(m) = OtaManifest::parse_and_verify(&manifest.bytes, &ota_manifest_verifier())
+                && m.force
+            {
+                info!(
+                    "MQTT: Received retained OTA manifest with force=true during pending confirmation, forwarding"
+                );
+                action = OtaManifestDeliveryAction::ForwardAndClearRetained;
+            }
+            // If parsing fails, we keep the original ClearRetainedOnly action (safe fallback)
+        }
+
+        match action {
             OtaManifestDeliveryAction::ForwardOnly => {
                 info!("MQTT: Received live OTA manifest command, handing off to OTA task");
                 ota_sender.send(manifest.bytes).await;
