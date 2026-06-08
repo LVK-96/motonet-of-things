@@ -41,7 +41,7 @@ Commands:
   ota-smoke  Publish an OTA smoke-test manifest to motonet/\$DEVICE_ID/cmd/ota
   ota-build  Build firmware and package into target/ota/firmware.bin
   ota-serve  Serve firmware.bin over HTTP (for device OTA download)
-  ota-send   Build, sign, and publish a real OTA manifest via MQTT
+  ota-send   Publish a pre-built OTA manifest via MQTT
   all        Start broker + subscriber (default)
 
   (The legacy 'ota' command is an alias for 'ota-smoke'.)
@@ -57,8 +57,8 @@ Examples:
   $0 ota-smoke plain
   $0 ota-build
   $0 ota-serve --port 9000
-  $0 ota-send plain --url http://192.168.1.10:8000/firmware.bin
-  DEVICE_ID=test-sensor $0 ota-send tls --url https://... --output manifest.json
+  $0 ota-send plain --manifest target/ota/firmware.manifest.json
+  DEVICE_ID=test-sensor $0 ota-send tls --manifest path/to/manifest.json
   $0 all tls
   $0 sub tls
 
@@ -67,12 +67,8 @@ OTA ota-smoke customization:
   OTA_MANIFEST_FILE  Optional manifest JSON file. If unset, sends a dummy manifest-shaped payload.
 
 OTA ota-send options:
-  --file FILE        Firmware binary (default: target/ota/firmware.bin)
-  --url URL          Download URL for the device (required)
-  --version VER      Firmware version (default: git describe --always --dirty)
-  --build NUM        Build number (default: git rev-list --count HEAD)
-  --seed-hex-file F  Ed25519 signing seed hex file (default: tools/ota/keys/dev_ed25519.seed.hex)
-  --output FILE      Save signed manifest JSON to file (does not publish)
+  --manifest FILE    Signed manifest JSON file (required).
+                     Build one with scripts/ota-pack.sh first.
 
 OTA ota-serve options:
   --file FILE        Firmware binary to serve (default: target/ota/firmware.bin)
@@ -186,7 +182,7 @@ EOF
 }
 
 write_broker_conf() {
-    CONF_FILE="$(mktemp)"
+    CONF_FILE="$(mktemp)" || { echo "Error: failed to create temporary broker config" >&2; exit 1; }
     if [[ "$MODE" == "tls" ]]; then
         cat >"$CONF_FILE" <<EOF
 listener $BROKER_PORT_TLS 0.0.0.0
@@ -273,8 +269,9 @@ ota_command_topic() {
 }
 
 default_ota_manifest() {
-    cat <<EOF
-{"schema":1,"key_id":1001,"target":"motonet-of-things/esp32","chip":"esp32-wroom","version":"0.0.0-smoke","build":1,"force":false,"url":"http://127.0.0.1:8000/firmware.bin","size":1234567,"sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","signature":"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}
+    # v2 encrypted-shaped dummy — a plausible-but-invalid manifest for smoke testing.
+    cat <<'EOF'
+{"schema":2,"key_id":1001,"target":"motonet-of-things/esp32","chip":"esp32-wroom","version":"0.0.0-smoke","build":1,"force":false,"url":"http://127.0.0.1:8000/firmware.bin.enc","download_size":33072,"image_size":32768,"image_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","enc":{"alg":"AES-256-CTR-HMAC-SHA256","key_id":1,"chunk_size":4096,"nonce_prefix":"0123456789abcdef01234567"},"signature":"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"}
 EOF
 }
 
@@ -388,7 +385,7 @@ run_ota_serve() {
 
     require_cmd python3
 
-    SERVE_TMPDIR="$(mktemp -d)"
+    SERVE_TMPDIR="$(mktemp -d)" || { echo "Error: failed to create temporary directory" >&2; exit 1; }
     cp "$file" "$SERVE_TMPDIR/firmware.bin"
 
     echo "=============================================="
@@ -414,135 +411,25 @@ run_ota_send() {
     local mode="$1"
     shift
 
-    local file=""
-    local url=""
-    local version=""
-    local build_num=""
-    local seed_hex_file=""
-    local output=""
-    local project_root
-    project_root="$(cd "$SCRIPT_DIR/.." && pwd)"
-    seed_hex_file="$project_root/tools/ota/keys/dev_ed25519.seed.hex"
+    local manifest_file=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --file) file="$2"; shift 2 ;;
-            --url) url="$2"; shift 2 ;;
-            --version) version="$2"; shift 2 ;;
-            --build) build_num="$2"; shift 2 ;;
-            --seed-hex-file) seed_hex_file="$2"; shift 2 ;;
-            --output) output="$2"; shift 2 ;;
+            --manifest) manifest_file="$2"; shift 2 ;;
             *) echo "Unknown option: $1" >&2; exit 1 ;;
         esac
     done
 
-    # Default file
-    if [[ -z "$file" ]]; then
-        if [[ -f "$project_root/target/ota/firmware.bin" ]]; then
-            file="$project_root/target/ota/firmware.bin"
-        else
-            echo "Error: --file not specified and $project_root/target/ota/firmware.bin not found" >&2
-            echo "Run '$0 ota-build' first or specify --file." >&2
-            exit 1
-        fi
-    fi
-    echo "Using firmware file: $file"
-
-    # URL is required
-    if [[ -z "$url" ]]; then
-        echo "Error: --url is required" >&2
-        echo ""
-        suggested_lan_urls 8000 "firmware.bin"
+    if [[ -z "$manifest_file" ]]; then
+        echo "Error: --manifest FILE is required" >&2
+        echo "Use ota-pack.sh to build an encrypted manifest, then publish with:" >&2
+        echo "  $0 ota-send [plain|tls] --manifest path/to/manifest.json" >&2
         exit 1
     fi
 
-    # Default version
-    if [[ -z "$version" ]]; then
-        version="$(cd "$project_root" && git describe --always --dirty 2>/dev/null || echo "unknown")"
-    fi
-
-    # Default build
-    if [[ -z "$build_num" ]]; then
-        build_num="$(cd "$project_root" && git rev-list --count HEAD 2>/dev/null || echo "0")"
-    fi
-
-    # Compute size and sha256
-    local size sha256
-    size="$(wc -c < "$file")"
-    require_cmd sha256sum
-    sha256="$(sha256sum "$file" | cut -d' ' -f1)"
-
-    # Build unsigned JSON
-    require_cmd jq
-    local unsigned_json
-    unsigned_json="$(jq -cn \
-        --arg version "$version" \
-        --argjson build "$build_num" \
-        --arg url "$url" \
-        --argjson size "$size" \
-        --arg sha256 "$sha256" \
-        '{schema:1, key_id:1001, target:"motonet-of-things/esp32", chip:"esp32-wroom", $version, $build, force:false, $url, $size, $sha256}')"
-
-    # Sign with Ed25519 seed
-    require_cmd openssl
-    require_cmd xxd
-
-    if [[ ! -f "$seed_hex_file" ]]; then
-        echo "Error: seed file not found: $seed_hex_file" >&2
+    if [[ ! -f "$manifest_file" ]]; then
+        echo "Error: manifest file not found: $manifest_file" >&2
         exit 1
-    fi
-
-    # `openssl pkeyutl -sign -rawin` is required for Ed25519; this is
-    # OpenSSL >= 1.1.1 only. macOS ships LibreSSL by default which does
-    # not support `-rawin` for Ed25519.
-    if ! openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
-        echo "Error: openssl does not support 'pkeyutl -rawin' (need OpenSSL >= 1.1.1)" >&2
-        exit 1
-    fi
-
-    local tmpkey_pem tmpkey_der
-    tmpkey_pem="$(mktemp)"
-    tmpkey_der="$(mktemp)"
-
-    local seed_hex
-    seed_hex="$(tr -d '[:space:]' < "$seed_hex_file")"
-
-    if [[ ${#seed_hex} -ne 64 ]]; then
-        echo "Error: dev seed must be 32 bytes (64 hex chars), got ${#seed_hex}" >&2
-        rm -f "$tmpkey_pem" "$tmpkey_der"
-        exit 1
-    fi
-
-    # PKCS8 DER for Ed25519 private key:
-    # 302e (SEQUENCE 46) 020100 (INTEGER 0) 300506032b6570 (SEQUENCE + OID 1.3.101.112)
-    # 0422 (OCTET STRING 34) 0420 (OCTET STRING 32) + seed (32 bytes)
-    local der_hex="302e020100300506032b657004220420${seed_hex}"
-    printf '%s' "$der_hex" | xxd -r -p > "$tmpkey_der"
-
-    if ! openssl pkey -inform DER -in "$tmpkey_der" -out "$tmpkey_pem" 2>/dev/null; then
-        echo "Error: failed to parse Ed25519 seed as PKCS8 key" >&2
-        rm -f "$tmpkey_pem" "$tmpkey_der"
-        exit 1
-    fi
-
-    local signature_hex unsigned_file
-    unsigned_file="$(mktemp)"
-    printf '%s' "$unsigned_json" > "$unsigned_file"
-    signature_hex="$(openssl pkeyutl -sign -rawin -in "$unsigned_file" -inkey "$tmpkey_pem" | xxd -p | tr -d '\n')"
-    rm -f "$unsigned_file"
-
-    rm -f "$tmpkey_pem" "$tmpkey_der"
-
-    # Build final signed manifest
-    local manifest_json
-    manifest_json="$(printf '%s' "$unsigned_json" | jq -c --arg sig "$signature_hex" '. + {signature: $sig}')"
-
-    # Save to output file if requested
-    if [[ -n "$output" ]]; then
-        printf '%s\n' "$manifest_json" > "$output"
-        echo "Manifest saved to: $output"
-        echo "(Not publishing; use without --output to publish via MQTT)"
-        return 0
     fi
 
     # Publish via MQTT
@@ -561,7 +448,7 @@ run_ota_send() {
         pub_args+=(-p "$BROKER_PORT_PLAIN")
     fi
 
-    pub_args+=(-t "$ota_topic" -m "$manifest_json" -r)
+    pub_args+=(-t "$ota_topic" -f "$manifest_file" -r)
     mosquitto_pub "${pub_args[@]}"
     echo "Done"
 }
