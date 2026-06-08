@@ -1,0 +1,150 @@
+name: OTA Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag/version, e.g. v0.1.1-test1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  ota-release:
+    name: Build and publish OTA assets
+    environment: OTA
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          buildtargets: esp32
+
+      - name: Install espflash
+        run: cargo install espflash --locked
+
+      - name: Validate release version
+        run: |
+          case "$RELEASE_VERSION" in
+            v*) ;;
+            *)
+              echo "Release version must start with 'v': $RELEASE_VERSION" >&2
+              exit 1
+              ;;
+          esac
+
+          if (( ${#RELEASE_VERSION} > 32 )); then
+            echo "Release version must be <= 32 bytes for firmware manifest parsing: $RELEASE_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Generate release firmware secrets
+        env:
+          WIFI_SSID: ${{ secrets.WIFI_SSID }}
+          WIFI_PASSWORD: ${{ secrets.WIFI_PASSWORD }}
+          MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
+          OTA_ENCRYPTION_MASTER_KEY_HEX: ${{ secrets.OTA_ENCRYPTION_MASTER_KEY_HEX }}
+          OTA_TLS_CA_CERT_DER_B64: ${{ secrets.OTA_TLS_CA_CERT_DER_B64 }}
+          MQTT_TLS_CA_CERT_DER_B64: ${{ secrets.MQTT_TLS_CA_CERT_DER_B64 }}
+          DEVICE_ID: ${{ vars.DEVICE_ID || 'esp32-rubicson' }}
+          MQTT_CLIENT_ID: ${{ vars.MQTT_CLIENT_ID || 'esp32-rubicson' }}
+          MQTT_USERNAME: ${{ vars.MQTT_USERNAME || 'sensor-node' }}
+          MQTT_BROKER_IP: ${{ vars.MQTT_BROKER_IP }}
+          MQTT_BROKER_HOSTNAME: ${{ vars.MQTT_BROKER_HOSTNAME }}
+          MQTT_BROKER_PORT: ${{ vars.MQTT_BROKER_PORT || '1883' }}
+          MQTT_USE_TLS: ${{ vars.MQTT_USE_TLS || 'false' }}
+          NTP_SERVER_IPV4_LIST: ${{ vars.NTP_SERVER_IPV4_LIST || '216.239.35.0,216.239.35.4,216.239.35.8,216.239.35.12' }}
+          WIFI_CHANNEL_HINT: ${{ vars.WIFI_CHANNEL_HINT }}
+          WIFI_BSSID_HINT: ${{ vars.WIFI_BSSID_HINT }}
+          WIFI_STATIC_IP: ${{ vars.WIFI_STATIC_IP }}
+          WIFI_SUBNET_PREFIX: ${{ vars.WIFI_SUBNET_PREFIX || '24' }}
+          WIFI_GATEWAY_IP: ${{ vars.WIFI_GATEWAY_IP }}
+          WIFI_DNS1_IP: ${{ vars.WIFI_DNS1_IP }}
+          WIFI_DNS2_IP: ${{ vars.WIFI_DNS2_IP }}
+        run: python3 scripts/ci/write-release-secrets.py
+
+      - name: Build release OTA firmware
+        run: |
+          cd firmware
+          cargo build --release --features release-ota
+
+      - name: Package app image
+        run: |
+          mkdir -p target/ota
+          espflash save-image --chip esp32 \
+            --partition-table firmware/partitions.csv \
+            --target-app-partition ota_0 \
+            target/xtensa-esp32-none-elf/release/esp32-rust-project \
+            target/ota/firmware.bin
+          size=$(wc -c < target/ota/firmware.bin)
+          max=$((0x1C0000))
+          if (( size > max )); then
+            echo "firmware.bin is $size bytes, exceeds OTA slot max $max" >&2
+            exit 1
+          fi
+          echo "OTA firmware size: $size bytes"
+
+      - name: Package encrypted OTA v2 container and signed manifest
+        env:
+          OTA_RELEASE_ED25519_SEED_HEX: ${{ secrets.OTA_RELEASE_ED25519_SEED_HEX }}
+          OTA_ENCRYPTION_MASTER_KEY_HEX: ${{ secrets.OTA_ENCRYPTION_MASTER_KEY_HEX }}
+        run: |
+          if [[ -z "${OTA_RELEASE_ED25519_SEED_HEX:-}" ]]; then
+            echo "Missing OTA_RELEASE_ED25519_SEED_HEX secret" >&2
+            exit 1
+          fi
+
+          seed_hex=$(printf '%s' "$OTA_RELEASE_ED25519_SEED_HEX" | tr -d '[:space:]')
+          if [[ ${#seed_hex} -ne 64 ]]; then
+            echo "OTA_RELEASE_ED25519_SEED_HEX must be a 32-byte/64-hex Ed25519 seed" >&2
+            exit 1
+          fi
+
+          # Write seed to temp file for ota-pack.sh --signing-seed-hex-file
+          tmp_seed_file=$(mktemp)
+          printf '%s' "$seed_hex" > "$tmp_seed_file"
+          trap 'rm -f "$tmp_seed_file"' EXIT
+
+          if (( GITHUB_RUN_NUMBER > 4294967295 )); then
+            echo "GITHUB_RUN_NUMBER must fit u32 for firmware manifest parsing: ${GITHUB_RUN_NUMBER}" >&2
+            exit 1
+          fi
+
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_VERSION}/firmware.bin.enc"
+
+          scripts/ota-pack.sh \
+            --input target/ota/firmware.bin \
+            --output target/ota/firmware.bin.enc \
+            --manifest target/ota/firmware.manifest.json \
+            --url "$url" \
+            --version "$RELEASE_VERSION" \
+            --build "$GITHUB_RUN_NUMBER" \
+            --signing-seed-hex-file "$tmp_seed_file" \
+            --signing-key-id 1 \
+            --ota-key-id 1
+
+          echo "Manifest URL: $url"
+
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_VERSION }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
+          make_latest: ${{ github.event_name == 'workflow_dispatch' && 'false' || 'true' }}
+          files: |
+            target/ota/firmware.bin.enc
+            target/ota/firmware.manifest.json

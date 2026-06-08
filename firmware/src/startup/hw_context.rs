@@ -33,14 +33,36 @@ fn spawn_task<S>(
     spawner.spawn(token.expect(message));
 }
 
+fn log_procpu_stack_guard() {
+    unsafe extern "C" {
+        static _stack_end_cpu0: u32;
+        static _stack_start_cpu0: u32;
+        static __stack_chk_guard: u32;
+    }
+
+    let stack_end = &raw const _stack_end_cpu0 as usize;
+    let stack_start = &raw const _stack_start_cpu0 as usize;
+    let guard = &raw const __stack_chk_guard as usize;
+    let mut dbreaka0: u32;
+    unsafe {
+        core::arch::asm!("rsr {0}, 144", out(reg) dbreaka0, options(nostack));
+    }
+    info!(
+        "StackGuard: procpu stack=0x{:x}..0x{:x} ({} bytes), guard=0x{:x}, dbreaka0=0x{:x}",
+        stack_end,
+        stack_start,
+        stack_start.saturating_sub(stack_end),
+        guard,
+        dbreaka0
+    );
+}
+
 pub(crate) struct HWContext {
     pub(crate) led_channel: Option<LedcChannel<'static, LowSpeed>>,
     pub(crate) network_stack: embassy_net::Stack<'static>,
     pub(crate) display: Sh1106Display<I2c<'static, Blocking>>,
     pub(crate) ui_input: EC11RotaryEncoderInput,
     pub(crate) flash_mutex: &'static Mutex<CriticalSectionRawMutex, FlashStorage<'static>>,
-    pub(crate) aes: esp_hal::peripherals::AES<'static>,
-    pub(crate) sha: esp_hal::peripherals::SHA<'static>,
     #[cfg(feature = "pulse_sw")]
     pub(crate) radio: Cc1101Radio,
     #[cfg(feature = "pulse_rmt")]
@@ -57,6 +79,17 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
 
     let peripherals = hardware::system_setup();
 
+    // SHA-256 hardware vs software self-test — runs once at boot.
+    crate::startup::sha_self_test::run_sha_self_test(
+        unsafe { peripherals.SHA.clone_unchecked() },
+        unsafe { peripherals.AES.clone_unchecked() },
+    );
+
+    // SAFETY: initialised exactly once, before any task accesses them.
+    unsafe {
+        crate::ota::init_crypto_peripherals(peripherals.AES, peripherals.SHA);
+    }
+
     // Initialize OTA flash storage singleton before any task uses it.
     let flash_mutex = &*app_bus::FLASH.init(Mutex::new(FlashStorage::new(peripherals.FLASH)));
 
@@ -66,6 +99,10 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
     app_bus::POWER_SETTINGS_WATCH
         .sender()
         .send(initial_power_settings);
+    let initial_radio_settings = crate::radio_settings::load_settings_or_default();
+    app_bus::RADIO_SETTINGS_WATCH
+        .sender()
+        .send(initial_radio_settings);
 
     // Initialize async runtime
     let software_interrupts = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
@@ -73,6 +110,7 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
         TimerGroup::new(peripherals.TIMG0).timer0,
         software_interrupts.software_interrupt0,
     );
+    log_procpu_stack_guard();
 
     let led_channel = hardware::setup_led_channel(peripherals.LEDC, peripherals.GPIO2);
 
@@ -96,6 +134,7 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
         peripherals.GPIO15,
     );
 
+    radio.restore_settings_after_reset(initial_radio_settings);
     with_retry("CC1101 radio", || radio.init()).await;
     info!("CC1101 setup complete!");
 
@@ -110,17 +149,12 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
         error!("LED hardware setup failed, skipping LED task.");
     }
 
-    let aes = peripherals.AES;
-    let sha = peripherals.SHA;
-
     HWContext {
         led_channel,
         network_stack,
         display,
         ui_input,
         flash_mutex,
-        aes,
-        sha,
         #[cfg(feature = "pulse_sw")]
         radio,
         #[cfg(feature = "pulse_rmt")]

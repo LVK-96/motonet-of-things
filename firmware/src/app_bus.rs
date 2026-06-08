@@ -9,6 +9,7 @@ use ota_core::OtaState;
 
 use crate::messages::{PowerSettings, RadioReading, RadioSettings};
 use crate::power;
+use crate::radio_settings;
 use crate::ui_input::UiEvent;
 
 const READINGS_WATCH_DEPTH: usize = 2;
@@ -218,6 +219,7 @@ pub async fn app_command_dispatch_task() {
                 power: power_settings,
             } => {
                 radio_settings_sender.send(radio);
+                radio_settings::persist_settings(radio);
                 power_settings_sender.send(power_settings);
                 power::set_settings(power_settings);
             }

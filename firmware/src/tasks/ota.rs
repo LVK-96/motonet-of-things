@@ -1,11 +1,10 @@
+use core::ptr::addr_of_mut;
 use defmt::{Debug2Format, info, warn};
-use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 use esp_bootloader_esp_idf::partitions::PARTITION_TABLE_MAX_LEN;
-use esp_hal::aes::AesBackend;
-use esp_hal::sha::ShaBackend;
+use esp_hal::system::software_reset;
 use esp_storage::FlashStorage;
 use ota_core::{Ed25519ManifestVerifier, OtaManifest, OtaState, validate_ota_url_policy};
 
@@ -32,6 +31,13 @@ use crate::secrets;
 /// the OTA for too long.
 const MQTT_STANDDOWN_TIMEOUT_SECS: u64 = 15;
 
+static mut OTA_PARTITION_TABLE_BUF: [u8; PARTITION_TABLE_MAX_LEN] = [0u8; PARTITION_TABLE_MAX_LEN];
+
+fn ota_partition_table_buf() -> &'static mut [u8; PARTITION_TABLE_MAX_LEN] {
+    // SAFETY: the single OTA task serializes all OTA flash-write attempts.
+    unsafe { &mut *addr_of_mut!(OTA_PARTITION_TABLE_BUF) }
+}
+
 #[embassy_executor::task]
 pub async fn ota_task(
     receiver: app_bus::OtaCommandReceiver,
@@ -39,17 +45,7 @@ pub async fn ota_task(
     mut mqtt_health_receiver: MqttHealthReceiver,
     network_stack: embassy_net::Stack<'static>,
     flash_mutex: &'static Mutex<CriticalSectionRawMutex, FlashStorage<'static>>,
-    aes_peripheral: esp_hal::peripherals::AES<'static>,
-    sha_peripheral: esp_hal::peripherals::SHA<'static>,
 ) {
-    // Start AES and SHA hardware-accelerator backends. Their drivers must
-    // stay alive for the lifetime of the task so that transient
-    // AesContext / Sha256Context instances can submit work items.
-    let mut aes_backend = AesBackend::new(aes_peripheral);
-    let _aes_driver = aes_backend.start();
-    let mut sha_backend = ShaBackend::new(sha_peripheral);
-    let _sha_driver = sha_backend.start();
-
     // Encryption key material.
     let master_key: [u8; 32] = secrets::OTA_ENCRYPTION_MASTER_KEY;
 
@@ -105,19 +101,25 @@ pub async fn ota_task(
         //    partition.
         {
             let mut flash_guard = flash_mutex.lock().await;
-            let mut partition_table_buf = [0u8; PARTITION_TABLE_MAX_LEN];
+            let partition_table_buf = ota_partition_table_buf();
 
-            match flash_write::download_and_write_to_flash(
+            if let Err(e) = flash_write::download_and_write_to_flash(
                 network_stack,
                 &manifest,
                 &mut flash_guard,
-                &mut partition_table_buf,
+                partition_table_buf,
                 &master_key,
             )
             .await
             {
-                Err(e) => warn!("OTA: flash write failed: {:?}", Debug2Format(&e)),
-                Ok(unreachable) => match unreachable {},
+                warn!("OTA: flash write failed: {:?}", Debug2Format(&e));
+            } else {
+                // Ensure all flash writes are committed before
+                // triggering a CPU reset.
+                unsafe {
+                    core::arch::asm!("memw; isync", options(nomem, nostack));
+                }
+                software_reset();
             }
         }
 
@@ -127,8 +129,8 @@ pub async fn ota_task(
     }
 }
 
-/// Wait until MQTT reports `MqttHealth::Disconnected`, or until
-/// `timeout_secs` elapses.
+/// Give MQTT a bounded window to observe `OtaState::Downloading` and
+/// disconnect before OTA starts using the network stack for HTTP.
 async fn wait_for_mqtt_stand_down(
     mqtt_health_receiver: &mut MqttHealthReceiver,
     timeout_secs: u64,
@@ -137,30 +139,11 @@ async fn wait_for_mqtt_stand_down(
         return;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            warn!(
-                "OTA: MQTT did not stand down within {}s, proceeding anyway",
-                timeout_secs
-            );
-            return;
-        }
-        let remaining = deadline - now;
-        match select(Timer::after(remaining), mqtt_health_receiver.changed()).await {
-            Either::First(()) => {
-                warn!(
-                    "OTA: MQTT did not stand down within {}s, proceeding anyway",
-                    timeout_secs
-                );
-                return;
-            }
-            Either::Second(_new_value) => {
-                if mqtt_health_receiver.try_get() == Some(MqttHealth::Disconnected) {
-                    return;
-                }
-            }
-        }
+    Timer::after(Duration::from_secs(timeout_secs)).await;
+    if mqtt_health_receiver.try_get() != Some(MqttHealth::Disconnected) {
+        warn!(
+            "OTA: MQTT did not stand down within {}s, proceeding anyway",
+            timeout_secs
+        );
     }
 }

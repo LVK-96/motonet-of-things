@@ -32,7 +32,7 @@ jobs:
         run: cargo +stable test -p app-core -p telemetry-core --target x86_64-unknown-linux-gnu
 
       - name: Host verification bundle
-        run: just test-host
+        run: just host-test
 
   firmware:
     name: Firmware Check

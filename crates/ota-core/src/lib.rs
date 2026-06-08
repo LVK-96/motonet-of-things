@@ -514,8 +514,8 @@ impl Ed25519ManifestVerifier {
 
 // Public key only. The matching release signing key is expected to live in CI secrets.
 const RELEASE_PUBLIC_KEY_BYTES: [u8; 32] = [
-    0x9b, 0x50, 0x66, 0x3b, 0x6d, 0x52, 0x22, 0xf1, 0x2f, 0x1f, 0x1a, 0x3d, 0x1d, 0x3d, 0x3a, 0x0d,
-    0x94, 0x07, 0xa7, 0x47, 0x7d, 0x69, 0x67, 0x26, 0xdf, 0x07, 0x23, 0x5d, 0x00, 0x2a, 0x7d, 0xfc,
+    0x8d, 0xfc, 0x99, 0x90, 0x9d, 0xe5, 0x00, 0x6d, 0xfa, 0xd1, 0x53, 0xfa, 0x9f, 0x31, 0x41, 0x81,
+    0xc8, 0x10, 0x09, 0x38, 0xf6, 0xf5, 0xc0, 0xf5, 0xfc, 0xa5, 0x4c, 0x8b, 0x1e, 0x87, 0x09, 0x7d,
 ];
 
 const DEV_TEST_PUBLIC_KEY_BYTES: [u8; 32] = [
@@ -775,6 +775,16 @@ pub const fn classify_ota_manifest_delivery(
         (_, true) => OtaManifestDeliveryAction::ForwardAndClearRetained,
         (_, false) => OtaManifestDeliveryAction::ForwardOnly,
     }
+}
+
+/// Returns `true` when an MQTT OTA command payload can be a manifest.
+///
+/// A zero-length payload is MQTT's retained-message delete convention, not a
+/// JSON manifest. Current subscribers may still receive that publish as a live
+/// message, so the MQTT task must ignore it before the OTA parser sees it.
+#[must_use]
+pub const fn is_ota_manifest_payload_candidate(payload_len: usize) -> bool {
+    payload_len != 0
 }
 
 /// Returns `true` when MQTT is permitted to connect and publish.
@@ -1435,6 +1445,19 @@ mod tests {
     }
 
     // ── Runtime coordination helpers ───────────────────────────────────
+
+    #[test]
+    fn zero_length_mqtt_ota_payload_is_not_a_manifest_candidate() {
+        // MQTT retained-message clearing is represented as a zero-length
+        // publish. Treating it as a manifest forwards empty bytes to the OTA
+        // parser, which reports a misleading Malformed manifest.
+        assert!(!is_ota_manifest_payload_candidate(0));
+    }
+
+    #[test]
+    fn non_empty_mqtt_ota_payload_is_a_manifest_candidate() {
+        assert!(is_ota_manifest_payload_candidate(1));
+    }
 
     #[test]
     fn inactive_state_allows_regular_runtime_work() {

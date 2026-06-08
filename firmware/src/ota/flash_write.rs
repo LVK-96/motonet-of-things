@@ -10,7 +10,6 @@
 //!    readback checks against the decrypted result.
 //! 4. Activate the new slot, mark the app `New`, and reboot.
 
-use core::convert::Infallible;
 use core::mem::MaybeUninit;
 use core::net::{IpAddr, Ipv4Addr};
 use core::ptr::addr_of_mut;
@@ -21,7 +20,8 @@ use embassy_net::{
     Stack,
     tcp::client::{TcpClient, TcpClientState},
 };
-use embassy_time::Duration;
+use embassy_time::{Duration, with_timeout};
+use embedded_io_async as embedded_io;
 use embedded_nal_async::{AddrType, Dns};
 use embedded_storage::ReadStorage;
 use embedded_storage::Storage;
@@ -29,9 +29,9 @@ use embedded_storage::nor_flash::NorFlash;
 use esp_bootloader_esp_idf::partitions::{
     Error as PartitionError, FlashRegion, PARTITION_TABLE_MAX_LEN,
 };
+use esp_hal::aes::AesBackend;
 use esp_hal::rng::Rng;
-use esp_hal::sha::Sha256Context;
-use esp_hal::system::software_reset;
+use esp_hal::sha::ShaBackend;
 use esp_storage::{FlashStorage, FlashStorageError};
 use heapless::String;
 use ota_core::{
@@ -42,6 +42,7 @@ use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
 use reqwless::headers::TransferEncoding;
 use reqwless::request::{Method, RequestBuilder};
 use reqwless::response::StatusCode;
+use sha2::Digest;
 
 use crate::network;
 use crate::ota::OtaBootMetadata;
@@ -57,13 +58,25 @@ const OTA_TCP_BUF_SIZE: usize = 4096;
 /// ESP32 flash sector size used for erase alignment.
 const FLASH_SECTOR_SIZE: u32 = 4096;
 /// Maximum HTTP header bytes buffered for a response.
-const HTTP_HEADER_BUF_SIZE: usize = 4096;
-/// Buffer size for each direction of the HTTPS TLS record layer.
-const OTA_TLS_BUF_SIZE: usize = 4096;
+///
+/// GitHub release downloads first return a large redirect response with many
+/// security/cache headers; 4 KiB is not enough for reqwless to parse it.
+const HTTP_HEADER_BUF_SIZE: usize = 16 * 1024;
+/// Buffer size for the HTTPS TLS record-layer read path.
+///
+/// GitHub release asset redirects terminate on hosts that commonly send full-size
+/// TLS records; embedded-tls warns below 16,640 bytes and the handshake can fail
+/// before the HTTP request is sent. Keep the write side smaller because OTA only
+/// sends a compact GET request.
+const OTA_TLS_READ_BUF_SIZE: usize = 16640;
+const OTA_TLS_WRITE_BUF_SIZE: usize = 4096;
+const OTA_HTTP_READ_TIMEOUT_SECS: u64 = 10;
 /// Number of leading bytes of the image retained for ESP prefix validation.
 const ESP_IMAGE_PREFIX_LEN: usize = 64;
 /// Number of bytes read back from flash for post-write verification.
-const FLASH_READBACK_LEN: usize = 256;
+/// The first sector (4096 bytes) covers the ESP image header and
+/// early boot data that would cause catastrophic failures if corrupt.
+const FLASH_READBACK_LEN: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -109,10 +122,10 @@ pub enum OtaFlashWriteError {
     HeaderInvalidReserved,
     /// Chunk truncated before HMAC tag.
     ChunkTruncated,
+    /// Heap allocation failed for OTA network scratch buffers.
+    OutOfMemory,
     /// Manifest canonical JSON construction failed.
     ManifestCanonical(ManifestError),
-    /// Per-read timeout on HTTP body.
-    ReadTimeout,
 }
 
 impl From<PartitionError> for OtaFlashWriteError {
@@ -147,6 +160,34 @@ impl From<encrypted::OtaHeaderError> for OtaFlashWriteError {
 impl From<encrypted::AesError> for OtaFlashWriteError {
     fn from(e: encrypted::AesError) -> Self {
         Self::AesError(e)
+    }
+}
+
+impl From<reqwless::Error> for OtaFlashWriteError {
+    fn from(e: reqwless::Error) -> Self {
+        match e {
+            reqwless::Error::Tls(tls_err) => {
+                warn!("OTA: TLS error: {:?}", Debug2Format(&tls_err));
+                Self::HttpConnect
+            }
+            reqwless::Error::Network(embedded_io::ErrorKind::OutOfMemory) => Self::OutOfMemory,
+            reqwless::Error::Network(kind) => {
+                warn!("OTA: network error: {:?}", Debug2Format(&kind));
+                Self::HttpConnect
+            }
+            reqwless::Error::BufferTooSmall => {
+                warn!("OTA: HTTP buffer too small");
+                Self::HttpConnect
+            }
+            reqwless::Error::ConnectionAborted => {
+                warn!("OTA: connection aborted");
+                Self::ReadFailed
+            }
+            other => {
+                warn!("OTA: HTTP error: {:?}", Debug2Format(&other));
+                Self::HttpConnect
+            }
+        }
     }
 }
 
@@ -225,9 +266,16 @@ fn parse_ipv4_literal(host: &str) -> Option<Ipv4Addr> {
 static TCP_CLIENT_READY: AtomicBool = AtomicBool::new(false);
 static mut TCP_CLIENT_BUF: MaybeUninit<TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE>> =
     MaybeUninit::uninit();
-static mut OTA_TLS_READ_BUF: [u8; OTA_TLS_BUF_SIZE] = [0u8; OTA_TLS_BUF_SIZE];
-static mut OTA_TLS_WRITE_BUF: [u8; OTA_TLS_BUF_SIZE] = [0u8; OTA_TLS_BUF_SIZE];
-static mut OTA_HTTP_HEADER_BUF: [u8; HTTP_HEADER_BUF_SIZE] = [0u8; HTTP_HEADER_BUF_SIZE];
+
+#[esp_hal::ram(reclaimed)]
+static mut OTA_TLS_READ_BUF: MaybeUninit<[u8; OTA_TLS_READ_BUF_SIZE]> = MaybeUninit::uninit();
+#[esp_hal::ram(reclaimed)]
+static mut OTA_TLS_WRITE_BUF: MaybeUninit<[u8; OTA_TLS_WRITE_BUF_SIZE]> = MaybeUninit::uninit();
+#[esp_hal::ram(reclaimed)]
+static mut OTA_HTTP_HEADER_BUF: MaybeUninit<[u8; HTTP_HEADER_BUF_SIZE]> = MaybeUninit::uninit();
+#[esp_hal::ram(reclaimed)]
+static mut OTA_CHUNK_BUF: MaybeUninit<[u8; ota_core::ENC_CHUNK_SIZE as usize]> =
+    MaybeUninit::uninit();
 
 fn tcp_client_state() -> &'static mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE> {
     let raw: *mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE> =
@@ -240,20 +288,20 @@ fn tcp_client_state() -> &'static mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TC
     unsafe { &mut *raw }
 }
 
-fn ota_tls_buffers() -> (
-    &'static mut [u8; OTA_TLS_BUF_SIZE],
-    &'static mut [u8; OTA_TLS_BUF_SIZE],
-) {
-    unsafe {
-        (
-            &mut *addr_of_mut!(OTA_TLS_READ_BUF),
-            &mut *addr_of_mut!(OTA_TLS_WRITE_BUF),
-        )
-    }
+fn ota_tls_read_buf() -> &'static mut [u8; OTA_TLS_READ_BUF_SIZE] {
+    unsafe { (*addr_of_mut!(OTA_TLS_READ_BUF)).assume_init_mut() }
+}
+fn ota_tls_write_buf() -> &'static mut [u8; OTA_TLS_WRITE_BUF_SIZE] {
+    unsafe { (*addr_of_mut!(OTA_TLS_WRITE_BUF)).assume_init_mut() }
+}
+fn ota_http_header_buf() -> &'static mut [u8; HTTP_HEADER_BUF_SIZE] {
+    unsafe { (*addr_of_mut!(OTA_HTTP_HEADER_BUF)).assume_init_mut() }
 }
 
-fn http_header_buf() -> &'static mut [u8; HTTP_HEADER_BUF_SIZE] {
-    unsafe { &mut *addr_of_mut!(OTA_HTTP_HEADER_BUF) }
+fn ota_chunk_buf() -> &'static mut [u8; ota_core::ENC_CHUNK_SIZE as usize] {
+    // SAFETY: the OTA task serializes downloads; this buffer is borrowed by
+    // one encrypted-body processor at a time.
+    unsafe { (*addr_of_mut!(OTA_CHUNK_BUF)).assume_init_mut() }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +401,7 @@ struct EncryptedResult {
 /// Fetch the v2 encrypted OTA payload and process it chunk-by-chunk:
 /// validate the 16-byte header, verify HMAC, decrypt, write plaintext to
 /// flash, and accumulate a SHA-256 hash of the plaintext.
+#[allow(clippy::too_many_lines)]
 async fn fetch_and_process_encrypted(
     network_stack: Stack<'static>,
     manifest: &OtaManifest,
@@ -365,10 +414,19 @@ async fn fetch_and_process_encrypted(
     let state = tcp_client_state();
     let tcp = TcpClient::new(network_stack, state);
     let dns = OtaDns::new(network_stack);
-    let (tls_read_buf, tls_write_buf) = ota_tls_buffers();
-    let tls_verify = ota_tls_verify();
-    let tls_config = TlsConfig::new(ota_tls_seed(), tls_read_buf, tls_write_buf, tls_verify);
-    let mut client = HttpClient::new_with_tls(&tcp, &dns, tls_config);
+    let tls_read_buf = ota_tls_read_buf();
+    let tls_write_buf = ota_tls_write_buf();
+    let http_header_buf = ota_http_header_buf();
+    // Use HttpClient::new for plain HTTP (no TLS) to avoid the
+    // PlainBuffered path in reqwless which may have issues with
+    // the Python http.server HTTP/1.0 responses.
+    let mut client = if manifest.url.starts_with("https://") {
+        let tls_verify = ota_tls_verify();
+        let tls_config = TlsConfig::new(ota_tls_seed(), tls_read_buf, tls_write_buf, tls_verify);
+        HttpClient::new_with_tls(&tcp, &dns, tls_config)
+    } else {
+        HttpClient::new(&tcp, &dns)
+    };
     let mut current_url: String<MAX_REDIRECT_URL_LEN> = String::new();
     current_url
         .push_str(&manifest.url)
@@ -376,33 +434,61 @@ async fn fetch_and_process_encrypted(
     let mut redirects = 0;
 
     loop {
-        info!(
-            "OTA: downloading {} (download_size={}, redirect {}/{})",
-            current_url.as_str(),
-            manifest.download_size,
-            redirects,
-            MAX_REDIRECTS
-        );
+        if redirects == 0 {
+            info!(
+                "OTA: downloading {} (download_size={}, redirect {}/{})",
+                current_url.as_str(),
+                manifest.download_size,
+                redirects,
+                MAX_REDIRECTS
+            );
+        } else {
+            info!(
+                "OTA: downloading redirected HTTPS asset (download_size={}, redirect {}/{})",
+                manifest.download_size, redirects, MAX_REDIRECTS
+            );
+        }
 
         let next_redirect = {
             let mut request = client
                 .request(Method::GET, current_url.as_str())
                 .await
-                .map_err(|_| OtaFlashWriteError::HttpConnect)?
+                .map_err(|err| {
+                    if redirects == 0 {
+                        warn!(
+                            "OTA: HTTP request/connect failed for {}: {:?}",
+                            current_url.as_str(),
+                            Debug2Format(&err)
+                        );
+                    } else {
+                        warn!(
+                            "OTA: HTTP request/connect failed for redirected HTTPS asset: {:?}",
+                            Debug2Format(&err)
+                        );
+                    }
+                    OtaFlashWriteError::HttpConnect
+                })?
                 .headers(OTA_HTTP_HEADERS);
 
-            let response = request
-                .send(http_header_buf())
-                .await
-                .map_err(|_| OtaFlashWriteError::HttpConnect)?;
+            let response = request.send(http_header_buf).await.map_err(|err| {
+                if redirects == 0 {
+                    warn!(
+                        "OTA: HTTP send/response failed for {}: {:?}",
+                        current_url.as_str(),
+                        Debug2Format(&err)
+                    );
+                } else {
+                    warn!(
+                        "OTA: HTTP send/response failed for redirected HTTPS asset: {:?}",
+                        Debug2Format(&err)
+                    );
+                }
+                OtaFlashWriteError::HttpConnect
+            })?;
 
             if response.status.is_redirection() {
                 let next_url = redirect_location(&response)?;
-                info!(
-                    "OTA: following redirect {} -> {}",
-                    response.status.0,
-                    next_url.as_str()
-                );
+                info!("OTA: following redirect {}", response.status.0);
                 Some(next_url)
             } else {
                 validate_response_metadata(&response, manifest.download_size as usize)?;
@@ -489,10 +575,6 @@ where
     Ok(())
 }
 
-/// Per-read timeout in seconds for each `fill_buf().await` call so a
-/// stalled TCP stream doesn't block the OTA pipeline indefinitely.
-const READ_TIMEOUT_SECS: u64 = 10;
-
 /// Read exactly `len` bytes from a `BufRead` into `buf`.
 async fn read_exact(
     reader: &mut impl embedded_io_async::BufRead,
@@ -500,11 +582,21 @@ async fn read_exact(
 ) -> Result<(), OtaFlashWriteError> {
     let mut offset = 0;
     while offset < buf.len() {
-        let available =
-            embassy_time::with_timeout(Duration::from_secs(READ_TIMEOUT_SECS), reader.fill_buf())
-                .await
-                .map_err(|_| OtaFlashWriteError::ReadTimeout)?
-                .map_err(|_| OtaFlashWriteError::ReadFailed)?;
+        let available = with_timeout(
+            Duration::from_secs(OTA_HTTP_READ_TIMEOUT_SECS),
+            reader.fill_buf(),
+        )
+        .await
+        .map_err(|_| {
+            warn!(
+                "OTA: HTTP body read timeout after {}s ({} of {} bytes in current read)",
+                OTA_HTTP_READ_TIMEOUT_SECS,
+                offset,
+                buf.len()
+            );
+            OtaFlashWriteError::ReadFailed
+        })?
+        .map_err(|_| OtaFlashWriteError::ReadFailed)?;
         if available.is_empty() {
             return Err(OtaFlashWriteError::ReadFailed);
         }
@@ -540,12 +632,15 @@ async fn process_encrypted_body(
     let mut prefix_validated = false;
     let mut total_plaintext: u32 = 0;
     let mut flash_offset: u32 = 0;
-    let mut sha_ctx = Sha256Context::new();
+    // Plaintext SHA-256 accumulator (software — hardware SHA_CONTINUE
+    // is broken on the target ESP32 revision for multi-block inputs).
+    let mut sha_hasher = sha2::Sha256::new();
     // Buffer for reading the wire-format length prefix + HMAC tag.
     let mut len_buf = [0u8; 4];
     let mut tag_buf = [0u8; encrypted::HMAC_TAG_SIZE];
-    // Reusable ciphertext buffer sized to the maximum chunk.
-    let mut ciphertext_buf = [0u8; ota_core::ENC_CHUNK_SIZE as usize];
+    // Reusable static ciphertext buffer sized to the maximum chunk. Keeping
+    // this out of the async future avoids a multi-kilobyte OTA task frame.
+    let ciphertext_buf = ota_chunk_buf();
 
     for chunk_index in 0..num_chunks {
         // Read 4-byte plaintext length (big-endian).
@@ -581,7 +676,22 @@ async fn process_encrypted_body(
             ct,
             &tag_buf,
         ) {
+            let computed = encrypted::compute_chunk_hmac(
+                hmac_key,
+                manifest_digest,
+                chunk_index,
+                flash_offset,
+                ciphertext_len,
+                ct,
+            );
             warn!("OTA: HMAC verification failed for chunk {}", chunk_index);
+            warn!("  manifest_digest: {}", sha256_hex(manifest_digest));
+            warn!(
+                "  chunk_index: {}, flash_offset: {}, ct_len: {}",
+                chunk_index, flash_offset, ciphertext_len
+            );
+            warn!("  tag (from file):    {}", sha256_hex(&tag_buf));
+            warn!("  hmac (device computed): {}", sha256_hex(&computed));
             return Err(OtaFlashWriteError::HmacMismatch);
         }
 
@@ -607,16 +717,25 @@ async fn process_encrypted_body(
         // Write plaintext to flash.
         Storage::write(region, flash_offset, plaintext).map_err(OtaFlashWriteError::from)?;
 
-        // Hash the plaintext.
-        sha_ctx.update(plaintext).wait_blocking();
+        // Hash the plaintext (software).
+        sha2::Digest::update(&mut sha_hasher, plaintext);
 
         flash_offset += ciphertext_len;
         total_plaintext += ciphertext_len;
+
+        let chunks_done = chunk_index + 1;
+        if chunks_done == 1 || chunks_done % 32 == 0 || chunks_done == num_chunks {
+            info!(
+                "OTA: wrote chunk {}/{} ({} bytes)",
+                chunks_done, num_chunks, total_plaintext
+            );
+        }
     }
 
     // 3. Finalize SHA-256.
     let mut digest = [0u8; encrypted::SHA256_OUTPUT_SIZE];
-    sha_ctx.finalize(&mut digest).wait_blocking();
+    let result = sha2::Digest::finalize(sha_hasher);
+    digest.copy_from_slice(&result);
 
     Ok(EncryptedResult {
         total_plaintext,
@@ -696,9 +815,23 @@ pub async fn download_and_write_to_flash(
     flash: &mut FlashStorage<'static>,
     partition_table_buf: &mut [u8; PARTITION_TABLE_MAX_LEN],
     master_key: &[u8; 32],
-) -> Result<Infallible, OtaFlashWriteError> {
+) -> Result<(), OtaFlashWriteError> {
+    // SAFETY: crypto peripherals are initialised once during hw_setup.
+    let aes = unsafe { crate::ota::take_aes() };
+    let sha = unsafe { crate::ota::take_sha() };
+    let mut aes_backend = AesBackend::new(aes);
+    let aes_driver = aes_backend.start();
+    let mut sha_backend = ShaBackend::new(sha);
+    let sha_driver = sha_backend.start();
     // Derive per-manifest subkeys from the encryption key id.
     let (aes_key, hmac_key) = encrypted::derive_subkeys(master_key, manifest.enc.key_id);
+
+    // Log public manifest metadata for cross-reference with packaging.
+    info!(
+        "OTA: enc.key_id={}, nonce_prefix={}",
+        manifest.enc.key_id,
+        manifest.enc.nonce_prefix.as_str()
+    );
 
     // Parse nonce prefix.
     let nonce_prefix = encrypted::parse_nonce_prefix(&manifest.enc.nonce_prefix)
@@ -709,6 +842,7 @@ pub async fn download_and_write_to_flash(
         .canonical_unsigned_json()
         .map_err(OtaFlashWriteError::ManifestCanonical)?;
     let manifest_digest = encrypted::compute_manifest_digest(&canonical);
+    info!("OTA: manifest_digest={}", sha256_hex(&manifest_digest));
 
     network::wait_for_config_up(network_stack).await;
 
@@ -772,5 +906,12 @@ pub async fn download_and_write_to_flash(
         stream_result.total_plaintext
     );
 
-    software_reset()
+    // Drop hardware crypto backends and their peripheral guards
+    // before returning so the caller can reset cleanly.
+    drop(aes_driver);
+    drop(aes_backend);
+    drop(sha_driver);
+    drop(sha_backend);
+
+    Ok(())
 }

@@ -12,6 +12,8 @@ mod hardware;
 #[cfg(not(feature = "ota-rollback-test"))]
 mod hw_context;
 #[cfg(not(feature = "ota-rollback-test"))]
+mod sha_self_test;
+#[cfg(not(feature = "ota-rollback-test"))]
 mod spawn;
 
 #[cfg(not(feature = "ota-rollback-test"))]

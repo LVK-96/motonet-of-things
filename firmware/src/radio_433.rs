@@ -16,7 +16,7 @@ use esp_hal::time::Rate;
 
 use crate::messages::{
     CARRIER_SENSE_MAX, CHANNEL_BANDWIDTH_MAX_INDEX, DEFAULT_RADIO_SETTINGS, MAGN_TARGET_MAX,
-    channel_bandwidth_hz, channel_bandwidth_index, quantize_detection_threshold_db,
+    RadioSettings, channel_bandwidth_hz, channel_bandwidth_index, quantize_detection_threshold_db,
 };
 
 /// Error type for radio operations
@@ -211,6 +211,30 @@ impl Cc1101Radio {
             channel_bandwidth_index: default_settings.channel_bandwidth_index,
             carrier_sense_threshold: default_settings.carrier_sense_threshold,
         }
+    }
+
+    /// Restore cached radio settings before the CC1101 is initialized after reset.
+    pub fn restore_settings_after_reset(&mut self, settings: RadioSettings) {
+        self.detection_threshold_db =
+            quantize_detection_threshold_db(settings.detection_threshold_db);
+        self.filter_level = settings.magn_target.min(MAGN_TARGET_MAX);
+        self.channel_bandwidth_index = settings
+            .channel_bandwidth_index
+            .min(CHANNEL_BANDWIDTH_MAX_INDEX);
+        self.carrier_sense_threshold = settings.carrier_sense_threshold.min(CARRIER_SENSE_MAX);
+    }
+
+    /// Apply all user-facing radio settings to the initialized CC1101.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RadioError::ConfigError` if any configuration command fails.
+    pub fn apply_settings(&mut self, settings: RadioSettings) -> Result<(), RadioError> {
+        self.set_detection_threshold(settings.detection_threshold_db)?;
+        self.set_filter_level(settings.magn_target)?;
+        self.set_channel_bandwidth_index(settings.channel_bandwidth_index)?;
+        self.set_carrier_sense_threshold(settings.carrier_sense_threshold)?;
+        Ok(())
     }
 
     /// Initialize and configure the radio hardware.

@@ -1,4 +1,7 @@
 #![no_std]
+#![feature(asm_experimental_arch)]
+
+extern crate alloc;
 
 use defmt::error;
 use embassy_time::{Duration, Timer};
@@ -12,6 +15,7 @@ pub mod ota;
 pub mod power;
 pub mod pulse_capture;
 pub mod radio_433;
+pub mod radio_settings;
 pub mod secrets;
 pub mod startup;
 pub mod tasks;

@@ -11,6 +11,14 @@ pub struct RfProfilePayload {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RadioSettingsPayload {
+    pub detection_threshold_db: u8,
+    pub magn_target: u8,
+    pub channel_bandwidth_index: u8,
+    pub carrier_sense_threshold: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodedValue<T> {
     pub value: T,
     pub schema_version: u8,
@@ -28,11 +36,13 @@ pub const POWER_SCHEMA_VERSION: u8 = 1;
 pub const LEGACY_POWER_SCHEMA_VERSION: u8 = 0;
 pub const RF_PROFILE_SCHEMA_VERSION: u8 = 2;
 pub const LEGACY_RF_PROFILE_SCHEMA_VERSION: u8 = 1;
+pub const RADIO_SETTINGS_SCHEMA_VERSION: u8 = 1;
 
 const POWER_MAGIC_CURRENT: u8 = 0xD1;
 const POWER_MAGIC_LEGACY: u8 = 0xA5;
 const RF_PROFILE_MAGIC_CURRENT: u8 = 0xD2;
 const RF_PROFILE_MAGIC_LEGACY: u8 = 0xC7;
+const RADIO_SETTINGS_MAGIC_CURRENT: u8 = 0xD3;
 const RF_PROFILE_VERSION_LEGACY_WORD: u8 = 1;
 const CHECKSUM_SEED_CURRENT: u8 = 0x73;
 const CHECKSUM_SEED_POWER_LEGACY: u8 = 0x5C;
@@ -95,7 +105,7 @@ pub fn encode_rf_profile(profile: RfProfilePayload) -> u32 {
     )
 }
 
-/// Decode radio settings from RTC storage
+/// Decode RF sweep profile from RTC storage
 ///
 /// # Errors
 /// Returns `DecodeError` if decode fails
@@ -134,6 +144,45 @@ pub fn decode_rf_profile(word: u32) -> Result<DecodedValue<RfProfilePayload>, De
 }
 
 #[must_use]
+pub fn encode_radio_settings(settings: RadioSettingsPayload) -> u32 {
+    let packed_thresholds = (settings.magn_target & 0x07)
+        | ((settings.channel_bandwidth_index & 0x03) << 3)
+        | ((settings.carrier_sense_threshold & 0x07) << 5);
+    encode_word(
+        [
+            RADIO_SETTINGS_MAGIC_CURRENT,
+            settings.detection_threshold_db,
+            packed_thresholds,
+        ],
+        CHECKSUM_SEED_CURRENT,
+    )
+}
+
+/// Decode radio settings from RTC storage
+///
+/// # Errors
+/// Returns `DecodeError` if decode fails
+pub fn decode_radio_settings(word: u32) -> Result<DecodedValue<RadioSettingsPayload>, DecodeError> {
+    let [byte0, byte1, byte2, byte3] = word.to_le_bytes();
+
+    if byte0 != RADIO_SETTINGS_MAGIC_CURRENT {
+        return Err(DecodeError::UnknownSchema);
+    }
+
+    validate_checksum([byte0, byte1, byte2], byte3, CHECKSUM_SEED_CURRENT)?;
+    Ok(DecodedValue {
+        value: RadioSettingsPayload {
+            detection_threshold_db: byte1,
+            magn_target: byte2 & 0x07,
+            channel_bandwidth_index: (byte2 >> 3) & 0x03,
+            carrier_sense_threshold: (byte2 >> 5) & 0x07,
+        },
+        schema_version: RADIO_SETTINGS_SCHEMA_VERSION,
+        needs_migration: false,
+    })
+}
+
+#[must_use]
 fn checksum(seed: u8, payload: [u8; 3]) -> u8 {
     payload
         .iter()
@@ -158,12 +207,13 @@ fn validate_checksum(payload: [u8; 3], expected_checksum: u8, seed: u8) -> Resul
 mod tests {
     use super::{
         DecodeError, LEGACY_POWER_SCHEMA_VERSION, LEGACY_RF_PROFILE_SCHEMA_VERSION,
-        POWER_SCHEMA_VERSION, RF_PROFILE_SCHEMA_VERSION, RfProfilePayload, decode_power_settings,
-        decode_rf_profile, encode_power_settings, encode_rf_profile,
+        POWER_SCHEMA_VERSION, RADIO_SETTINGS_SCHEMA_VERSION, RF_PROFILE_SCHEMA_VERSION,
+        RadioSettingsPayload, RfProfilePayload, decode_power_settings, decode_radio_settings,
+        decode_rf_profile, encode_power_settings, encode_radio_settings, encode_rf_profile,
     };
 
     #[test]
-    fn roundtrip_power_and_rf_profile_with_schema_versions() {
+    fn roundtrip_persisted_settings_with_schema_versions() {
         let power_encoded = encode_power_settings(super::PowerSettingsPayload {
             predictive_sleep_enabled: true,
             sleep_duration_secs: 45,
@@ -183,6 +233,26 @@ mod tests {
         assert_eq!(rf_decoded.schema_version, RF_PROFILE_SCHEMA_VERSION);
         assert!(!rf_decoded.needs_migration);
         assert_eq!(rf_decoded.value.profile_index, 3);
+
+        let radio_encoded = encode_radio_settings(RadioSettingsPayload {
+            detection_threshold_db: 12,
+            magn_target: 6,
+            channel_bandwidth_index: 2,
+            carrier_sense_threshold: 5,
+        });
+        let radio_decoded = decode_radio_settings(radio_encoded)
+            .expect("radio settings should decode after encoding");
+        assert_eq!(radio_decoded.schema_version, RADIO_SETTINGS_SCHEMA_VERSION);
+        assert!(!radio_decoded.needs_migration);
+        assert_eq!(
+            radio_decoded.value,
+            RadioSettingsPayload {
+                detection_threshold_db: 12,
+                magn_target: 6,
+                channel_bandwidth_index: 2,
+                carrier_sense_threshold: 5,
+            }
+        );
     }
 
     #[test]
@@ -208,6 +278,16 @@ mod tests {
             .ok()
             .map(|decoded| decoded.value.profile_index);
         assert_eq!(restored_rf, None);
+
+        let radio_encoded = encode_radio_settings(RadioSettingsPayload {
+            detection_threshold_db: 8,
+            magn_target: 4,
+            channel_bandwidth_index: 1,
+            carrier_sense_threshold: 7,
+        });
+        let radio_corrupted = radio_encoded ^ u32::from(0x55u8);
+        let restored_radio = decode_radio_settings(radio_corrupted).ok();
+        assert_eq!(restored_radio, None);
     }
 
     #[test]

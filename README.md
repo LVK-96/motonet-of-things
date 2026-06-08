@@ -115,6 +115,92 @@ Time sync failover is configured with:
 
 Invalid entries are ignored. If no valid server remains, firmware falls back to built-in defaults.
 
+## OTA From GitHub Releases
+
+The firmware uses encrypted OTA v2 packaging: the plaintext firmware is
+encrypted into a `.bin.enc` container and paired with a signed manifest
+(`firmware.manifest.json`). The manifest's `url` points at the encrypted
+container hosted on GitHub Releases:
+
+```text
+https://github.com/<owner>/<repo>/releases/download/<tag>/firmware.bin.enc
+```
+
+### Firmware Secrets
+
+Secure the OTA master key in `firmware/src/secrets.rs`:
+
+- `OTA_ENCRYPTION_KEY_ID: u32 = 1` — key identifier.
+- `OTA_ENCRYPTION_MASTER_KEY: [u8; 32]` — 32 raw bytes from which per-key-id
+  AES-256 and HMAC-SHA256 subkeys are derived. Must match the key used by the
+  packaging tool.
+- `OTA_TLS_ALLOW_INVALID_CA: bool` — when `true`, TLS certificate verification
+  for OTA downloads is skipped entirely. Only use for local dev; never enable
+  for production. Use `OTA_TLS_CA_CERT_DER` for CA-pinned verification instead.
+
+Generate a fresh master key:
+
+```bash
+openssl rand -hex 32
+```
+
+### Release Workflow
+
+Release OTA builds must be compiled with:
+
+```bash
+cd firmware
+cargo build --release --features release-ota
+```
+
+Tagged pushes (`v*`) run `.github/workflows/ota-release.yml`, which:
+- bakes `OTA_ENCRYPTION_MASTER_KEY` into the firmware via env secret
+- builds `firmware.bin`
+- encrypts and packages it into `firmware.bin.enc` + signed
+  `firmware.manifest.json` using `scripts/ota-pack.sh`
+- uploads only the encrypted container and manifest to the GitHub Release
+  (never the plaintext binary)
+
+The workflow uses these GitHub secrets:
+- `OTA_RELEASE_ED25519_SEED_HEX` — Ed25519 seed (64 hex chars)
+- `OTA_ENCRYPTION_MASTER_KEY_HEX` — master key (64 hex chars)
+
+The release manifest uses `--signing-key-id 1` and `--ota-key-id 1`.
+
+### Local Packaging Flow
+
+Use `scripts/ota-pack.sh` to produce an encrypted container + manifest:
+
+```bash
+scripts/ota-pack.sh \
+  --input target/ota/firmware.bin \
+  --output target/ota/firmware.bin.enc \
+  --manifest target/ota/firmware.manifest.json \
+  --url https://example.com/firmware.bin.enc \
+  --version 0.2.0 --build 42 \
+  --signing-seed-hex-file tools/ota/keys/dev_ed25519.seed.hex \
+  --signing-key-id 1001 \
+  --ota-key-id 1 \
+  --ota-master-key-hex-file tools/ota/keys/dev_master.hex
+```
+
+Or with env var fallback for the master key:
+
+```bash
+OTA_ENCRYPTION_MASTER_KEY_HEX=... scripts/ota-pack.sh ...
+```
+
+### Testing OTA Locally
+
+Build an OTA image, package it, serve it, and publish the manifest:
+
+```bash
+scripts/mqtt-test.sh ota-build
+scripts/ota-pack.sh ...   # produce .enc + .manifest.json
+scripts/mqtt-test.sh ota-serve --port 9000 --file target/ota/firmware.bin.enc
+scripts/mqtt-test.sh ota-send [plain|tls] --manifest target/ota/firmware.manifest.json
+```
+
 ## Verification
 
 Run verification from repository root:
