@@ -39,6 +39,8 @@ pub(crate) struct HWContext {
     pub(crate) display: Sh1106Display<I2c<'static, Blocking>>,
     pub(crate) ui_input: EC11RotaryEncoderInput,
     pub(crate) flash_mutex: &'static Mutex<CriticalSectionRawMutex, FlashStorage<'static>>,
+    pub(crate) aes: esp_hal::peripherals::AES<'static>,
+    pub(crate) sha: esp_hal::peripherals::SHA<'static>,
     #[cfg(feature = "pulse_sw")]
     pub(crate) radio: Cc1101Radio,
     #[cfg(feature = "pulse_rmt")]
@@ -108,12 +110,17 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
         error!("LED hardware setup failed, skipping LED task.");
     }
 
+    let aes = peripherals.AES;
+    let sha = peripherals.SHA;
+
     HWContext {
         led_channel,
         network_stack,
         display,
         ui_input,
         flash_mutex,
+        aes,
+        sha,
         #[cfg(feature = "pulse_sw")]
         radio,
         #[cfg(feature = "pulse_rmt")]

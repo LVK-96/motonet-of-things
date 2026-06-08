@@ -30,6 +30,8 @@ pub(crate) fn spawn_tasks(spawner: &Spawner, context: HWContext) {
         display,
         ui_input,
         flash_mutex,
+        aes,
+        sha,
         #[cfg(feature = "pulse_sw")]
         radio,
         #[cfg(feature = "pulse_rmt")]
@@ -171,6 +173,8 @@ pub(crate) fn spawn_tasks(spawner: &Spawner, context: HWContext) {
             mqtt_health_receiver_ota,
             network_stack,
             flash_mutex,
+            aes,
+            sha,
         ),
         "Failed to spawn OTA task",
     );

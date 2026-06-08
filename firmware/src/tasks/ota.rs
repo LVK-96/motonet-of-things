@@ -4,16 +4,33 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use esp_bootloader_esp_idf::partitions::PARTITION_TABLE_MAX_LEN;
+use esp_hal::aes::AesBackend;
+use esp_hal::sha::ShaBackend;
 use esp_storage::FlashStorage;
 use ota_core::{Ed25519ManifestVerifier, OtaManifest, OtaState, validate_ota_url_policy};
+
+#[cfg(feature = "release-ota")]
+fn ota_manifest_verifier() -> Ed25519ManifestVerifier {
+    Ed25519ManifestVerifier::release_ota()
+}
+
+#[cfg(not(feature = "release-ota"))]
+fn ota_manifest_verifier() -> Ed25519ManifestVerifier {
+    Ed25519ManifestVerifier::dev_test()
+}
 
 use crate::app_bus;
 use crate::app_bus::{MqttHealth, MqttHealthReceiver};
 use crate::ota::{OtaUpdateGuard, flash_write};
+use crate::secrets;
 
 /// Maximum time to wait for MQTT to stand down after broadcasting
 /// `OtaState::Downloading` before proceeding with the HTTP download.
-const MQTT_STANDDOWN_TIMEOUT_SECS: u64 = 5;
+///
+/// 15 s gives MQTT a reasonable window to flush in-flight publishes
+/// and cleanly disconnect over a lossy Wi-Fi link without holding up
+/// the OTA for too long.
+const MQTT_STANDDOWN_TIMEOUT_SECS: u64 = 15;
 
 #[embassy_executor::task]
 pub async fn ota_task(
@@ -22,21 +39,32 @@ pub async fn ota_task(
     mut mqtt_health_receiver: MqttHealthReceiver,
     network_stack: embassy_net::Stack<'static>,
     flash_mutex: &'static Mutex<CriticalSectionRawMutex, FlashStorage<'static>>,
+    aes_peripheral: esp_hal::peripherals::AES<'static>,
+    sha_peripheral: esp_hal::peripherals::SHA<'static>,
 ) {
+    // Start AES and SHA hardware-accelerator backends. Their drivers must
+    // stay alive for the lifetime of the task so that transient
+    // AesContext / Sha256Context instances can submit work items.
+    let mut aes_backend = AesBackend::new(aes_peripheral);
+    let _aes_driver = aes_backend.start();
+    let mut sha_backend = ShaBackend::new(sha_peripheral);
+    let _sha_driver = sha_backend.start();
+
+    // Encryption key material.
+    let master_key: [u8; 32] = secrets::OTA_ENCRYPTION_MASTER_KEY;
+
     loop {
         let manifest_bytes = receiver.receive().await;
 
         // 1. Parse and verify manifest.
-        let manifest = match OtaManifest::parse_and_verify(
-            &manifest_bytes,
-            &Ed25519ManifestVerifier::dev_test(),
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("OTA: manifest rejected: {:?}", Debug2Format(&e));
-                continue;
-            }
-        };
+        let manifest =
+            match OtaManifest::parse_and_verify(&manifest_bytes, &ota_manifest_verifier()) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("OTA: manifest rejected: {:?}", Debug2Format(&e));
+                    continue;
+                }
+            };
 
         // 2. Validate URL policy.
         if let Err(e) = validate_ota_url_policy(&manifest.url) {
@@ -45,27 +73,36 @@ pub async fn ota_task(
         }
 
         info!(
-            "OTA: starting download of {} (v{}, {} bytes)",
+            "OTA: starting download of {} (v{}, download_size={}, image_size={})",
             manifest.url.as_str(),
             manifest.version.as_str(),
-            manifest.size
+            manifest.download_size,
+            manifest.image_size
         );
+
+        // 2b. Reject manifests with wrong encryption key id before
+        //     broadcasting state or entering maintenance mode.
+        if manifest.enc.key_id != secrets::OTA_ENCRYPTION_KEY_ID {
+            warn!(
+                "OTA: enc.key_id {} != configured {} — rejecting",
+                manifest.enc.key_id,
+                secrets::OTA_ENCRYPTION_KEY_ID
+            );
+            continue;
+        }
 
         // 3. Broadcast Downloading state so MQTT/radio/display stand down.
         ota_state_sender.send(OtaState::Downloading);
 
         // 4. Block sleep for the entire OTA window via the atomic guard.
-        //    Then race the stand-down timeout against the actual
-        //    MqttHealth::Disconnected transition so we don't burn the
-        //    full 5 s on a fast MQTT teardown.
         let _ota_guard = OtaUpdateGuard::begin_download();
         wait_for_mqtt_stand_down(&mut mqtt_health_receiver, MQTT_STANDDOWN_TIMEOUT_SECS).await;
 
-        // 5. Switch to the Applying phase so observers can show
-        //    "OTA applying..." during the flash write.
+        // 5. Switch to the Applying phase.
         ota_state_sender.send(OtaState::Applying);
 
-        // 6. Lock flash and stream the firmware into the inactive partition.
+        // 6. Lock flash and stream the encrypted firmware into the inactive
+        //    partition.
         {
             let mut flash_guard = flash_mutex.lock().await;
             let mut partition_table_buf = [0u8; PARTITION_TABLE_MAX_LEN];
@@ -75,29 +112,23 @@ pub async fn ota_task(
                 &manifest,
                 &mut flash_guard,
                 &mut partition_table_buf,
+                &master_key,
             )
             .await
             {
                 Err(e) => warn!("OTA: flash write failed: {:?}", Debug2Format(&e)),
-                // The `Ok` arm of `Result<Infallible, _>` is uninhabited —
-                // `download_and_write_to_flash` either errors out or
-                // calls `software_reset()` which never returns. Matching
-                // on the never value is exhaustive and proves this arm
-                // is unreachable.
                 Ok(unreachable) => match unreachable {},
             }
         }
 
-        // 7. Return to Inactive (the guard also resets on drop, but we
-        //    need the watch observers to see the transition too).
+        // 7. Return to Inactive (guard also resets on drop).
         ota_state_sender.send(OtaState::Inactive);
         info!("OTA: returned to Inactive");
     }
 }
 
 /// Wait until MQTT reports `MqttHealth::Disconnected`, or until
-/// `timeout_secs` elapses since the first observation of a non-disconnected
-/// state. Logs a warning if the timeout expires first.
+/// `timeout_secs` elapses.
 async fn wait_for_mqtt_stand_down(
     mqtt_health_receiver: &mut MqttHealthReceiver,
     timeout_secs: u64,

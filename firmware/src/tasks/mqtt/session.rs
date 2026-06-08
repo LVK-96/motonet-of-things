@@ -6,7 +6,7 @@ use embedded_io_async::{Read as AsyncRead, Write as AsyncWrite};
 use embedded_tls::pki::CertVerifier;
 use embedded_tls::{
     Aes128GcmSha256, Certificate, CryptoProvider, MaxFragmentLength, TlsConfig, TlsConnection,
-    TlsContext, TlsError,
+    TlsContext, TlsError, TlsVerifier,
 };
 use ota_core::{OtaManifestDeliveryAction, OtaState, classify_ota_manifest_delivery};
 use rand_core::RngCore;
@@ -340,14 +340,14 @@ impl rand_core::CryptoRng for MqttTlsRng {}
 
 struct MqttTlsProvider {
     rng: MqttTlsRng,
-    verifier: CertVerifier<Aes128GcmSha256, MqttTlsClock, MQTT_TLS_CERT_VERIFY_BUF_SIZE>,
+    verifier: CertVerifier<'static, Aes128GcmSha256, MqttTlsClock, MQTT_TLS_CERT_VERIFY_BUF_SIZE>,
 }
 
 impl MqttTlsProvider {
-    fn new() -> Self {
+    fn new(ca_der: &'static [u8]) -> Self {
         Self {
             rng: MqttTlsRng::new(),
-            verifier: CertVerifier::new(),
+            verifier: CertVerifier::new(Certificate::X509(ca_der)),
         }
     }
 }
@@ -360,9 +360,7 @@ impl CryptoProvider for MqttTlsProvider {
         &mut self.rng
     }
 
-    fn verifier(
-        &mut self,
-    ) -> Result<&mut impl embedded_tls::TlsVerifier<Self::CipherSuite>, TlsError> {
+    fn verifier(&mut self) -> Result<&mut impl TlsVerifier<Self::CipherSuite>, TlsError> {
         Ok(&mut self.verifier)
     }
 }
@@ -394,13 +392,15 @@ pub(super) async fn establish_mqtt_session_tls<'a>(
     let mut tls_socket =
         TlsConnection::new(socket, tls_record_read_buffer, tls_record_write_buffer);
     let tls_config = TlsConfig::new()
-        .with_ca(Certificate::X509(MQTT_TLS_CA_CERT_DER))
         .with_server_name(MQTT_BROKER_HOSTNAME)
         .with_max_fragment_length(MaxFragmentLength::Bits11);
 
     let tls_open_at = Instant::now();
     if let Err(e) = tls_socket
-        .open(TlsContext::new(&tls_config, MqttTlsProvider::new()))
+        .open(TlsContext::new(
+            &tls_config,
+            MqttTlsProvider::new(MQTT_TLS_CA_CERT_DER),
+        ))
         .await
     {
         warn!(

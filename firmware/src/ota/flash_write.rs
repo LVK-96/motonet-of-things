@@ -1,18 +1,16 @@
-//! Flash-aware OTA download that streams firmware directly into the inactive
-//! partition, verifies integrity, activates the new slot, and reboots.
+//! Flash-aware OTA download for **v2 encrypted** firmware.
 //!
-//! The pipeline is split into four phases so the top-level
-//! [`download_and_write_to_flash`] reads as a sequence of named steps:
+//! The pipeline decrypts and verifies each chunk on the fly using the ESP32
+//! hardware AES and SHA accelerators (via `esp-hal` work-queue contexts).
 //!
 //! 1. [`prepare_inactive_slot`] — size check + sector-aligned erase.
-//! 2. [`fetch_and_stream_to_flash`] — HTTP fetch, response validation,
-//!    and on-the-fly hash/prefix/flash write via [`StreamToFlash`].
+//! 2. [`fetch_and_process_encrypted`] — HTTP fetch, v2 header validation,
+//!    chunk HMAC verify → AES-CTR decrypt → flash write + SHA-256 hash.
 //! 3. [`post_verify`] + [`verify_flash_readback`] — manifest and
-//!    readback checks against the streamed result.
+//!    readback checks against the decrypted result.
 //! 4. Activate the new slot, mark the app `New`, and reboot.
 
 use core::convert::Infallible;
-use core::fmt::Write as _;
 use core::mem::MaybeUninit;
 use core::net::{IpAddr, Ipv4Addr};
 use core::ptr::addr_of_mut;
@@ -23,7 +21,7 @@ use embassy_net::{
     Stack,
     tcp::client::{TcpClient, TcpClientState},
 };
-use embedded_io_async::BufRead as _;
+use embassy_time::Duration;
 use embedded_nal_async::{AddrType, Dns};
 use embedded_storage::ReadStorage;
 use embedded_storage::Storage;
@@ -31,18 +29,24 @@ use embedded_storage::nor_flash::NorFlash;
 use esp_bootloader_esp_idf::partitions::{
     Error as PartitionError, FlashRegion, PARTITION_TABLE_MAX_LEN,
 };
+use esp_hal::rng::Rng;
+use esp_hal::sha::Sha256Context;
 use esp_hal::system::software_reset;
 use esp_storage::{FlashStorage, FlashStorageError};
 use heapless::String;
-use ota_core::{EspImagePrefixError, OtaManifest, validate_esp_image_prefix};
-use reqwless::client::HttpClient;
+use ota_core::{
+    EspImagePrefixError, MAX_REDIRECT_URL_LEN, MAX_REDIRECTS, ManifestError, OtaManifest,
+    validate_esp_image_prefix, validate_ota_url_policy,
+};
+use reqwless::client::{HttpClient, TlsConfig, TlsVerify};
 use reqwless::headers::TransferEncoding;
-use reqwless::request::Method;
+use reqwless::request::{Method, RequestBuilder};
 use reqwless::response::StatusCode;
-use sha2::{Digest, Sha256};
 
 use crate::network;
 use crate::ota::OtaBootMetadata;
+use crate::ota::encrypted;
+use crate::secrets;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -52,10 +56,11 @@ use crate::ota::OtaBootMetadata;
 const OTA_TCP_BUF_SIZE: usize = 4096;
 /// ESP32 flash sector size used for erase alignment.
 const FLASH_SECTOR_SIZE: u32 = 4096;
-/// Maximum HTTP header bytes we'll buffer for a response.
-const HTTP_HEADER_BUF_SIZE: usize = 1024;
-/// Number of leading bytes of the image retained for ESP prefix
-/// validation. The basic ESP image header lives in the first 8 bytes.
+/// Maximum HTTP header bytes buffered for a response.
+const HTTP_HEADER_BUF_SIZE: usize = 4096;
+/// Buffer size for each direction of the HTTPS TLS record layer.
+const OTA_TLS_BUF_SIZE: usize = 4096;
+/// Number of leading bytes of the image retained for ESP prefix validation.
 const ESP_IMAGE_PREFIX_LEN: usize = 64;
 /// Number of bytes read back from flash for post-write verification.
 const FLASH_READBACK_LEN: usize = 256;
@@ -71,6 +76,10 @@ pub enum OtaFlashWriteError {
     Flash(FlashStorageError),
     HttpConnect,
     HttpStatus(u16),
+    RedirectWithoutLocation,
+    RedirectLocationTooLong,
+    RedirectRejected,
+    TooManyRedirects,
     MissingContentLength,
     ContentLengthMismatch,
     ChunkedRejected,
@@ -79,12 +88,31 @@ pub enum OtaFlashWriteError {
     ShaMismatch,
     InvalidImagePrefix(EspImagePrefixError),
     FlashVerifyFailed,
-    /// Manifest `size` does not fit in the inactive OTA slot even after
-    /// sector alignment.
+    /// Manifest `image_size` does not fit in the inactive OTA slot.
     ImageTooLargeForSlot {
-        size: u32,
+        image_size: u32,
         slot_size: u32,
     },
+    /// Bad nonce prefix hex in manifest.
+    InvalidNoncePrefix,
+    /// HMAC tag verification failed for a chunk.
+    HmacMismatch,
+    /// AES hardware operation failed during decryption.
+    AesError(encrypted::AesError),
+    /// OTA v2 stream header too short.
+    HeaderTooShort,
+    /// OTA v2 stream header has invalid magic.
+    HeaderInvalidMagic,
+    /// OTA v2 stream header has unsupported version.
+    HeaderInvalidVersion,
+    /// OTA v2 stream header has non-zero reserved bytes.
+    HeaderInvalidReserved,
+    /// Chunk truncated before HMAC tag.
+    ChunkTruncated,
+    /// Manifest canonical JSON construction failed.
+    ManifestCanonical(ManifestError),
+    /// Per-read timeout on HTTP body.
+    ReadTimeout,
 }
 
 impl From<PartitionError> for OtaFlashWriteError {
@@ -105,46 +133,89 @@ impl From<EspImagePrefixError> for OtaFlashWriteError {
     }
 }
 
+impl From<encrypted::OtaHeaderError> for OtaFlashWriteError {
+    fn from(e: encrypted::OtaHeaderError) -> Self {
+        match e {
+            encrypted::OtaHeaderError::TooShort => Self::HeaderTooShort,
+            encrypted::OtaHeaderError::InvalidMagic => Self::HeaderInvalidMagic,
+            encrypted::OtaHeaderError::InvalidVersion => Self::HeaderInvalidVersion,
+            encrypted::OtaHeaderError::ReservedNonZero => Self::HeaderInvalidReserved,
+        }
+    }
+}
+
+impl From<encrypted::AesError> for OtaFlashWriteError {
+    fn from(e: encrypted::AesError) -> Self {
+        Self::AesError(e)
+    }
+}
+
 // ---------------------------------------------------------------------------
-// IPv4-literal DNS adapter
+// DNS adapter
 // ---------------------------------------------------------------------------
 
-/// DNS resolver that parses IPv4 address literals directly.
-///
-/// The OTA URL policy guarantees the download URL contains an IPv4 host,
-/// so we never need to perform a real DNS lookup. Using a dedicated adapter
-/// keeps the boundary explicit so a real DNS resolver can be slotted in
-/// later without changing the download pipeline.
-struct Ipv4LiteralDns;
+#[derive(Debug)]
+enum OtaDnsError {
+    Lookup,
+}
 
-impl Dns for Ipv4LiteralDns {
-    type Error = Infallible;
+struct OtaDns {
+    socket: embassy_net::dns::DnsSocket<'static>,
+}
+
+impl OtaDns {
+    fn new(stack: Stack<'static>) -> Self {
+        Self {
+            socket: embassy_net::dns::DnsSocket::new(stack),
+        }
+    }
+}
+
+impl Dns for OtaDns {
+    type Error = OtaDnsError;
 
     async fn get_host_by_name(
         &self,
         host: &str,
-        _addr_type: AddrType,
-    ) -> Result<IpAddr, Infallible> {
-        // The URL policy in ota-core already validated this is a
-        // dotted-decimal IPv4 address; defensively fall back to 0.0.0.0 if
-        // the contract is ever violated.
-        let mut octets = [0u8; 4];
-        for (i, part) in host.split('.').enumerate() {
-            if i >= 4 {
-                break;
-            }
-            octets[i] = part.parse().unwrap_or(0);
+        addr_type: AddrType,
+    ) -> Result<IpAddr, OtaDnsError> {
+        if let Some(addr) = parse_ipv4_literal(host) {
+            return Ok(IpAddr::V4(addr));
         }
-        Ok(IpAddr::V4(Ipv4Addr::from(octets)))
+        self.socket
+            .get_host_by_name(host, addr_type)
+            .await
+            .map_err(|_| OtaDnsError::Lookup)
     }
 
     async fn get_host_by_address(
         &self,
         _addr: IpAddr,
         _result: &mut [u8],
-    ) -> Result<usize, Infallible> {
+    ) -> Result<usize, OtaDnsError> {
         Ok(0)
     }
+}
+
+fn parse_ipv4_literal(host: &str) -> Option<Ipv4Addr> {
+    if host.is_empty() || host.split('.').count() != 4 {
+        return None;
+    }
+    let mut octets = [0u8; 4];
+    for (i, part) in host.split('.').enumerate() {
+        if part.is_empty() || part.len() > 3 || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let mut value: u16 = 0;
+        for byte in part.bytes() {
+            value = value * 10 + u16::from(byte - b'0');
+        }
+        let Ok(value) = u8::try_from(value) else {
+            return None;
+        };
+        octets[i] = value;
+    }
+    Some(Ipv4Addr::from(octets))
 }
 
 // ---------------------------------------------------------------------------
@@ -154,135 +225,80 @@ impl Dns for Ipv4LiteralDns {
 static TCP_CLIENT_READY: AtomicBool = AtomicBool::new(false);
 static mut TCP_CLIENT_BUF: MaybeUninit<TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE>> =
     MaybeUninit::uninit();
+static mut OTA_TLS_READ_BUF: [u8; OTA_TLS_BUF_SIZE] = [0u8; OTA_TLS_BUF_SIZE];
+static mut OTA_TLS_WRITE_BUF: [u8; OTA_TLS_BUF_SIZE] = [0u8; OTA_TLS_BUF_SIZE];
+static mut OTA_HTTP_HEADER_BUF: [u8; HTTP_HEADER_BUF_SIZE] = [0u8; HTTP_HEADER_BUF_SIZE];
 
 fn tcp_client_state() -> &'static mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE> {
-    // addr_of_mut! for static mut produces a raw pointer (safe in edition 2024);
-    // we guard initialization with TCP_CLIENT_READY.
     let raw: *mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE> =
         addr_of_mut!(TCP_CLIENT_BUF).cast();
     if !TCP_CLIENT_READY.swap(true, Ordering::AcqRel) {
-        // SAFETY: first call, exclusive access before the bool is set.
         unsafe {
             raw.write(TcpClientState::new());
         }
     }
-    // SAFETY: initialized either in this call or a previous one (guarded by atomic).
     unsafe { &mut *raw }
+}
+
+fn ota_tls_buffers() -> (
+    &'static mut [u8; OTA_TLS_BUF_SIZE],
+    &'static mut [u8; OTA_TLS_BUF_SIZE],
+) {
+    unsafe {
+        (
+            &mut *addr_of_mut!(OTA_TLS_READ_BUF),
+            &mut *addr_of_mut!(OTA_TLS_WRITE_BUF),
+        )
+    }
+}
+
+fn http_header_buf() -> &'static mut [u8; HTTP_HEADER_BUF_SIZE] {
+    unsafe { &mut *addr_of_mut!(OTA_HTTP_HEADER_BUF) }
 }
 
 // ---------------------------------------------------------------------------
 // SHA-256 hex helper
 // ---------------------------------------------------------------------------
 
+/// Convert a 32-byte SHA-256 digest to a 64-char lowercase hex string.
+///
+/// Uses a manual hex table so the conversion is infallible.
+#[allow(clippy::unwrap_used)]
 fn sha256_hex(digest: &[u8; 32]) -> String<64> {
-    let mut out = String::new();
-    for byte in digest {
-        // write! into a fixed-capacity heapless::String is infallible.
-        write!(out, "{byte:02x}").ok();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 64];
+    for (i, byte) in digest.iter().enumerate() {
+        buf[i * 2] = HEX[(byte >> 4) as usize];
+        buf[i * 2 + 1] = HEX[(byte & 0xF) as usize];
     }
-    out
-}
-
-// ---------------------------------------------------------------------------
-// Streaming state
-// ---------------------------------------------------------------------------
-
-/// Streaming state for writing the HTTP response body to the inactive
-/// flash partition. Captures the first 64 bytes for ESP prefix
-/// validation, hashes the body, and writes chunks to flash.
-struct StreamToFlash<'a, F: Storage> {
-    region: FlashRegion<'a, F>,
-    first_bytes: [u8; ESP_IMAGE_PREFIX_LEN],
-    first_filled: usize,
-    prefix_validated: bool,
-    total: usize,
-    flash_offset: u32,
-    hasher: Sha256,
-}
-
-/// Output of [`StreamToFlash`] — everything the post-download verifiers
-/// need without holding on to the flash region borrow.
-struct StreamResult {
-    total: usize,
-    digest: [u8; 32],
-    first_bytes: [u8; ESP_IMAGE_PREFIX_LEN],
-    first_filled: usize,
-}
-
-impl<'a, F: Storage> StreamToFlash<'a, F> {
-    fn new(region: FlashRegion<'a, F>) -> Self {
-        Self {
-            region,
-            first_bytes: [0u8; ESP_IMAGE_PREFIX_LEN],
-            first_filled: 0,
-            prefix_validated: false,
-            total: 0,
-            flash_offset: 0,
-            hasher: Sha256::new(),
-        }
-    }
-
-    /// Ingest a body chunk: capture prefix bytes, validate the ESP image
-    /// prefix as soon as enough bytes are available, hash, and write to
-    /// flash. The prefix check happens **before** the first `Storage::write`
-    /// so a corrupt or hostile image never touches the inactive slot.
-    #[allow(clippy::cast_possible_truncation)]
-    fn process_chunk(&mut self, chunk: &[u8]) -> Result<(), OtaFlashWriteError> {
-        // Capture the first 64 bytes for ESP prefix validation.
-        let remaining = ESP_IMAGE_PREFIX_LEN.saturating_sub(self.first_filled);
-        let copy = chunk.len().min(remaining);
-        if copy > 0 {
-            self.first_bytes[self.first_filled..self.first_filled + copy]
-                .copy_from_slice(&chunk[..copy]);
-            self.first_filled += copy;
-        }
-        if !self.prefix_validated && self.first_filled >= 8 {
-            validate_esp_image_prefix(&self.first_bytes[..self.first_filled])?;
-            self.prefix_validated = true;
-        }
-
-        // Hash and write to flash.
-        self.hasher.update(chunk);
-        Storage::write(&mut self.region, self.flash_offset, chunk)
-            .map_err(OtaFlashWriteError::from)?;
-        self.flash_offset += chunk.len() as u32;
-        self.total += chunk.len();
-        Ok(())
-    }
-
-    fn finalize(self) -> StreamResult {
-        let digest: [u8; 32] = self.hasher.finalize().into();
-        StreamResult {
-            total: self.total,
-            digest,
-            first_bytes: self.first_bytes,
-            first_filled: self.first_filled,
-        }
-    }
+    // SAFETY: `buf` contains only ASCII hex characters (0-9, a-f),
+    // all of which are valid UTF-8.
+    let s = unsafe { core::str::from_utf8_unchecked(&buf) };
+    // `Vec::from_slice` cannot fail: input is exactly 64 bytes, capacity is 64.
+    let vec = heapless::Vec::<u8, 64>::from_slice(s.as_bytes()).unwrap();
+    // SAFETY: `vec` contains only valid UTF-8 (same hex chars).
+    unsafe { String::from_utf8_unchecked(vec) }
 }
 
 // ---------------------------------------------------------------------------
 // Phase 1: prepare the inactive slot
 // ---------------------------------------------------------------------------
 
-/// Verify the manifest's `size` fits in the inactive partition (with one
-/// sector of tail padding) and erase the sectors the image will occupy.
-///
-/// `partition_size()` is the partition size in bytes as reported by
-/// `esp_bootloader_esp_idf`; the `as u32` cast is sound for the ESP32-WROOM
-/// 4 MiB flash layout this firmware targets.
 #[allow(clippy::cast_possible_truncation)]
 fn prepare_inactive_slot<F: NorFlash>(
     region: &mut FlashRegion<'_, F>,
     image_bytes: u32,
 ) -> Result<(), OtaFlashWriteError> {
     let slot_size = region.partition_size() as u32;
-    // Reserve one sector at the tail of the partition so we never
-    // accidentally span a partial sector.
+    // Reserve one sector (4 KiB) at the tail of the inactive slot. This
+    // headroom prevents us from touching the next partition in the table
+    // even when the image is sector-aligned. It also provides a safety
+    // margin against erase/write glitches at the partition boundary and
+    // mirrors the bootloader's own slot headroom convention.
     let max_writable = slot_size.saturating_sub(FLASH_SECTOR_SIZE);
     if image_bytes > max_writable {
         return Err(OtaFlashWriteError::ImageTooLargeForSlot {
-            size: image_bytes,
+            image_size: image_bytes,
             slot_size,
         });
     }
@@ -299,62 +315,149 @@ fn prepare_inactive_slot<F: NorFlash>(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: HTTP fetch + stream
+// Phase 2: HTTP(S) fetch + encrypted stream processing
 // ---------------------------------------------------------------------------
 
-/// Issue the GET, validate the response metadata against the expected
-/// image size, and stream the body into the flash region. On return the
-/// region borrow is released and the caller has a [`StreamResult`] for
-/// post-verification.
-async fn fetch_and_stream_to_flash(
-    network_stack: Stack<'static>,
-    url: &str,
-    region: FlashRegion<'_, FlashStorage<'static>>,
-    expected_size: usize,
-) -> Result<StreamResult, OtaFlashWriteError> {
-    let state = tcp_client_state();
-    let tcp = TcpClient::new(network_stack, state);
-    let dns = Ipv4LiteralDns;
-    let mut client = HttpClient::new(&tcp, &dns);
+const OTA_HTTP_HEADERS: &[(&str, &str)] = &[
+    ("User-Agent", "motonet-of-things-esp32-ota"),
+    ("Accept", "application/octet-stream"),
+    ("Connection", "close"),
+];
 
-    info!("OTA: downloading {} ({} bytes)", url, expected_size);
-
-    // Issue the request.
-    let mut request = client
-        .request(Method::GET, url)
-        .await
-        .map_err(|_| OtaFlashWriteError::HttpConnect)?;
-
-    let mut header_buf = [0u8; HTTP_HEADER_BUF_SIZE];
-    let response = request
-        .send(&mut header_buf)
-        .await
-        .map_err(|_| OtaFlashWriteError::HttpConnect)?;
-
-    validate_response_metadata(&response, expected_size)?;
-
-    // Stream the body to flash.
-    let mut stream = StreamToFlash::new(region);
-    let mut body = response.body().reader();
-    loop {
-        let buf = body
-            .fill_buf()
-            .await
-            .map_err(|_| OtaFlashWriteError::ReadFailed)?;
-        if buf.is_empty() {
-            break;
-        }
-        let chunk = buf.len();
-        stream.process_chunk(&buf[..chunk])?;
-        body.consume(chunk);
-    }
-    Ok(stream.finalize())
+fn ota_tls_seed() -> u64 {
+    let rng = Rng::new();
+    (u64::from(rng.random()) << 32) | u64::from(rng.random())
 }
 
-/// Validate the HTTP response status, `Content-Length`, and transfer
-/// encoding against the expected image size. Generic over the connection
-/// type so it works for any `reqwless::Response` regardless of the
-/// underlying transport.
+/// Build the TLS verification config, respecting `OTA_TLS_ALLOW_INVALID_CA`.
+fn ota_tls_verify() -> TlsVerify<'static> {
+    if secrets::OTA_TLS_ALLOW_INVALID_CA {
+        TlsVerify::None
+    } else {
+        TlsVerify::Certificate {
+            ca: secrets::OTA_TLS_CA_CERT_DER,
+            cert: None,
+            key: None,
+        }
+    }
+}
+
+/// Output of the encrypted download and processing phase.
+struct EncryptedResult {
+    total_plaintext: u32,
+    digest: [u8; 32],
+    first_bytes: [u8; ESP_IMAGE_PREFIX_LEN],
+    first_filled: usize,
+}
+
+/// Fetch the v2 encrypted OTA payload and process it chunk-by-chunk:
+/// validate the 16-byte header, verify HMAC, decrypt, write plaintext to
+/// flash, and accumulate a SHA-256 hash of the plaintext.
+async fn fetch_and_process_encrypted(
+    network_stack: Stack<'static>,
+    manifest: &OtaManifest,
+    region: &mut FlashRegion<'_, FlashStorage<'static>>,
+    nonce_prefix: &[u8; 12],
+    hmac_key: &[u8; encrypted::HMAC_KEY_SIZE],
+    aes_key: &[u8; encrypted::AES_KEY_SIZE],
+    manifest_digest: &[u8; encrypted::SHA256_OUTPUT_SIZE],
+) -> Result<EncryptedResult, OtaFlashWriteError> {
+    let state = tcp_client_state();
+    let tcp = TcpClient::new(network_stack, state);
+    let dns = OtaDns::new(network_stack);
+    let (tls_read_buf, tls_write_buf) = ota_tls_buffers();
+    let tls_verify = ota_tls_verify();
+    let tls_config = TlsConfig::new(ota_tls_seed(), tls_read_buf, tls_write_buf, tls_verify);
+    let mut client = HttpClient::new_with_tls(&tcp, &dns, tls_config);
+    let mut current_url: String<MAX_REDIRECT_URL_LEN> = String::new();
+    current_url
+        .push_str(&manifest.url)
+        .map_err(|_| OtaFlashWriteError::RedirectLocationTooLong)?;
+    let mut redirects = 0;
+
+    loop {
+        info!(
+            "OTA: downloading {} (download_size={}, redirect {}/{})",
+            current_url.as_str(),
+            manifest.download_size,
+            redirects,
+            MAX_REDIRECTS
+        );
+
+        let next_redirect = {
+            let mut request = client
+                .request(Method::GET, current_url.as_str())
+                .await
+                .map_err(|_| OtaFlashWriteError::HttpConnect)?
+                .headers(OTA_HTTP_HEADERS);
+
+            let response = request
+                .send(http_header_buf())
+                .await
+                .map_err(|_| OtaFlashWriteError::HttpConnect)?;
+
+            if response.status.is_redirection() {
+                let next_url = redirect_location(&response)?;
+                info!(
+                    "OTA: following redirect {} -> {}",
+                    response.status.0,
+                    next_url.as_str()
+                );
+                Some(next_url)
+            } else {
+                validate_response_metadata(&response, manifest.download_size as usize)?;
+
+                // Process the encrypted body.
+                let result = process_encrypted_body(
+                    response.body().reader(),
+                    region,
+                    nonce_prefix,
+                    hmac_key,
+                    aes_key,
+                    manifest_digest,
+                    manifest.image_size,
+                )
+                .await?;
+                return Ok(result);
+            }
+        };
+
+        if redirects >= MAX_REDIRECTS {
+            warn!("OTA: too many HTTP redirects");
+            return Err(OtaFlashWriteError::TooManyRedirects);
+        }
+        let next_url = next_redirect.ok_or(OtaFlashWriteError::RedirectWithoutLocation)?;
+        if !next_url.as_str().starts_with("https://")
+            || validate_ota_url_policy(next_url.as_str()).is_err()
+        {
+            warn!("OTA: rejected redirect target {}", next_url.as_str());
+            return Err(OtaFlashWriteError::RedirectRejected);
+        }
+        current_url = next_url;
+        redirects += 1;
+    }
+}
+
+fn redirect_location<C>(
+    response: &reqwless::response::Response<'_, '_, C>,
+) -> Result<String<MAX_REDIRECT_URL_LEN>, OtaFlashWriteError>
+where
+    C: embedded_io_async::Read,
+{
+    for (name, value) in response.headers() {
+        if name.eq_ignore_ascii_case("location") {
+            let location = core::str::from_utf8(value)
+                .map_err(|_| OtaFlashWriteError::RedirectRejected)?
+                .trim_matches(|ch: char| ch.is_ascii_whitespace());
+            let mut out = String::new();
+            out.push_str(location)
+                .map_err(|_| OtaFlashWriteError::RedirectLocationTooLong)?;
+            return Ok(out);
+        }
+    }
+    Err(OtaFlashWriteError::RedirectWithoutLocation)
+}
+
 fn validate_response_metadata<C>(
     response: &reqwless::response::Response<'_, '_, C>,
     expected_size: usize,
@@ -386,41 +489,175 @@ where
     Ok(())
 }
 
+/// Per-read timeout in seconds for each `fill_buf().await` call so a
+/// stalled TCP stream doesn't block the OTA pipeline indefinitely.
+const READ_TIMEOUT_SECS: u64 = 10;
+
+/// Read exactly `len` bytes from a `BufRead` into `buf`.
+async fn read_exact(
+    reader: &mut impl embedded_io_async::BufRead,
+    buf: &mut [u8],
+) -> Result<(), OtaFlashWriteError> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        let available =
+            embassy_time::with_timeout(Duration::from_secs(READ_TIMEOUT_SECS), reader.fill_buf())
+                .await
+                .map_err(|_| OtaFlashWriteError::ReadTimeout)?
+                .map_err(|_| OtaFlashWriteError::ReadFailed)?;
+        if available.is_empty() {
+            return Err(OtaFlashWriteError::ReadFailed);
+        }
+        let copy = available.len().min(buf.len() - offset);
+        buf[offset..offset + copy].copy_from_slice(&available[..copy]);
+        offset += copy;
+        reader.consume(copy);
+    }
+    Ok(())
+}
+
+/// Process the v2 encrypted HTTP body: validate header, then for each
+/// chunk verify HMAC, decrypt, write to flash, and hash the plaintext.
+#[allow(clippy::too_many_arguments)]
+async fn process_encrypted_body(
+    mut reader: impl embedded_io_async::BufRead,
+    region: &mut FlashRegion<'_, FlashStorage<'static>>,
+    nonce_prefix: &[u8; 12],
+    hmac_key: &[u8; encrypted::HMAC_KEY_SIZE],
+    aes_key: &[u8; encrypted::AES_KEY_SIZE],
+    manifest_digest: &[u8; encrypted::SHA256_OUTPUT_SIZE],
+    image_size: u32,
+) -> Result<EncryptedResult, OtaFlashWriteError> {
+    // 1. Read and validate the 16-byte header.
+    let mut header = [0u8; encrypted::OTA_V2_HEADER_SIZE];
+    read_exact(&mut reader, &mut header).await?;
+    encrypted::validate_ota_header(&header)?;
+
+    // 2. Stream chunks — exactly ceil(image_size / ENC_CHUNK_SIZE) chunks.
+    let num_chunks = image_size.div_ceil(ota_core::ENC_CHUNK_SIZE);
+    let mut first_bytes = [0u8; ESP_IMAGE_PREFIX_LEN];
+    let mut first_filled = 0usize;
+    let mut prefix_validated = false;
+    let mut total_plaintext: u32 = 0;
+    let mut flash_offset: u32 = 0;
+    let mut sha_ctx = Sha256Context::new();
+    // Buffer for reading the wire-format length prefix + HMAC tag.
+    let mut len_buf = [0u8; 4];
+    let mut tag_buf = [0u8; encrypted::HMAC_TAG_SIZE];
+    // Reusable ciphertext buffer sized to the maximum chunk.
+    let mut ciphertext_buf = [0u8; ota_core::ENC_CHUNK_SIZE as usize];
+
+    for chunk_index in 0..num_chunks {
+        // Read 4-byte plaintext length (big-endian).
+        read_exact(&mut reader, &mut len_buf).await?;
+        let ciphertext_len = u32::from_be_bytes(len_buf);
+
+        // Enforce exact expected length per chunk: full chunk for all but
+        // the last, remainder for the last.
+        let expected_len = if chunk_index == num_chunks - 1 {
+            image_size - chunk_index * ota_core::ENC_CHUNK_SIZE
+        } else {
+            ota_core::ENC_CHUNK_SIZE
+        };
+        if ciphertext_len != expected_len {
+            warn!(
+                "OTA: chunk {} length {} != expected {}",
+                chunk_index, ciphertext_len, expected_len
+            );
+            return Err(OtaFlashWriteError::ChunkTruncated);
+        }
+
+        let ct = &mut ciphertext_buf[..ciphertext_len as usize];
+        read_exact(&mut reader, ct).await?;
+        read_exact(&mut reader, &mut tag_buf).await?;
+
+        // Verify HMAC before decrypting.
+        if !encrypted::verify_chunk_hmac(
+            hmac_key,
+            manifest_digest,
+            chunk_index,
+            flash_offset,
+            ciphertext_len,
+            ct,
+            &tag_buf,
+        ) {
+            warn!("OTA: HMAC verification failed for chunk {}", chunk_index);
+            return Err(OtaFlashWriteError::HmacMismatch);
+        }
+
+        // Decrypt in-place.
+        encrypted::aes_ctr_crypt_in_place(aes_key, nonce_prefix, chunk_index, ct)?;
+
+        let plaintext = ct; // now decrypted
+
+        // Validate ESP image prefix on the first bytes of plaintext, before
+        // writing anything to flash.
+        if !prefix_validated {
+            let copy = plaintext
+                .len()
+                .min(ESP_IMAGE_PREFIX_LEN.saturating_sub(first_filled));
+            first_bytes[first_filled..first_filled + copy].copy_from_slice(&plaintext[..copy]);
+            first_filled += copy;
+            if first_filled >= 8 {
+                validate_esp_image_prefix(&first_bytes[..first_filled])?;
+                prefix_validated = true;
+            }
+        }
+
+        // Write plaintext to flash.
+        Storage::write(region, flash_offset, plaintext).map_err(OtaFlashWriteError::from)?;
+
+        // Hash the plaintext.
+        sha_ctx.update(plaintext).wait_blocking();
+
+        flash_offset += ciphertext_len;
+        total_plaintext += ciphertext_len;
+    }
+
+    // 3. Finalize SHA-256.
+    let mut digest = [0u8; encrypted::SHA256_OUTPUT_SIZE];
+    sha_ctx.finalize(&mut digest).wait_blocking();
+
+    Ok(EncryptedResult {
+        total_plaintext,
+        digest,
+        first_bytes,
+        first_filled,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3: post-download verification
 // ---------------------------------------------------------------------------
 
-/// Verify the streamed result matches the manifest's `size` and `sha256`.
-fn post_verify(
-    result: &StreamResult,
-    expected_size: usize,
-    expected_sha: &str,
-) -> Result<(), OtaFlashWriteError> {
-    if result.total != expected_size {
+fn post_verify(result: &EncryptedResult, manifest: &OtaManifest) -> Result<(), OtaFlashWriteError> {
+    if result.total_plaintext != manifest.image_size {
         warn!(
-            "OTA: body size mismatch (expected {}, got {})",
-            expected_size, result.total
+            "OTA: image size mismatch (expected {}, got {})",
+            manifest.image_size, result.total_plaintext
         );
         return Err(OtaFlashWriteError::SizeMismatch);
     }
     let digest_hex = sha256_hex(&result.digest);
-    if !digest_hex.as_str().eq_ignore_ascii_case(expected_sha) {
+    if !digest_hex
+        .as_str()
+        .eq_ignore_ascii_case(manifest.image_sha256.as_str())
+    {
         warn!(
             "OTA: SHA-256 mismatch (expected {}, got {})",
-            expected_sha, digest_hex
+            Debug2Format(&manifest.image_sha256),
+            Debug2Format(&digest_hex)
         );
         return Err(OtaFlashWriteError::ShaMismatch);
     }
     Ok(())
 }
 
-/// Read back the first [`FLASH_READBACK_LEN`] bytes of the inactive
-/// partition and compare against the in-memory copy we streamed.
 fn verify_flash_readback<F: ReadStorage>(
     region: &mut FlashRegion<'_, F>,
-    result: &StreamResult,
+    result: &EncryptedResult,
 ) -> Result<(), OtaFlashWriteError> {
-    let readback_len = FLASH_READBACK_LEN.min(result.total);
+    let readback_len = FLASH_READBACK_LEN.min(result.total_plaintext as usize);
     let mut readback = [0u8; FLASH_READBACK_LEN];
     ReadStorage::read(region, 0, &mut readback[..readback_len])
         .map_err(OtaFlashWriteError::from)?;
@@ -439,35 +676,46 @@ fn verify_flash_readback<F: ReadStorage>(
 // Top-level entry point
 // ---------------------------------------------------------------------------
 
-/// Download the OTA firmware image and stream it directly to the inactive
+/// Download the v2 encrypted OTA firmware and stream it to the inactive
 /// flash partition. On success, activates the new slot and reboots.
 ///
-/// The ESP image prefix (first 8 bytes) is validated as soon as those bytes
-/// are available, before any data is written to flash, so a corrupt manifest
-/// never touches the inactive slot.
-///
-/// The `partition_table_buf` is a caller-provided buffer used temporarily
-/// for reading the partition table. It must be at least
-/// [`PARTITION_TABLE_MAX_LEN`] bytes.
+/// The AES and SHA hardware-accelerator backends must already be started
+/// (their drivers alive) in the caller. This function creates transient
+/// `AesContext` / `Sha256Context` instances that submit work to the
+/// shared work queues.
 ///
 /// # Errors
 ///
-/// Returns [`OtaFlashWriteError`] on any flash, HTTP, or verification failure.
-/// On success the function never returns — it reboots the chip.
+/// Returns [`OtaFlashWriteError`] on any flash, HTTP, crypto, or
+/// verification failure. On success the function never returns — it
+/// reboots the chip.
 #[allow(clippy::cast_possible_truncation)]
 pub async fn download_and_write_to_flash(
     network_stack: Stack<'static>,
     manifest: &OtaManifest,
     flash: &mut FlashStorage<'static>,
     partition_table_buf: &mut [u8; PARTITION_TABLE_MAX_LEN],
+    master_key: &[u8; 32],
 ) -> Result<Infallible, OtaFlashWriteError> {
+    // Derive per-manifest subkeys from the encryption key id.
+    let (aes_key, hmac_key) = encrypted::derive_subkeys(master_key, manifest.enc.key_id);
+
+    // Parse nonce prefix.
+    let nonce_prefix = encrypted::parse_nonce_prefix(&manifest.enc.nonce_prefix)
+        .map_err(|_e| OtaFlashWriteError::InvalidNoncePrefix)?;
+
+    // Compute manifest digest.
+    let canonical = manifest
+        .canonical_unsigned_json()
+        .map_err(OtaFlashWriteError::ManifestCanonical)?;
+    let manifest_digest = encrypted::compute_manifest_digest(&canonical);
+
     network::wait_for_config_up(network_stack).await;
 
     let mut boot_metadata = OtaBootMetadata::new(flash, partition_table_buf)?;
 
-    // Phase 1+2: prepare the slot, fetch the image, and stream it in.
-    // The `region` borrow is scoped to this block so the readback in
-    // phase 3 can re-open the partition independently.
+    // Phase 1+2: prepare the inactive slot, fetch the encrypted download,
+    // decrypt/verify/write chunk-by-chunk.
     let stream_result = {
         let (mut region, slot) = boot_metadata
             .inactive_partition()
@@ -479,13 +727,21 @@ pub async fn download_and_write_to_flash(
             region.partition_size()
         );
 
-        prepare_inactive_slot(&mut region, manifest.size)?;
-        fetch_and_stream_to_flash(network_stack, &manifest.url, region, manifest.size as usize)
-            .await?
+        prepare_inactive_slot(&mut region, manifest.image_size)?;
+        fetch_and_process_encrypted(
+            network_stack,
+            manifest,
+            &mut region,
+            &nonce_prefix,
+            &hmac_key,
+            &aes_key,
+            &manifest_digest,
+        )
+        .await?
     };
 
     // Phase 3: post-download verification.
-    post_verify(&stream_result, manifest.size as usize, &manifest.sha256)?;
+    post_verify(&stream_result, manifest)?;
 
     {
         let (mut region, _) = boot_metadata
@@ -495,7 +751,7 @@ pub async fn download_and_write_to_flash(
     }
     info!(
         "OTA: flash write complete ({} bytes, sha={}, prefix_ok)",
-        stream_result.total,
+        stream_result.total_plaintext,
         sha256_hex(&stream_result.digest),
     );
     info!(
@@ -513,7 +769,7 @@ pub async fn download_and_write_to_flash(
 
     info!(
         "OTA: new slot activated ({} bytes written), rebooting...",
-        stream_result.total
+        stream_result.total_plaintext
     );
 
     software_reset()

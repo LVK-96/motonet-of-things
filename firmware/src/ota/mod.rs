@@ -1,4 +1,5 @@
 mod boot_metadata;
+pub mod encrypted;
 pub mod flash_write;
 
 pub use boot_metadata::OtaBootMetadata;
