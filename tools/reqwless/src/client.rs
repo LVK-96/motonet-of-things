@@ -59,7 +59,7 @@ pub struct TlsConfig<'a> {
 #[cfg(feature = "embedded-tls")]
 struct Provider<'a> {
     rng: rand_chacha::ChaCha8Rng,
-    verifier: CertVerifier<'a, Aes128GcmSha256, NoClock, 4096>,
+    verifier: CertVerifier<'a, Aes128GcmSha256, NoClock, 8192>,
     key: Option<&'a [u8]>,
     cert: Option<Certificate<&'a [u8]>>,
 }
