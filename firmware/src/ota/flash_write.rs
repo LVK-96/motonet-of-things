@@ -377,13 +377,23 @@ fn ota_tls_seed() -> u64 {
     (u64::from(rng.random()) << 32) | u64::from(rng.random())
 }
 
+const GITHUB_RELEASE_ASSETS_TLS_CA_CERT_DER: &[u8] = include_bytes!("../../isrg-root-x1.der");
+
+fn ota_tls_ca_for_url(url: &str) -> &'static [u8] {
+    if url.starts_with("https://release-assets.githubusercontent.com/") {
+        GITHUB_RELEASE_ASSETS_TLS_CA_CERT_DER
+    } else {
+        secrets::OTA_TLS_CA_CERT_DER
+    }
+}
+
 /// Build the TLS verification config, respecting `OTA_TLS_ALLOW_INVALID_CA`.
-fn ota_tls_verify() -> TlsVerify<'static> {
+fn ota_tls_verify_for_url(url: &str) -> TlsVerify<'static> {
     if secrets::OTA_TLS_ALLOW_INVALID_CA {
         TlsVerify::None
     } else {
         TlsVerify::Certificate {
-            ca: secrets::OTA_TLS_CA_CERT_DER,
+            ca: ota_tls_ca_for_url(url),
             cert: None,
             key: None,
         }
@@ -414,19 +424,7 @@ async fn fetch_and_process_encrypted(
     let state = tcp_client_state();
     let tcp = TcpClient::new(network_stack, state);
     let dns = OtaDns::new(network_stack);
-    let tls_read_buf = ota_tls_read_buf();
-    let tls_write_buf = ota_tls_write_buf();
     let http_header_buf = ota_http_header_buf();
-    // Use HttpClient::new for plain HTTP (no TLS) to avoid the
-    // PlainBuffered path in reqwless which may have issues with
-    // the Python http.server HTTP/1.0 responses.
-    let mut client = if manifest.url.starts_with("https://") {
-        let tls_verify = ota_tls_verify();
-        let tls_config = TlsConfig::new(ota_tls_seed(), tls_read_buf, tls_write_buf, tls_verify);
-        HttpClient::new_with_tls(&tcp, &dns, tls_config)
-    } else {
-        HttpClient::new(&tcp, &dns)
-    };
     let mut current_url: String<MAX_REDIRECT_URL_LEN> = String::new();
     current_url
         .push_str(&manifest.url)
@@ -450,6 +448,23 @@ async fn fetch_and_process_encrypted(
         }
 
         let next_redirect = {
+            // Use HttpClient::new for plain HTTP (no TLS) to avoid the
+            // PlainBuffered path in reqwless, which may have issues with
+            // Python http.server HTTP/1.0 responses. Rebuild the HTTPS
+            // client for every redirect so each host can use its matching
+            // trust anchor.
+            let mut client = if current_url.as_str().starts_with("https://") {
+                let tls_config = TlsConfig::new(
+                    ota_tls_seed(),
+                    ota_tls_read_buf(),
+                    ota_tls_write_buf(),
+                    ota_tls_verify_for_url(current_url.as_str()),
+                );
+                HttpClient::new_with_tls(&tcp, &dns, tls_config)
+            } else {
+                HttpClient::new(&tcp, &dns)
+            };
+
             let mut request = client
                 .request(Method::GET, current_url.as_str())
                 .await
