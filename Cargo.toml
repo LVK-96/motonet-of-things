@@ -42,3 +42,6 @@ redundant_closure_for_method_calls = "deny" # Prefer point-free style: .map(f)
 unwrap_used = "deny"             # Ban .unwrap() (force error handling)
 expect_used = "deny"             # Ban .expect()
 panic = "deny"                   # Ban panic! (force Result types)verflow-checks = false
+
+[patch.crates-io]
+embedded-tls = { path = "tools/embedded-tls" }
