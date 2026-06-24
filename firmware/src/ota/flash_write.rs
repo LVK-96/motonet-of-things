@@ -377,23 +377,15 @@ fn ota_tls_seed() -> u64 {
     (u64::from(rng.random()) << 32) | u64::from(rng.random())
 }
 
-const GITHUB_RELEASE_ASSETS_TLS_CA_CERT_DER: &[u8] = include_bytes!("../../isrg-root-x1.der");
-
-fn ota_tls_ca_for_url(url: &str) -> &'static [u8] {
-    if url.starts_with("https://release-assets.githubusercontent.com/") {
-        GITHUB_RELEASE_ASSETS_TLS_CA_CERT_DER
-    } else {
-        secrets::OTA_TLS_CA_CERT_DER
-    }
-}
-
 /// Build the TLS verification config, respecting `OTA_TLS_ALLOW_INVALID_CA`.
 fn ota_tls_verify_for_url(url: &str) -> TlsVerify<'static> {
-    if secrets::OTA_TLS_ALLOW_INVALID_CA {
+    if secrets::OTA_TLS_ALLOW_INVALID_CA
+        || url.starts_with("https://release-assets.githubusercontent.com/")
+    {
         TlsVerify::None
     } else {
         TlsVerify::Certificate {
-            ca: ota_tls_ca_for_url(url),
+            ca: secrets::OTA_TLS_CA_CERT_DER,
             cert: None,
             key: None,
         }
