@@ -466,16 +466,13 @@ async fn fetch_and_process_encrypted(
                 .map_err(|err| {
                     if redirects == 0 {
                         warn!(
-                            "OTA: HTTP request/connect failed for {}: {:?}",
-                            current_url.as_str(),
-                            Debug2Format(&err)
+                            "OTA: HTTP request/connect failed for {}",
+                            current_url.as_str()
                         );
                     } else {
-                        warn!(
-                            "OTA: HTTP request/connect failed for redirected HTTPS asset: {:?}",
-                            Debug2Format(&err)
-                        );
+                        warn!("OTA: HTTP request/connect failed for redirected HTTPS asset");
                     }
+                    log_http_client_error("request/connect", &err);
                     OtaFlashWriteError::HttpConnect
                 })?
                 .headers(OTA_HTTP_HEADERS);
@@ -483,16 +480,13 @@ async fn fetch_and_process_encrypted(
             let response = request.send(http_header_buf).await.map_err(|err| {
                 if redirects == 0 {
                     warn!(
-                        "OTA: HTTP send/response failed for {}: {:?}",
-                        current_url.as_str(),
-                        Debug2Format(&err)
+                        "OTA: HTTP send/response failed for {}",
+                        current_url.as_str()
                     );
                 } else {
-                    warn!(
-                        "OTA: HTTP send/response failed for redirected HTTPS asset: {:?}",
-                        Debug2Format(&err)
-                    );
+                    warn!("OTA: HTTP send/response failed for redirected HTTPS asset");
                 }
+                log_http_client_error("send/response", &err);
                 OtaFlashWriteError::HttpConnect
             })?;
 
@@ -552,6 +546,38 @@ where
         }
     }
     Err(OtaFlashWriteError::RedirectWithoutLocation)
+}
+
+fn log_http_client_error(context: &str, err: &reqwless::Error) {
+    match err {
+        reqwless::Error::Dns => warn!("OTA: HTTP {} error class: dns", context),
+        reqwless::Error::Network(kind) => {
+            warn!(
+                "OTA: HTTP {} error class: network {:?}",
+                context,
+                Debug2Format(kind)
+            )
+        }
+        reqwless::Error::Codec => warn!("OTA: HTTP {} error class: codec", context),
+        reqwless::Error::InvalidUrl(_) => warn!("OTA: HTTP {} error class: invalid-url", context),
+        reqwless::Error::Tls(tls) => {
+            warn!(
+                "OTA: HTTP {} error class: tls {:?}",
+                context,
+                Debug2Format(tls)
+            )
+        }
+        reqwless::Error::BufferTooSmall => {
+            warn!("OTA: HTTP {} error class: buffer-too-small", context)
+        }
+        reqwless::Error::AlreadySent => warn!("OTA: HTTP {} error class: already-sent", context),
+        reqwless::Error::IncorrectBodyWritten => {
+            warn!("OTA: HTTP {} error class: incorrect-body-written", context)
+        }
+        reqwless::Error::ConnectionAborted => {
+            warn!("OTA: HTTP {} error class: connection-aborted", context)
+        }
+    }
 }
 
 fn validate_response_metadata<C>(

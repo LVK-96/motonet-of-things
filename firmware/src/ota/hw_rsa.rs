@@ -1,6 +1,6 @@
 use core::convert::TryInto;
 
-use defmt::{debug, warn};
+use defmt::{info, warn};
 use embedded_tls::{RsaVerifier, TlsError};
 use esp_hal::Blocking;
 use esp_hal::rsa::{Rsa, RsaModularExponentiation, operand_sizes::Op2048};
@@ -53,7 +53,7 @@ impl RsaVerifier for Esp32RsaVerifier {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), TlsError> {
-        debug!("TLS RSA: verifying RSA-PSS-SHA256 signature with ESP32 accelerator");
+        info!("TLS RSA: verifying RSA-PSS-SHA256 signature with ESP32 accelerator");
         let encoded_message = Self::rsa_public_operation(public_key_der, signature)?;
         verify_pss_sha256_encoded_message(message, &encoded_message).map_err(map_rsa_error)
     }
@@ -64,7 +64,7 @@ impl RsaVerifier for Esp32RsaVerifier {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), TlsError> {
-        debug!("TLS RSA: verifying RSA-PKCS1v15-SHA256 signature with ESP32 accelerator");
+        info!("TLS RSA: verifying RSA-PKCS1v15-SHA256 signature with ESP32 accelerator");
         let encoded_message = Self::rsa_public_operation(public_key_der, signature)?;
         verify_pkcs1v15_sha256_encoded_message(message, &encoded_message).map_err(map_rsa_error)
     }
