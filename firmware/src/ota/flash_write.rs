@@ -386,6 +386,7 @@ fn ota_tls_verify_for_url(url: &str) -> TlsVerify<'static> {
             ca: secrets::OTA_TLS_CA_CERT_DER,
             cert: None,
             key: None,
+            rsa_verifier: None,
         }
     }
 }

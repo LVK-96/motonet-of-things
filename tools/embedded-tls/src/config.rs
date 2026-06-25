@@ -126,6 +126,67 @@ pub struct TlsConfig<'a> {
     pub(crate) max_fragment_length: Option<MaxFragmentLength>,
 }
 
+/// External RSA verifier hook.
+///
+/// Embedded targets can implement this with a hardware RSA accelerator instead
+/// of pulling in heap-backed software bignum code. Inputs are the DER-encoded
+/// PKCS#1 RSA public key, the signed message, and the raw signature bytes.
+pub trait RsaVerifier {
+    fn verify_pss_sha256(
+        &self,
+        _public_key_der: &[u8],
+        _message: &[u8],
+        _signature: &[u8],
+    ) -> Result<(), TlsError> {
+        Err(TlsError::InvalidSignatureScheme)
+    }
+
+    fn verify_pss_sha384(
+        &self,
+        _public_key_der: &[u8],
+        _message: &[u8],
+        _signature: &[u8],
+    ) -> Result<(), TlsError> {
+        Err(TlsError::InvalidSignatureScheme)
+    }
+
+    fn verify_pss_sha512(
+        &self,
+        _public_key_der: &[u8],
+        _message: &[u8],
+        _signature: &[u8],
+    ) -> Result<(), TlsError> {
+        Err(TlsError::InvalidSignatureScheme)
+    }
+
+    fn verify_pkcs1v15_sha256(
+        &self,
+        _public_key_der: &[u8],
+        _message: &[u8],
+        _signature: &[u8],
+    ) -> Result<(), TlsError> {
+        Err(TlsError::InvalidSignatureScheme)
+    }
+
+    fn verify_pkcs1v15_sha384(
+        &self,
+        _public_key_der: &[u8],
+        _message: &[u8],
+        _signature: &[u8],
+    ) -> Result<(), TlsError> {
+        Err(TlsError::InvalidSignatureScheme)
+    }
+
+    fn verify_pkcs1v15_sha512(
+        &self,
+        _public_key_der: &[u8],
+        _message: &[u8],
+        _signature: &[u8],
+    ) -> Result<(), TlsError> {
+        Err(TlsError::InvalidSignatureScheme)
+    }
+}
+
 pub trait TlsClock {
     fn now() -> Option<u64>;
 }

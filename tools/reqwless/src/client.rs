@@ -13,7 +13,8 @@ use embedded_io_async::{Read, Write};
 use embedded_nal_async::{Dns, TcpConnect};
 #[cfg(feature = "embedded-tls")]
 use embedded_tls::{
-    Aes128GcmSha256, Certificate, CryptoProvider, NoClock, SignatureScheme, TlsError, TlsVerifier, pki::CertVerifier,
+    Aes128GcmSha256, Certificate, CryptoProvider, NoClock, RsaVerifier, SignatureScheme, TlsError, TlsVerifier,
+    pki::CertVerifier,
 };
 use nourl::{Url, UrlScheme};
 #[cfg(feature = "embedded-tls")]
@@ -106,6 +107,7 @@ pub enum TlsVerify<'a> {
         ca: &'a [u8],
         cert: Option<&'a [u8]>,
         key: Option<&'a [u8]>,
+        rsa_verifier: Option<&'a (dyn RsaVerifier + 'a)>,
     },
 }
 
@@ -212,22 +214,31 @@ where
                 let mut conn: embedded_tls::TlsConnection<'conn, T::Connection<'conn>, embedded_tls::Aes128GcmSha256> =
                     embedded_tls::TlsConnection::new(conn, tls.read_buffer, tls.write_buffer);
 
-                match tls.verify {
+                match &mut tls.verify {
                     TlsVerify::None => {
                         use embedded_tls::UnsecureProvider;
                         conn.open(TlsContext::new(&config, UnsecureProvider::new(rng))).await?;
                     }
                     TlsVerify::Psk { identity, psk } => {
                         use embedded_tls::UnsecureProvider;
-                        config = config.with_psk(psk, &[identity]);
+                        config = config.with_psk(psk, &[*identity]);
                         conn.open(TlsContext::new(&config, UnsecureProvider::new(rng))).await?;
                     }
-                    TlsVerify::Certificate { ca, cert, key } => {
+                    TlsVerify::Certificate {
+                        ca,
+                        cert,
+                        key,
+                        rsa_verifier,
+                    } => {
+                        let mut verifier = embedded_tls::pki::CertVerifier::new(Certificate::X509(*ca));
+                        if let Some(rsa_verifier) = *rsa_verifier {
+                            verifier = verifier.with_rsa_verifier(rsa_verifier);
+                        }
                         let provider = Provider {
                             rng,
-                            verifier: embedded_tls::pki::CertVerifier::new(Certificate::X509(ca)),
-                            key,
-                            cert: cert.map(Certificate::X509),
+                            verifier,
+                            key: *key,
+                            cert: (*cert).map(Certificate::X509),
                         };
 
                         conn.open(TlsContext::new(&config, provider)).await?;
