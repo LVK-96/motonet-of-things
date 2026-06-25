@@ -61,8 +61,9 @@ const FLASH_SECTOR_SIZE: u32 = 4096;
 /// Maximum HTTP header bytes buffered for a response.
 ///
 /// GitHub release downloads first return a large redirect response with many
-/// security/cache headers; 4 KiB is not enough for reqwless to parse it.
-const HTTP_HEADER_BUF_SIZE: usize = 16 * 1024;
+/// security/cache headers; the current max measured block is about 5.1 KiB, so
+/// keep 8 KiB to leave redirect-query churn margin without spending 16 KiB.
+const HTTP_HEADER_BUF_SIZE: usize = 8 * 1024;
 const OTA_HTTP_READ_TIMEOUT_SECS: u64 = 10;
 const TLS_WORKSPACE_WAIT_ATTEMPTS: usize = 50;
 const TLS_WORKSPACE_WAIT_INTERVAL_MS: u64 = 100;
