@@ -2783,6 +2783,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsa-verify-core"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "rtt-target"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
