@@ -21,6 +21,7 @@ use crate::app_bus::{self, AppCommand};
 use crate::messages::RadioReading;
 use crate::power;
 use crate::secrets::MQTT_USE_TLS;
+use crate::tls_workspace::TlsWorkspaceGuard;
 
 #[cfg(feature = "release-ota")]
 fn ota_manifest_verifier() -> Ed25519ManifestVerifier {
@@ -38,9 +39,6 @@ mod session;
 type PlainClient<'a> = Client<'a, TcpSocket<'a>, BumpBuffer<'a>, 4, 2, 2, 0>;
 type TlsSocket<'a> = TlsConnection<'a, TcpSocket<'a>, Aes128GcmSha256>;
 type TlsClient<'a> = Client<'a, TlsSocket<'a>, BumpBuffer<'a>, 4, 2, 2, 0>;
-
-const MQTT_TLS_RECORD_READ_BUF_SIZE: usize = 16640;
-const MQTT_TLS_RECORD_WRITE_BUF_SIZE: usize = 4096;
 
 enum ReadingOutcome {
     Continue,
@@ -349,16 +347,21 @@ pub async fn mqtt_task(
         let mut mqtt_buffer = BumpBuffer::new(&mut mqtt_buf);
 
         if MQTT_USE_TLS {
-            let mut tls_read_buf = [0u8; MQTT_TLS_RECORD_READ_BUF_SIZE];
-            let mut tls_write_buf = [0u8; MQTT_TLS_RECORD_WRITE_BUF_SIZE];
+            let Some(mut tls_workspace) = TlsWorkspaceGuard::try_acquire() else {
+                warn!("MQTT: TLS workspace busy, retrying in {}s", backoff_secs);
+                Timer::after(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = next_mqtt_backoff_secs(backoff_secs);
+                continue;
+            };
+            let (tls_read_buf, tls_write_buf) = tls_workspace.buffers();
             let mut client = TlsClient::new(&mut mqtt_buffer);
 
             if session::establish_mqtt_session_tls(
                 network_stack,
                 &mut rx_buf,
                 &mut tx_buf,
-                &mut tls_read_buf,
-                &mut tls_write_buf,
+                tls_read_buf,
+                tls_write_buf,
                 &mut client,
                 &ota_sender,
                 ota_state_receiver.try_get().unwrap_or(OtaState::Inactive),

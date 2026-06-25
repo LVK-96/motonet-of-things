@@ -20,7 +20,7 @@ use embassy_net::{
     Stack,
     tcp::client::{TcpClient, TcpClientState},
 };
-use embassy_time::{Duration, with_timeout};
+use embassy_time::{Duration, Timer, with_timeout};
 use embedded_io_async as embedded_io;
 use embedded_nal_async::{AddrType, Dns};
 use embedded_storage::ReadStorage;
@@ -48,6 +48,7 @@ use crate::network;
 use crate::ota::OtaBootMetadata;
 use crate::ota::encrypted;
 use crate::secrets;
+use crate::tls_workspace::TlsWorkspaceGuard;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -62,15 +63,9 @@ const FLASH_SECTOR_SIZE: u32 = 4096;
 /// GitHub release downloads first return a large redirect response with many
 /// security/cache headers; 4 KiB is not enough for reqwless to parse it.
 const HTTP_HEADER_BUF_SIZE: usize = 16 * 1024;
-/// Buffer size for the HTTPS TLS record-layer read path.
-///
-/// GitHub release asset redirects terminate on hosts that commonly send full-size
-/// TLS records; embedded-tls warns below 16,640 bytes and the handshake can fail
-/// before the HTTP request is sent. Keep the write side smaller because OTA only
-/// sends a compact GET request.
-const OTA_TLS_READ_BUF_SIZE: usize = 16640;
-const OTA_TLS_WRITE_BUF_SIZE: usize = 4096;
 const OTA_HTTP_READ_TIMEOUT_SECS: u64 = 10;
+const TLS_WORKSPACE_WAIT_ATTEMPTS: usize = 50;
+const TLS_WORKSPACE_WAIT_INTERVAL_MS: u64 = 100;
 /// Number of leading bytes of the image retained for ESP prefix validation.
 const ESP_IMAGE_PREFIX_LEN: usize = 64;
 /// Number of bytes read back from flash for post-write verification.
@@ -268,10 +263,6 @@ static mut TCP_CLIENT_BUF: MaybeUninit<TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_T
     MaybeUninit::uninit();
 
 #[esp_hal::ram(reclaimed)]
-static mut OTA_TLS_READ_BUF: MaybeUninit<[u8; OTA_TLS_READ_BUF_SIZE]> = MaybeUninit::uninit();
-#[esp_hal::ram(reclaimed)]
-static mut OTA_TLS_WRITE_BUF: MaybeUninit<[u8; OTA_TLS_WRITE_BUF_SIZE]> = MaybeUninit::uninit();
-#[esp_hal::ram(reclaimed)]
 static mut OTA_HTTP_HEADER_BUF: MaybeUninit<[u8; HTTP_HEADER_BUF_SIZE]> = MaybeUninit::uninit();
 #[esp_hal::ram(reclaimed)]
 static mut OTA_CHUNK_BUF: MaybeUninit<[u8; ota_core::ENC_CHUNK_SIZE as usize]> =
@@ -288,12 +279,6 @@ fn tcp_client_state() -> &'static mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TC
     unsafe { &mut *raw }
 }
 
-fn ota_tls_read_buf() -> &'static mut [u8; OTA_TLS_READ_BUF_SIZE] {
-    unsafe { (*addr_of_mut!(OTA_TLS_READ_BUF)).assume_init_mut() }
-}
-fn ota_tls_write_buf() -> &'static mut [u8; OTA_TLS_WRITE_BUF_SIZE] {
-    unsafe { (*addr_of_mut!(OTA_TLS_WRITE_BUF)).assume_init_mut() }
-}
 fn ota_http_header_buf() -> &'static mut [u8; HTTP_HEADER_BUF_SIZE] {
     unsafe { (*addr_of_mut!(OTA_HTTP_HEADER_BUF)).assume_init_mut() }
 }
@@ -372,6 +357,18 @@ const OTA_HTTP_HEADERS: &[(&str, &str)] = &[
     ("Connection", "close"),
 ];
 
+async fn acquire_ota_tls_workspace() -> Result<TlsWorkspaceGuard, OtaFlashWriteError> {
+    for _ in 0..TLS_WORKSPACE_WAIT_ATTEMPTS {
+        if let Some(workspace) = TlsWorkspaceGuard::try_acquire() {
+            return Ok(workspace);
+        }
+        Timer::after(Duration::from_millis(TLS_WORKSPACE_WAIT_INTERVAL_MS)).await;
+    }
+
+    warn!("OTA: TLS workspace stayed busy");
+    Err(OtaFlashWriteError::OutOfMemory)
+}
+
 fn ota_tls_seed() -> u64 {
     let rng = Rng::new();
     (u64::from(rng.random()) << 32) | u64::from(rng.random())
@@ -445,11 +442,17 @@ async fn fetch_and_process_encrypted(
             // Python http.server HTTP/1.0 responses. Rebuild the HTTPS
             // client for every redirect so each host can use its matching
             // trust anchor.
-            let mut client = if current_url.as_str().starts_with("https://") {
+            let mut tls_workspace = if current_url.as_str().starts_with("https://") {
+                Some(acquire_ota_tls_workspace().await?)
+            } else {
+                None
+            };
+            let mut client = if let Some(workspace) = tls_workspace.as_mut() {
+                let (tls_read_buf, tls_write_buf) = workspace.buffers();
                 let tls_config = TlsConfig::new(
                     ota_tls_seed(),
-                    ota_tls_read_buf(),
-                    ota_tls_write_buf(),
+                    tls_read_buf,
+                    tls_write_buf,
                     ota_tls_verify_for_url(current_url.as_str()),
                 );
                 HttpClient::new_with_tls(&tcp, &dns, tls_config)

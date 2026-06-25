@@ -21,6 +21,7 @@ pub mod startup;
 pub mod tasks;
 pub mod telemetry;
 pub mod time_sync;
+pub mod tls_workspace;
 pub mod ui_input;
 
 /// Helper to retry an operation until it succeeds
