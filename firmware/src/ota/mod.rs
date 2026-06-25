@@ -4,6 +4,7 @@ use core::ptr::addr_of_mut;
 mod boot_metadata;
 pub mod encrypted;
 pub mod flash_write;
+mod hw_rsa;
 
 /// AES peripheral handle, initialised during `hw_setup` before any task runs.
 /// SAFETY: initialised exactly once before any task accesses it.
@@ -13,16 +14,22 @@ static mut AES_PERIPHERAL: MaybeUninit<esp_hal::peripherals::AES<'static>> = May
 /// SAFETY: initialised exactly once before any task accesses it.
 #[allow(improper_ctypes_definitions)]
 static mut SHA_PERIPHERAL: MaybeUninit<esp_hal::peripherals::SHA<'static>> = MaybeUninit::uninit();
+/// RSA peripheral handle, initialised during `hw_setup` before any task runs.
+/// SAFETY: initialised exactly once before any task accesses it.
+#[allow(improper_ctypes_definitions)]
+static mut RSA_PERIPHERAL: MaybeUninit<esp_hal::peripherals::RSA<'static>> = MaybeUninit::uninit();
 
 /// # Safety
 /// Call exactly once during `hw_setup`, before any task accesses the peripheral.
 pub(crate) unsafe fn init_crypto_peripherals(
     aes: esp_hal::peripherals::AES<'static>,
     sha: esp_hal::peripherals::SHA<'static>,
+    rsa: esp_hal::peripherals::RSA<'static>,
 ) {
     unsafe {
         addr_of_mut!(AES_PERIPHERAL).write(MaybeUninit::new(aes));
         addr_of_mut!(SHA_PERIPHERAL).write(MaybeUninit::new(sha));
+        addr_of_mut!(RSA_PERIPHERAL).write(MaybeUninit::new(rsa));
     }
 }
 
@@ -42,6 +49,17 @@ pub(crate) unsafe fn take_aes() -> esp_hal::peripherals::AES<'static> {
 pub(crate) unsafe fn take_sha() -> esp_hal::peripherals::SHA<'static> {
     unsafe {
         addr_of_mut!(SHA_PERIPHERAL)
+            .read()
+            .assume_init()
+            .clone_unchecked()
+    }
+}
+
+/// # Safety
+/// Must only be called after `init_crypto_peripherals` has been called.
+pub(crate) unsafe fn take_rsa() -> esp_hal::peripherals::RSA<'static> {
+    unsafe {
+        addr_of_mut!(RSA_PERIPHERAL)
             .read()
             .assume_init()
             .clone_unchecked()

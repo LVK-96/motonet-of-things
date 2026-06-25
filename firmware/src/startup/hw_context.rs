@@ -87,7 +87,11 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
 
     // SAFETY: initialised exactly once, before any task accesses them.
     unsafe {
-        crate::ota::init_crypto_peripherals(peripherals.AES, peripherals.SHA);
+        crate::ota::init_crypto_peripherals(
+            peripherals.AES,
+            peripherals.SHA,
+            peripherals.RSA.clone_unchecked(),
+        );
     }
 
     #[cfg(feature = "rsa-self-test")]

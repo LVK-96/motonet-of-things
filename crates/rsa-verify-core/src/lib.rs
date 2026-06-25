@@ -9,6 +9,10 @@ const PSS_EM_LEN: usize = RSA_2048_LEN;
 const PSS_MASKED_DB_LEN: usize = PSS_EM_LEN - SHA256_LEN - 1;
 const PSS_SALT_LEN: usize = SHA256_LEN;
 const PSS_PS_LEN: usize = PSS_MASKED_DB_LEN - PSS_SALT_LEN - 1;
+const SHA256_DIGEST_INFO_PREFIX: &[u8; 19] = &[
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+    0x00, 0x04, 0x20,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RsaVerifyError {
@@ -21,6 +25,104 @@ pub enum RsaVerifyError {
 pub struct Rsa2048PublicKey {
     pub modulus_be: [u8; RSA_2048_LEN],
     pub exponent_be: [u8; 4],
+}
+
+pub fn rsa2048_be_bytes_to_le_words(bytes: &[u8; RSA_2048_LEN]) -> [u32; 64] {
+    let mut words = [0u32; 64];
+    let mut index = 0;
+    while index < 64 {
+        let byte_offset = RSA_2048_LEN - ((index + 1) * 4);
+        words[index] = u32::from_be_bytes([
+            bytes[byte_offset],
+            bytes[byte_offset + 1],
+            bytes[byte_offset + 2],
+            bytes[byte_offset + 3],
+        ]);
+        index += 1;
+    }
+    words
+}
+
+pub fn rsa2048_le_words_to_be_bytes(words: &[u32; 64]) -> [u8; RSA_2048_LEN] {
+    let mut bytes = [0u8; RSA_2048_LEN];
+    let mut index = 0;
+    while index < 64 {
+        let byte_offset = RSA_2048_LEN - ((index + 1) * 4);
+        bytes[byte_offset..byte_offset + 4].copy_from_slice(&words[index].to_be_bytes());
+        index += 1;
+    }
+    bytes
+}
+
+pub fn rsa2048_exponent_be_to_le_words(bytes: &[u8; 4]) -> [u32; 64] {
+    let mut words = [0u32; 64];
+    words[0] = u32::from_be_bytes(*bytes);
+    words
+}
+
+pub fn compute_m_prime(modulus_le: &[u32; 64]) -> u32 {
+    let modulus_limb = modulus_le[0];
+    let mut inverse = 1u32;
+    let mut iteration = 0;
+    while iteration < 5 {
+        inverse = inverse.wrapping_mul(2u32.wrapping_sub(modulus_limb.wrapping_mul(inverse)));
+        iteration += 1;
+    }
+    inverse.wrapping_neg()
+}
+
+pub fn compute_r_squared_mod_n(modulus_le: &[u32; 64]) -> [u32; 64] {
+    let mut value = [0u32; 64];
+    value[0] = 1;
+
+    let mut bit = 0;
+    while bit < RSA_2048_LEN * 16 {
+        double_mod(&mut value, modulus_le);
+        bit += 1;
+    }
+
+    value
+}
+
+fn double_mod(value: &mut [u32; 64], modulus: &[u32; 64]) {
+    let mut carry = 0u64;
+    let mut index = 0;
+    while index < 64 {
+        let doubled = (u64::from(value[index]) << 1) | carry;
+        value[index] = doubled as u32;
+        carry = doubled >> 32;
+        index += 1;
+    }
+
+    if carry != 0 || cmp_le_words(value, modulus) != core::cmp::Ordering::Less {
+        sub_assign_le_words(value, modulus);
+    }
+}
+
+fn cmp_le_words(left: &[u32; 64], right: &[u32; 64]) -> core::cmp::Ordering {
+    let mut index = 64;
+    while index > 0 {
+        index -= 1;
+        if left[index] < right[index] {
+            return core::cmp::Ordering::Less;
+        }
+        if left[index] > right[index] {
+            return core::cmp::Ordering::Greater;
+        }
+    }
+    core::cmp::Ordering::Equal
+}
+
+fn sub_assign_le_words(left: &mut [u32; 64], right: &[u32; 64]) {
+    let mut borrow = 0u64;
+    let mut index = 0;
+    while index < 64 {
+        let rhs = u64::from(right[index]) + borrow;
+        let lhs = u64::from(left[index]);
+        left[index] = lhs.wrapping_sub(rhs) as u32;
+        borrow = u64::from(lhs < rhs);
+        index += 1;
+    }
 }
 
 pub fn parse_pkcs1_rsa2048_public_key_der(der: &[u8]) -> Result<Rsa2048PublicKey, RsaVerifyError> {
@@ -82,6 +184,37 @@ pub fn verify_pss_sha256_encoded_message(
     let expected_h = verifier_hash.finalize();
 
     if expected_h.as_slice() == h {
+        Ok(())
+    } else {
+        Err(RsaVerifyError::InvalidSignature)
+    }
+}
+
+pub fn verify_pkcs1v15_sha256_encoded_message(
+    message: &[u8],
+    encoded_message: &[u8; RSA_2048_LEN],
+) -> Result<(), RsaVerifyError> {
+    if encoded_message[0] != 0x00 || encoded_message[1] != 0x01 {
+        return Err(RsaVerifyError::InvalidSignature);
+    }
+
+    let separator_index = RSA_2048_LEN - SHA256_DIGEST_INFO_PREFIX.len() - SHA256_LEN - 1;
+    if !encoded_message[2..separator_index]
+        .iter()
+        .all(|byte| *byte == 0xff)
+        || encoded_message[separator_index] != 0x00
+    {
+        return Err(RsaVerifyError::InvalidSignature);
+    }
+
+    let prefix_start = separator_index + 1;
+    let digest_start = prefix_start + SHA256_DIGEST_INFO_PREFIX.len();
+    if &encoded_message[prefix_start..digest_start] != SHA256_DIGEST_INFO_PREFIX {
+        return Err(RsaVerifyError::InvalidSignature);
+    }
+
+    let expected_digest = Sha256::digest(message);
+    if encoded_message[digest_start..] == expected_digest[..] {
         Ok(())
     } else {
         Err(RsaVerifyError::InvalidSignature)

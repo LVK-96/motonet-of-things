@@ -376,17 +376,15 @@ fn ota_tls_seed() -> u64 {
 }
 
 /// Build the TLS verification config, respecting `OTA_TLS_ALLOW_INVALID_CA`.
-fn ota_tls_verify_for_url(url: &str) -> TlsVerify<'static> {
-    if secrets::OTA_TLS_ALLOW_INVALID_CA
-        || url.starts_with("https://release-assets.githubusercontent.com/")
-    {
+fn ota_tls_verify_for_url(_url: &str) -> TlsVerify<'static> {
+    if secrets::OTA_TLS_ALLOW_INVALID_CA {
         TlsVerify::None
     } else {
         TlsVerify::Certificate {
             ca: secrets::OTA_TLS_CA_CERT_DER,
             cert: None,
             key: None,
-            rsa_verifier: None,
+            rsa_verifier: Some(&super::hw_rsa::OTA_RSA_VERIFIER),
         }
     }
 }

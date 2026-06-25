@@ -1552,6 +1552,7 @@ dependencies = [
  "profont",
  "rand_core 0.6.4",
  "reqwless",
+ "rsa-verify-core",
  "rtt-target",
  "rubicson",
  "rust-mqtt",
