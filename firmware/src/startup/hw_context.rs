@@ -90,6 +90,9 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
         crate::ota::init_crypto_peripherals(peripherals.AES, peripherals.SHA);
     }
 
+    #[cfg(feature = "rsa-self-test")]
+    crate::startup::rsa_self_test::run_rsa_self_test(peripherals.RSA);
+
     // Initialize OTA flash storage singleton before any task uses it.
     let flash_mutex = &*app_bus::FLASH.init(Mutex::new(FlashStorage::new(peripherals.FLASH)));
 

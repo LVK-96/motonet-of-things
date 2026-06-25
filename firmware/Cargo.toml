@@ -19,6 +19,7 @@ pulse_sw = []
 pulse_rmt = []
 ota-rollback-test = []
 release-ota = []
+rsa-self-test = []
 
 [dependencies]
 rubicson = { path = "../crates/rubicson" }

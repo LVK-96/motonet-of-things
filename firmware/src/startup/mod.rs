@@ -11,6 +11,8 @@ use embassy_time::{Duration, Timer};
 mod hardware;
 #[cfg(not(feature = "ota-rollback-test"))]
 mod hw_context;
+#[cfg(all(not(feature = "ota-rollback-test"), feature = "rsa-self-test"))]
+mod rsa_self_test;
 #[cfg(not(feature = "ota-rollback-test"))]
 mod sha_self_test;
 #[cfg(not(feature = "ota-rollback-test"))]
