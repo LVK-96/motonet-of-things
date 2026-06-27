@@ -6,9 +6,7 @@
 //! verifier core.
 
 use defmt::{error, info};
-use esp_hal::Blocking;
 use esp_hal::peripherals::RSA;
-use esp_hal::rsa::{Rsa, RsaModularExponentiation, operand_sizes::Op2048};
 
 const M_PRIME: u32 = 0x51201f27;
 const MODULUS: [u32; 64] = [
@@ -65,12 +63,14 @@ const EXPECTED: [u32; 64] = [
 pub(crate) fn run_rsa_self_test(rsa: RSA<'static>) {
     info!("RSA self-test: starting hardware RSA-2048 public operation");
 
-    let mut rsa = Rsa::new(rsa);
-    let mut operation =
-        RsaModularExponentiation::<Op2048, Blocking>::new(&mut rsa, &EXPONENT, &MODULUS, M_PRIME);
-    let mut output = [0u32; 64];
-    operation.start_exponentiation(&SIGNATURE, &R_SQUARED_MOD_N);
-    operation.read_results(&mut output);
+    let output = crate::ota::hw_rsa::rsa2048_modexp_words(
+        rsa,
+        &EXPONENT,
+        &MODULUS,
+        M_PRIME,
+        &SIGNATURE,
+        &R_SQUARED_MOD_N,
+    );
 
     if output == EXPECTED {
         info!("RSA self-test: PASSED");

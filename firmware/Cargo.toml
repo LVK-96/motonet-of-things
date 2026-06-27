@@ -2,7 +2,7 @@
 edition = "2024"
 name = "esp32-rust-project"
 rust-version = "1.95"
-version = "0.1.0"
+version = "0.1.3"
 
 [[bin]]
 name = "esp32-rust-project"

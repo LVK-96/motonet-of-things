@@ -65,7 +65,7 @@ const FLASH_SECTOR_SIZE: u32 = 4096;
 /// keep 8 KiB to leave redirect-query churn margin without spending 16 KiB.
 const HTTP_HEADER_BUF_SIZE: usize = 8 * 1024;
 const OTA_HTTP_READ_TIMEOUT_SECS: u64 = 10;
-const TLS_WORKSPACE_WAIT_ATTEMPTS: usize = 50;
+const TLS_WORKSPACE_WAIT_ATTEMPTS: usize = 250;
 const TLS_WORKSPACE_WAIT_INTERVAL_MS: u64 = 100;
 /// Number of leading bytes of the image retained for ESP prefix validation.
 const ESP_IMAGE_PREFIX_LEN: usize = 64;
@@ -376,12 +376,17 @@ fn ota_tls_seed() -> u64 {
 }
 
 /// Build the TLS verification config, respecting `OTA_TLS_ALLOW_INVALID_CA`.
-fn ota_tls_verify_for_url(_url: &str) -> TlsVerify<'static> {
+fn ota_tls_verify_for_url(url: &str) -> TlsVerify<'static> {
     if secrets::OTA_TLS_ALLOW_INVALID_CA {
         TlsVerify::None
     } else {
+        let ca = if url.starts_with("https://github.com/") {
+            secrets::OTA_TLS_CA_CERT_DER
+        } else {
+            secrets::OTA_ASSET_TLS_CA_CERT_DER
+        };
         TlsVerify::Certificate {
-            ca: secrets::OTA_TLS_CA_CERT_DER,
+            ca,
             cert: None,
             key: None,
             rsa_verifier: Some(&super::hw_rsa::OTA_RSA_VERIFIER),

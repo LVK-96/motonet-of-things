@@ -4,7 +4,7 @@ use core::ptr::addr_of_mut;
 mod boot_metadata;
 pub mod encrypted;
 pub mod flash_write;
-mod hw_rsa;
+pub(crate) mod hw_rsa;
 
 /// AES peripheral handle, initialised during `hw_setup` before any task runs.
 /// SAFETY: initialised exactly once before any task accesses it.
@@ -37,9 +37,8 @@ pub(crate) unsafe fn init_crypto_peripherals(
 /// Must only be called after `init_crypto_peripherals` has been called.
 pub(crate) unsafe fn take_aes() -> esp_hal::peripherals::AES<'static> {
     unsafe {
-        addr_of_mut!(AES_PERIPHERAL)
-            .read()
-            .assume_init()
+        (*addr_of_mut!(AES_PERIPHERAL))
+            .assume_init_ref()
             .clone_unchecked()
     }
 }
@@ -48,9 +47,8 @@ pub(crate) unsafe fn take_aes() -> esp_hal::peripherals::AES<'static> {
 /// Must only be called after `init_crypto_peripherals` has been called.
 pub(crate) unsafe fn take_sha() -> esp_hal::peripherals::SHA<'static> {
     unsafe {
-        addr_of_mut!(SHA_PERIPHERAL)
-            .read()
-            .assume_init()
+        (*addr_of_mut!(SHA_PERIPHERAL))
+            .assume_init_ref()
             .clone_unchecked()
     }
 }
@@ -59,9 +57,8 @@ pub(crate) unsafe fn take_sha() -> esp_hal::peripherals::SHA<'static> {
 /// Must only be called after `init_crypto_peripherals` has been called.
 pub(crate) unsafe fn take_rsa() -> esp_hal::peripherals::RSA<'static> {
     unsafe {
-        addr_of_mut!(RSA_PERIPHERAL)
-            .read()
-            .assume_init()
+        (*addr_of_mut!(RSA_PERIPHERAL))
+            .assume_init_ref()
             .clone_unchecked()
     }
 }

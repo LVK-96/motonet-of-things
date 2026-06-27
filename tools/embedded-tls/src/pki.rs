@@ -61,6 +61,39 @@ impl<'a> Iterator for CertificateChain<'a> {
     }
 }
 
+fn certificate_entry_eq(left: &CertificateEntryRef<'_>, right: &CertificateEntryRef<'_>) -> bool {
+    match (left, right) {
+        (CertificateEntryRef::X509(left), CertificateEntryRef::X509(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn certificate_entry_same_public_key(
+    left: &CertificateEntryRef<'_>,
+    right: &CertificateEntryRef<'_>,
+) -> bool {
+    match (left, right) {
+        (CertificateEntryRef::X509(left), CertificateEntryRef::X509(right)) => {
+            let Ok(left) = DecodedCertificate::from_der(left) else {
+                return false;
+            };
+            let Ok(right) = DecodedCertificate::from_der(right) else {
+                return false;
+            };
+            left.tbs_certificate
+                .subject_public_key_info
+                .public_key
+                .as_bytes()
+                == right
+                    .tbs_certificate
+                    .subject_public_key_info
+                    .public_key
+                    .as_bytes()
+        }
+        _ => false,
+    }
+}
+
 pub struct CertVerifier<'a, CipherSuite, Clock, const CERT_SIZE: usize>
 where
     Clock: TlsClock,
@@ -121,8 +154,19 @@ where
             san_dns_names: heapless::Vec::new(),
         };
 
-        for (p, q) in CertificateChain::new(&(&self.ca).into(), &cert) {
-            names = verify_certificate(p, q, Clock::now(), self.rsa_verifier)?;
+        let ca_entry: CertificateEntryRef<'_> = (&self.ca).into();
+        for (idx, certificate) in cert.entries.iter().enumerate() {
+            if certificate_entry_eq(certificate, &ca_entry)
+                || (idx > 0 && certificate_entry_same_public_key(certificate, &ca_entry))
+            {
+                break;
+            }
+
+            let issuer = cert.entries.get(idx + 1).unwrap_or(&ca_entry);
+            let verified_names = verify_certificate(issuer, certificate, Clock::now(), self.rsa_verifier)?;
+            if idx == 0 {
+                names = verified_names;
+            }
         }
 
         if !tls_hostname_match(&names, &self.host) {
