@@ -59,6 +59,7 @@ jobs:
           MQTT_PASSWORD: ${{ secrets.MQTT_PASSWORD }}
           OTA_ENCRYPTION_MASTER_KEY_HEX: ${{ secrets.OTA_ENCRYPTION_MASTER_KEY_HEX }}
           OTA_TLS_CA_CERT_DER_B64: ${{ secrets.OTA_TLS_CA_CERT_DER_B64 }}
+          OTA_ASSET_TLS_CA_CERT_DER_B64: ${{ secrets.OTA_ASSET_TLS_CA_CERT_DER_B64 }}
           MQTT_TLS_CA_CERT_DER_B64: ${{ secrets.MQTT_TLS_CA_CERT_DER_B64 }}
           DEVICE_ID: ${{ vars.DEVICE_ID || 'esp32-rubicson' }}
           MQTT_CLIENT_ID: ${{ vars.MQTT_CLIENT_ID || 'esp32-rubicson' }}

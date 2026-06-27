@@ -205,6 +205,8 @@ def main() -> None:
 
     FIRMWARE.mkdir(parents=True, exist_ok=True)
     decode_required_b64("OTA_TLS_CA_CERT_DER_B64", OTA_CA)
+    ota_asset_ca = FIRMWARE / "ota-asset-tls-ca.der"
+    decode_required_b64("OTA_ASSET_TLS_CA_CERT_DER_B64", ota_asset_ca)
 
     if mqtt_use_tls:
         if not decode_optional_b64("MQTT_TLS_CA_CERT_DER_B64", MQTT_CA):
@@ -253,6 +255,7 @@ pub const MQTT_TLS_FALLBACK_UNIX_TIME_SECS: u64 = 1_735_689_600;
 
 // OTA HTTPS CA certificate (DER format) for verifying release asset hosts.
 pub const OTA_TLS_CA_CERT_DER: &[u8] = include_bytes!("../ota-tls-ca.der");
+pub const OTA_ASSET_TLS_CA_CERT_DER: &[u8] = include_bytes!("../ota-asset-tls-ca.der");
 
 // Release firmware must verify the OTA HTTPS server certificate.
 pub const OTA_TLS_ALLOW_INVALID_CA: bool = false;
