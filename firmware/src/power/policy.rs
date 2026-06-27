@@ -64,6 +64,10 @@ pub fn maybe_sleep_after_publish(queue_empty: bool, time_since_mesaurement_recei
     let settings = get_settings();
     let now = super::now_secs();
     let idle_deadline = super::UI_IDLE_DEADLINE_SECS.load(Ordering::Relaxed);
+    if crate::ota::ota_sleep_blocked() {
+        info!("PowerSave: skip deep sleep (OTA in progress)");
+        return;
+    }
     let decision = predictive_sleep_decision(
         queue_empty,
         time_since_mesaurement_receive,

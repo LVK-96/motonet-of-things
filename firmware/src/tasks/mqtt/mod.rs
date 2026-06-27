@@ -68,12 +68,16 @@ where
     match publish::publish_reading(client, reading).await {
         publish::PublishOutcome::Published => {
             debug!("MQTT: Publish successful (QoS 1, awaiting PUBACK)");
-            info!("MQTT: Publish confirmed, checking deep sleep policy");
-            let time_since_measurement = Instant::now() - reading.received_at;
-            power::maybe_sleep_after_publish(
-                receiver.is_empty(),
-                CoreDuration::from_secs(time_since_measurement.as_secs()),
-            );
+            if crate::ota::ota_sleep_blocked() {
+                info!("MQTT: Publish confirmed, OTA active, skipping deep sleep policy");
+            } else {
+                info!("MQTT: Publish confirmed, checking deep sleep policy");
+                let time_since_measurement = Instant::now() - reading.received_at;
+                power::maybe_sleep_after_publish(
+                    receiver.is_empty(),
+                    CoreDuration::from_secs(time_since_measurement.as_secs()),
+                );
+            }
             *last_activity = Instant::now();
             ReadingOutcome::Continue
         }
