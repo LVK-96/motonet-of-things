@@ -1520,9 +1520,6 @@ mod tests {
 
     #[test]
     fn live_manifest_during_active_phases_is_forwarded_without_retained_clear() {
-        // A live (non-retained) command during Downloading or Applying is
-        // forwarded; we don't try to clear a retained copy that doesn't
-        // exist.
         assert_eq!(
             classify_ota_manifest_delivery(OtaState::Downloading, false),
             OtaManifestDeliveryAction::ForwardOnly

@@ -127,12 +127,6 @@ where
 
     /// Mark the currently selected app as new in OTA metadata.
     ///
-    /// `activate_next_partition` already points the otadata record at the
-    /// newly written slot, so this is a defensive write to make the `New`
-    /// state explicit before the post-reboot confirm task inspects it.
-    /// Leaving the call in place keeps the state intent obvious to readers
-    /// and avoids relying on undocumented bootloader defaults.
-    ///
     /// # Errors
     ///
     /// Returns an OTA metadata error if the state cannot be written.

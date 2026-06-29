@@ -25,12 +25,6 @@ use crate::app_bus::{MqttHealth, MqttHealthReceiver};
 use crate::ota::{OtaUpdateGuard, flash_write};
 use crate::secrets;
 
-/// Maximum time to wait for MQTT to stand down after broadcasting
-/// `OtaState::Downloading` before proceeding with the HTTP download.
-///
-/// 15 s gives MQTT a reasonable window to flush in-flight publishes
-/// and cleanly disconnect over a lossy Wi-Fi link without holding up
-/// the OTA for too long.
 const MQTT_STANDDOWN_TIMEOUT_SECS: u64 = 15;
 
 static mut OTA_PARTITION_TABLE_BUF: [u8; PARTITION_TABLE_MAX_LEN] = [0u8; PARTITION_TABLE_MAX_LEN];
@@ -54,7 +48,6 @@ pub async fn ota_task(
     loop {
         let manifest_bytes = receiver.receive().await;
 
-        // 1. Parse and verify manifest.
         let manifest =
             match OtaManifest::parse_and_verify(&manifest_bytes, &ota_manifest_verifier()) {
                 Ok(m) => m,
@@ -64,7 +57,6 @@ pub async fn ota_task(
                 }
             };
 
-        // 2. Validate URL policy.
         if let Err(e) = validate_ota_url_policy(&manifest.url) {
             warn!("OTA: URL policy rejected: {:?}", Debug2Format(&e));
             continue;
@@ -78,8 +70,6 @@ pub async fn ota_task(
             manifest.image_size
         );
 
-        // 2b. Reject manifests with wrong encryption key id before
-        //     broadcasting state or entering maintenance mode.
         if manifest.enc.key_id != secrets::OTA_ENCRYPTION_KEY_ID {
             warn!(
                 "OTA: enc.key_id {} != configured {} — rejecting",
@@ -89,18 +79,13 @@ pub async fn ota_task(
             continue;
         }
 
-        // 3. Broadcast Downloading state so MQTT/radio/display stand down.
         ota_state_sender.send(OtaState::Downloading);
 
-        // 4. Block sleep for the entire OTA window via the atomic guard.
         let _ota_guard = OtaUpdateGuard::begin_download();
         wait_for_mqtt_stand_down(&mut mqtt_health_receiver, MQTT_STANDDOWN_TIMEOUT_SECS).await;
 
-        // 5. Switch to the Applying phase.
         ota_state_sender.send(OtaState::Applying);
 
-        // 6. Lock flash and stream the encrypted firmware into the inactive
-        //    partition.
         {
             let mut flash_guard = flash_mutex.lock().await;
             let partition_table_buf = ota_partition_table_buf();
@@ -125,7 +110,6 @@ pub async fn ota_task(
             }
         }
 
-        // 7. Return to Inactive (guard also resets on drop).
         ota_state_sender.send(OtaState::Inactive);
         info!("OTA: returned to Inactive");
     }

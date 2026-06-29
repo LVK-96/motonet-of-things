@@ -156,19 +156,15 @@ async fn handle_mqtt_event(
     if let Some(manifest) = manifest {
         let mut action = classify_ota_manifest_delivery(ota_state, manifest.retained);
 
-        // Special case: if we're in PendingConfirmation with a retained manifest
-        // but the manifest has force=true, we should treat it as ForwardAndClearRetained
-        if matches!(action, OtaManifestDeliveryAction::ClearRetainedOnly) {
-            // Try to parse the manifest to check the force flag
-            if let Ok(m) = OtaManifest::parse_and_verify(&manifest.bytes, &ota_manifest_verifier())
-                && m.force
-            {
-                info!(
-                    "MQTT: Received retained OTA manifest with force=true during pending confirmation, forwarding"
-                );
-                action = OtaManifestDeliveryAction::ForwardAndClearRetained;
-            }
-            // If parsing fails, we keep the original ClearRetainedOnly action (safe fallback)
+        if matches!(action, OtaManifestDeliveryAction::ClearRetainedOnly)
+            && let Ok(incoming) =
+                OtaManifest::parse_and_verify(&manifest.bytes, &ota_manifest_verifier())
+            && incoming.force
+        {
+            info!(
+                "MQTT: Received retained OTA manifest with force=true during pending confirmation, forwarding"
+            );
+            action = OtaManifestDeliveryAction::ForwardAndClearRetained;
         }
 
         match action {

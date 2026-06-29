@@ -1,21 +1,22 @@
 //! AES-256-CTR decryption, HMAC-SHA256 verification, and key derivation
 //! for v2 encrypted OTA firmware downloads.
 //!
-//! HMAC and plaintext hashing use software SHA-256 (`sha2` crate) because
-//! the ESP32 hardware SHA accelerator's `SHA256_CONTINUE` operation
-//! produces incorrect results on the target revision (v3.0) for multi-block
-//! inputs.  AES-256-CTR decryption still uses the hardware accelerator.
+//! AES-256-CTR decryption uses the ESP32 hardware accelerator; SHA-256
+//! uses the hardware path where buffers fit and software hashing for
+//! streaming plaintext digests.
 
 use esp_hal::aes::{AesContext, Operation, cipher_modes::Ctr};
 use sha2::Digest;
 
-/// Selects the SHA-256 implementation: `true` = hardware (with block-level
-/// digest save/restore to work around esp-hal's pipelining bug), `false` =
-/// software (`sha2` crate).
-///
-/// Hardware is ~5× faster but the original ESP32 has known `SHA_CONTINUE`
-/// issues.  Set this to `false` to fall back to software SHA-256.
 const USE_HARDWARE_SHA: bool = true;
+
+/// Reset the SHA peripheral to a clean state before operations.
+///
+/// This is a no-op placeholder; hardware SHA is serialized block-by-block in
+/// [`hw_sha256`] to work around the ESP32 SHA_CONTINUE pipelining bug.
+pub fn gate_sha_clock() {
+    // No-op: hardware SHA is serialized block-by-block below.
+}
 
 /// SHA-256 digest length in bytes.
 pub const SHA256_OUTPUT_SIZE: usize = 32;
@@ -59,27 +60,6 @@ pub const HMAC_TAG_SIZE: usize = SHA256_OUTPUT_SIZE;
 /// Per-chunk wire overhead: 4-byte length prefix + 32-byte HMAC tag.
 pub const CHUNK_WIRE_OVERHEAD: usize = 4 + HMAC_TAG_SIZE;
 
-// ── SHA reset ───────────────────────────────────────────────────────────
-
-/// Reset the SHA peripheral: clock-gate + peripheral reset.
-///
-/// Follows the ESP-IDF SHA driver pattern via the esp-hal `SYSTEM`
-/// register block (which maps to DPORT on ESP32): gate the clock off,
-/// assert the SHA reset line, de-assert, then re-enable the clock.
-/// A bare clock-gate is insufficient to restore SHA after AES has run.
-///
-/// Uses `esp_hal::peripherals::SYSTEM::regs()` instead of raw DPORT
-/// pointers so the accesses go through the same path that esp-hal's
-/// own `PeripheralClockControl::reset` uses.
-///
-/// # Performance
-///
-/// The reset adds ~0.3 µs per call.  Across ~855 OTA SHA operations
-/// the total overhead is under 300 µs.
-pub fn gate_sha_clock() {
-    // No-op: hardware SHA is serialized block-by-block below.
-}
-
 // ── Hardware SHA-256 (block-serialized via esp-hal Sha driver) ──────
 
 /// Compute SHA-256 using the ESP32 hardware accelerator.
@@ -91,9 +71,7 @@ pub fn gate_sha_clock() {
 #[allow(dead_code)]
 #[must_use]
 pub fn hw_sha256(data: &[u8], sha_peripheral: &esp_hal::peripherals::SHA<'static>) -> [u8; 32] {
-    // Safety: clone_unchecked creates a second handle to the same
-    // peripheral.  The OTA task serialises all SHA operations; no
-    // concurrent access.
+    // Safety: the OTA task serialises SHA access.
     let sha_handle = unsafe { sha_peripheral.clone_unchecked() };
     let mut sha = esp_hal::sha::Sha::new(sha_handle);
     let mut digest = sha.start::<esp_hal::sha::Sha256>();
@@ -101,10 +79,6 @@ pub fn hw_sha256(data: &[u8], sha_peripheral: &esp_hal::peripherals::SHA<'static
     let mut remaining: &[u8] = data;
     while !remaining.is_empty() {
         remaining = nb::block!(digest.update(remaining)).unwrap();
-        // Spin until engine finishes the current block before feeding
-        // more data.  Without this, the next update() call writes to
-        // SHA_TEXT while the engine is still reading from it (ESP32 shares
-        // text and hash registers).
         while digest.is_busy() {}
     }
 
@@ -203,6 +177,7 @@ fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
 #[must_use]
 pub fn compute_manifest_digest(canonical_json: &str) -> [u8; SHA256_OUTPUT_SIZE] {
     if USE_HARDWARE_SHA {
+        // SAFETY: called from OTA task which holds the SHA peripheral guard.
         let sha = unsafe { crate::ota::sha_ref() };
         hw_sha256(canonical_json.as_bytes(), sha)
     } else {

@@ -1,8 +1,8 @@
 use core::convert::TryInto;
 
+use defmt::warn;
 #[cfg(feature = "rsa-self-test")]
-use defmt::error;
-use defmt::{debug, info, warn};
+use defmt::{error, info};
 use embedded_tls::{RsaVerifier, TlsError};
 use esp_hal::rsa::{Rsa, RsaModularExponentiation, operand_sizes::Op2048};
 use rsa_verify_core::{
@@ -40,12 +40,6 @@ fn rsa_public_operation_2048(
     public_key_der: &[u8],
     signature: &[u8],
 ) -> Result<[u8; RSA_2048_LEN], TlsError> {
-    info!(
-        "TLS RSA: public_key_der_len={}, signature_len={}",
-        public_key_der.len(),
-        signature.len()
-    );
-
     let public_key: Rsa2048PublicKey =
         parse_pkcs1_rsa2048_public_key_der(public_key_der).map_err(map_rsa_error)?;
     let signature_be: &[u8; RSA_2048_LEN] =
@@ -65,7 +59,6 @@ fn rsa_public_operation_2048(
     let mut result = [0u32; RSA_2048_WORDS];
     operation.read_results(&mut result);
 
-    debug!("TLS RSA: raw output low word 0x{:08x}", result[0]);
     Ok(rsa2048_le_words_to_be_bytes(&result))
 }
 
@@ -160,7 +153,6 @@ impl RsaVerifier for Esp32RsaVerifier {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), TlsError> {
-        info!("TLS RSA: verifying RSA-PKCS1v15-SHA256 signature with ESP32 accelerator");
         Self::verify_sha256_signature(
             public_key_der,
             message,
@@ -175,7 +167,6 @@ impl RsaVerifier for Esp32RsaVerifier {
         message: &[u8],
         signature: &[u8],
     ) -> Result<(), TlsError> {
-        info!("TLS RSA: verifying RSA-PSS-SHA256 signature with ESP32 accelerator");
         Self::verify_sha256_signature(
             public_key_der,
             message,
@@ -204,7 +195,6 @@ impl RsaVerifier for Esp32RsaVerifier {
 }
 
 fn map_rsa_error(error: RsaVerifyError) -> TlsError {
-    warn!("RSA verification error: {:?}", defmt::Debug2Format(&error));
     match error {
         RsaVerifyError::MalformedDer | RsaVerifyError::UnsupportedKey => {
             warn!("TLS RSA: malformed or unsupported RSA key");

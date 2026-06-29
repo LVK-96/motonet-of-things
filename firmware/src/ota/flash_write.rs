@@ -444,11 +444,7 @@ async fn fetch_and_process_encrypted(
         }
 
         let next_redirect = {
-            // Use HttpClient::new for plain HTTP (no TLS) to avoid the
-            // PlainBuffered path in reqwless, which may have issues with
-            // Python http.server HTTP/1.0 responses. Rebuild the HTTPS
-            // client for every redirect so each host can use its matching
-            // trust anchor.
+            // Rebuild HTTPS clients per redirect so each host gets the right trust anchor.
             let mut tls_workspace = if current_url.as_str().starts_with("https://") {
                 Some(acquire_ota_tls_workspace().await?)
             } else {
@@ -651,8 +647,6 @@ async fn read_exact(
     Ok(())
 }
 
-/// Process the v2 encrypted HTTP body: validate header, then for each
-/// chunk verify HMAC, decrypt, write to flash, and hash the plaintext.
 #[allow(clippy::too_many_arguments)]
 async fn process_encrypted_body(
     mut reader: impl embedded_io_async::BufRead,
@@ -663,22 +657,17 @@ async fn process_encrypted_body(
     manifest_digest: &[u8; encrypted::SHA256_OUTPUT_SIZE],
     image_size: u32,
 ) -> Result<EncryptedResult, OtaFlashWriteError> {
-    // 1. Read and validate the 16-byte header.
     let mut header = [0u8; encrypted::OTA_V2_HEADER_SIZE];
     read_exact(&mut reader, &mut header).await?;
     encrypted::validate_ota_header(&header)?;
 
-    // 2. Stream chunks — exactly ceil(image_size / ENC_CHUNK_SIZE) chunks.
     let num_chunks = image_size.div_ceil(ota_core::ENC_CHUNK_SIZE);
     let mut first_bytes = [0u8; ESP_IMAGE_PREFIX_LEN];
     let mut first_filled = 0usize;
     let mut prefix_validated = false;
     let mut total_plaintext: u32 = 0;
     let mut flash_offset: u32 = 0;
-    // Plaintext SHA-256 accumulator (software — hardware SHA_CONTINUE
-    // is broken on the target ESP32 revision for multi-block inputs).
     let mut sha_hasher = sha2::Sha256::new();
-    // Buffer for reading the wire-format length prefix + HMAC tag.
     let mut len_buf = [0u8; 4];
     let mut tag_buf = [0u8; encrypted::HMAC_TAG_SIZE];
     // Reusable static ciphertext buffer sized to the maximum chunk. Keeping
@@ -686,12 +675,9 @@ async fn process_encrypted_body(
     let ciphertext_buf = ota_chunk_buf();
 
     for chunk_index in 0..num_chunks {
-        // Read 4-byte plaintext length (big-endian).
         read_exact(&mut reader, &mut len_buf).await?;
         let ciphertext_len = u32::from_be_bytes(len_buf);
 
-        // Enforce exact expected length per chunk: full chunk for all but
-        // the last, remainder for the last.
         let expected_len = if chunk_index == num_chunks - 1 {
             image_size - chunk_index * ota_core::ENC_CHUNK_SIZE
         } else {
@@ -709,7 +695,6 @@ async fn process_encrypted_body(
         read_exact(&mut reader, ct).await?;
         read_exact(&mut reader, &mut tag_buf).await?;
 
-        // Verify HMAC before decrypting.
         if !encrypted::verify_chunk_hmac(
             hmac_key,
             manifest_digest,
@@ -719,32 +704,14 @@ async fn process_encrypted_body(
             ct,
             &tag_buf,
         ) {
-            let computed = encrypted::compute_chunk_hmac(
-                hmac_key,
-                manifest_digest,
-                chunk_index,
-                flash_offset,
-                ciphertext_len,
-                ct,
-            );
             warn!("OTA: HMAC verification failed for chunk {}", chunk_index);
-            warn!("  manifest_digest: {}", sha256_hex(manifest_digest));
-            warn!(
-                "  chunk_index: {}, flash_offset: {}, ct_len: {}",
-                chunk_index, flash_offset, ciphertext_len
-            );
-            warn!("  tag (from file):    {}", sha256_hex(&tag_buf));
-            warn!("  hmac (device computed): {}", sha256_hex(&computed));
             return Err(OtaFlashWriteError::HmacMismatch);
         }
 
-        // Decrypt in-place.
         encrypted::aes_ctr_crypt_in_place(aes_key, nonce_prefix, chunk_index, ct)?;
 
-        let plaintext = ct; // now decrypted
+        let plaintext = ct;
 
-        // Validate ESP image prefix on the first bytes of plaintext, before
-        // writing anything to flash.
         if !prefix_validated {
             let copy = plaintext
                 .len()
@@ -757,10 +724,7 @@ async fn process_encrypted_body(
             }
         }
 
-        // Write plaintext to flash.
         Storage::write(region, flash_offset, plaintext).map_err(OtaFlashWriteError::from)?;
-
-        // Hash the plaintext (software).
         sha2::Digest::update(&mut sha_hasher, plaintext);
 
         flash_offset += ciphertext_len;
@@ -775,7 +739,6 @@ async fn process_encrypted_body(
         }
     }
 
-    // 3. Finalize SHA-256.
     let mut digest = [0u8; encrypted::SHA256_OUTPUT_SIZE];
     let result = sha2::Digest::finalize(sha_hasher);
     digest.copy_from_slice(&result);
@@ -869,7 +832,6 @@ pub async fn download_and_write_to_flash(
     // Derive per-manifest subkeys from the encryption key id.
     let (aes_key, hmac_key) = encrypted::derive_subkeys(master_key, manifest.enc.key_id);
 
-    // Log public manifest metadata for cross-reference with packaging.
     info!(
         "OTA: enc.key_id={}, nonce_prefix={}",
         manifest.enc.key_id,
@@ -880,12 +842,10 @@ pub async fn download_and_write_to_flash(
     let nonce_prefix = encrypted::parse_nonce_prefix(&manifest.enc.nonce_prefix)
         .map_err(|_e| OtaFlashWriteError::InvalidNoncePrefix)?;
 
-    // Compute manifest digest.
     let canonical = manifest
         .canonical_unsigned_json()
         .map_err(OtaFlashWriteError::ManifestCanonical)?;
     let manifest_digest = encrypted::compute_manifest_digest(&canonical);
-    info!("OTA: manifest_digest={}", sha256_hex(&manifest_digest));
 
     network::wait_for_config_up(network_stack).await;
 
