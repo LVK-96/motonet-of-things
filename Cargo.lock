@@ -1507,8 +1507,7 @@ dependencies = [
 [[package]]
 name = "esp32"
 version = "0.40.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5726e07689249d1a2cb7c492077bc424837fb68a64f7eb5d46569325352e9428"
+source = "git+https://github.com/LVK-96/esp-pacs?rev=cc1f342f312889d8ce758c8ebf68472a60efad78#cc1f342f312889d8ce758c8ebf68472a60efad78"
 dependencies = [
  "defmt 1.1.0",
  "vcell",
@@ -1516,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "esp32-rust-project"
-version = "0.1.0"
+version = "0.1.5"
 dependencies = [
  "app-core",
  "cc1101",

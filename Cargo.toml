@@ -46,3 +46,4 @@ panic = "deny"                   # Ban panic! (force Result types)verflow-checks
 
 [patch.crates-io]
 embedded-tls = { path = "tools/embedded-tls" }
+esp32 = { git = "https://github.com/LVK-96/esp-pacs", rev = "cc1f342f312889d8ce758c8ebf68472a60efad78" }
