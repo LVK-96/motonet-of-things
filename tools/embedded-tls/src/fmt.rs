@@ -192,16 +192,18 @@ macro_rules! unwrap {
     }
 }
 
+#[cfg(not(feature = "defmt"))]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NoneError;
 
+#[cfg(not(feature = "defmt"))]
 pub trait Try {
     type Ok;
     type Error;
     fn into_result(self) -> Result<Self::Ok, Self::Error>;
 }
 
+#[cfg(not(feature = "defmt"))]
 impl<T> Try for Option<T> {
     type Ok = T;
     type Error = NoneError;
@@ -212,6 +214,7 @@ impl<T> Try for Option<T> {
     }
 }
 
+#[cfg(not(feature = "defmt"))]
 impl<T, E> Try for Result<T, E> {
     type Ok = T;
     type Error = E;

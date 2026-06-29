@@ -1,3 +1,5 @@
+use alloc::boxed::Box;
+
 use core::ptr::addr_of_mut;
 use defmt::{Debug2Format, info, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -103,13 +105,13 @@ pub async fn ota_task(
             let mut flash_guard = flash_mutex.lock().await;
             let partition_table_buf = ota_partition_table_buf();
 
-            if let Err(e) = flash_write::download_and_write_to_flash(
+            if let Err(e) = Box::pin(flash_write::download_and_write_to_flash(
                 network_stack,
                 &manifest,
                 &mut flash_guard,
                 partition_table_buf,
                 &master_key,
-            )
+            ))
             .await
             {
                 warn!("OTA: flash write failed: {:?}", Debug2Format(&e));

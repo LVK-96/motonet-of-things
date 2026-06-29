@@ -10,6 +10,8 @@
 //!    readback checks against the decrypted result.
 //! 4. Activate the new slot, mark the app `New`, and reboot.
 
+use alloc::boxed::Box;
+
 use core::mem::MaybeUninit;
 use core::net::{IpAddr, Ipv4Addr};
 use core::ptr::addr_of_mut;
@@ -452,21 +454,21 @@ async fn fetch_and_process_encrypted(
             } else {
                 None
             };
-            let mut client = if let Some(workspace) = tls_workspace.as_mut() {
-                let (tls_read_buf, tls_write_buf) = workspace.buffers();
-                let tls_config = TlsConfig::new(
-                    ota_tls_seed(),
-                    tls_read_buf,
-                    tls_write_buf,
-                    ota_tls_verify_for_url(current_url.as_str()),
-                );
-                HttpClient::new_with_tls(&tcp, &dns, tls_config)
-            } else {
-                HttpClient::new(&tcp, &dns)
-            };
+            let mut client = tls_workspace.as_mut().map_or_else(
+                || HttpClient::new(&tcp, &dns),
+                |workspace| {
+                    let (tls_read_buf, tls_write_buf) = workspace.buffers();
+                    let tls_config = TlsConfig::new(
+                        ota_tls_seed(),
+                        tls_read_buf,
+                        tls_write_buf,
+                        ota_tls_verify_for_url(current_url.as_str()),
+                    );
+                    HttpClient::new_with_tls(&tcp, &dns, tls_config)
+                },
+            );
 
-            let mut request = client
-                .request(Method::GET, current_url.as_str())
+            let mut request = Box::pin(client.request(Method::GET, current_url.as_str()))
                 .await
                 .map_err(|err| {
                     if redirects == 0 {
@@ -561,7 +563,7 @@ fn log_http_client_error(context: &str, err: &reqwless::Error) {
                 "OTA: HTTP {} error class: network {:?}",
                 context,
                 Debug2Format(kind)
-            )
+            );
         }
         reqwless::Error::Codec => warn!("OTA: HTTP {} error class: codec", context),
         reqwless::Error::InvalidUrl(_) => warn!("OTA: HTTP {} error class: invalid-url", context),
@@ -570,17 +572,17 @@ fn log_http_client_error(context: &str, err: &reqwless::Error) {
                 "OTA: HTTP {} error class: tls {:?}",
                 context,
                 Debug2Format(tls)
-            )
+            );
         }
         reqwless::Error::BufferTooSmall => {
-            warn!("OTA: HTTP {} error class: buffer-too-small", context)
+            warn!("OTA: HTTP {} error class: buffer-too-small", context);
         }
         reqwless::Error::AlreadySent => warn!("OTA: HTTP {} error class: already-sent", context),
         reqwless::Error::IncorrectBodyWritten => {
-            warn!("OTA: HTTP {} error class: incorrect-body-written", context)
+            warn!("OTA: HTTP {} error class: incorrect-body-written", context);
         }
         reqwless::Error::ConnectionAborted => {
-            warn!("OTA: HTTP {} error class: connection-aborted", context)
+            warn!("OTA: HTTP {} error class: connection-aborted", context);
         }
     }
 }
@@ -903,7 +905,7 @@ pub async fn download_and_write_to_flash(
         );
 
         prepare_inactive_slot(&mut region, manifest.image_size)?;
-        fetch_and_process_encrypted(
+        Box::pin(fetch_and_process_encrypted(
             network_stack,
             manifest,
             &mut region,
@@ -911,7 +913,7 @@ pub async fn download_and_write_to_flash(
             &hmac_key,
             &aes_key,
             &manifest_digest,
-        )
+        ))
         .await?
     };
 
