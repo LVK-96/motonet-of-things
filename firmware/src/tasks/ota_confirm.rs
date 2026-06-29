@@ -1,9 +1,9 @@
 //! Post-OTA health confirmation task.
 //!
 //! After a successful OTA update and reboot, the new image remains unconfirmed
-//! as `New` or `PendingVerify`. This task waits for health
-//! signals (Wi‑Fi up, MQTT connected + heartbeat published, minimum uptime)
-//! and then calls [`OtaBootMetadata::mark_current_app_valid`] to confirm the
+//! as `New` or `PendingVerify`. This task waits for [`MqttHealth::HeartbeatPublished`]
+//! (which implies both network and MQTT connectivity) and a minimum uptime window
+//! before calling [`OtaBootMetadata::mark_current_app_valid`] to confirm the
 //! image. If confirmation is skipped, the bootloader will roll back to the
 //! previous image on the next reset.
 

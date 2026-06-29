@@ -26,18 +26,6 @@ const RADIO_TELEMETRY_CHANNEL_DEPTH: usize = 16;
 pub const OTA_MANIFEST_MAX_BYTES: usize = ota_core::MAX_MANIFEST_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MqttSessionState {
-    Connected,
-    Disconnected,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NetworkState {
-    Up,
-    Down,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiInputEvent {
     Navigation(UiEvent),
     ApplySettings {
@@ -50,9 +38,7 @@ pub enum UiInputEvent {
 pub enum AppEvent {
     UiInput(UiInputEvent),
     RadioFrameDecoded(RadioReading),
-    MqttSessionState(MqttSessionState),
     TimeUpdated(u64),
-    NetworkState(NetworkState),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -171,10 +157,7 @@ pub fn route_event(event: AppEvent) -> Option<AppCommand> {
             Some(AppCommand::ApplySettings { radio, power })
         }
         AppEvent::RadioFrameDecoded(reading) => Some(AppCommand::PublishTelemetry(reading)),
-        AppEvent::UiInput(UiInputEvent::Navigation(_))
-        | AppEvent::MqttSessionState(_)
-        | AppEvent::TimeUpdated(_)
-        | AppEvent::NetworkState(_) => None,
+        AppEvent::UiInput(UiInputEvent::Navigation(_)) | AppEvent::TimeUpdated(_) => None,
     }
 }
 
@@ -231,9 +214,8 @@ pub async fn app_command_dispatch_task() {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppCommand, AppEvent, ControlDispatch, MqttSessionState, NetworkState, UiInputEvent,
-        classify_control_dispatch, route_event, route_event_to_control_command,
-        route_event_to_mqtt_command,
+        AppCommand, AppEvent, ControlDispatch, UiInputEvent, classify_control_dispatch,
+        route_event, route_event_to_control_command, route_event_to_mqtt_command,
     };
     use crate::messages::{
         DEFAULT_POWER_SETTINGS, DEFAULT_RADIO_SETTINGS, PowerSettings, RadioReading, RadioSettings,
@@ -344,10 +326,10 @@ mod tests {
     #[test]
     fn unrelated_event_variants_are_ignored_without_panicking() {
         let events = [
-            AppEvent::UiInput(UiInputEvent::Navigation(UiEvent::NextScreen)),
-            AppEvent::MqttSessionState(MqttSessionState::Connected),
+            AppEvent::UiInput(UiInputEvent::Navigation(
+                crate::ui_input::UiEvent::NextScreen,
+            )),
             AppEvent::TimeUpdated(1_707_000_000),
-            AppEvent::NetworkState(NetworkState::Down),
         ];
 
         for event in events {
