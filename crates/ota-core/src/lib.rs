@@ -9,7 +9,6 @@ extern crate alloc;
 
 use alloc::{format, string::String};
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicU8, Ordering};
 
 use ed25519_dalek::{Signature, Verifier as DalekVerifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -37,8 +36,6 @@ pub const RELEASE_KEY_ID: u32 = 1;
 pub const DEV_TEST_PUBLIC_KEY_HEX: &str =
     "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c";
 
-static OTA_STATE: AtomicU8 = AtomicU8::new(OtaState::Inactive.as_u8());
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OtaState {
     Inactive = 0,
@@ -62,76 +59,6 @@ impl From<u8> for OtaState {
             3 => Self::PendingConfirmation,
             _ => Self::Inactive,
         }
-    }
-}
-
-#[must_use]
-pub fn ota_state() -> OtaState {
-    OTA_STATE.load(Ordering::Relaxed).into()
-}
-
-pub fn set_ota_state(state: OtaState) {
-    OTA_STATE.store(state.as_u8(), Ordering::Relaxed);
-}
-
-#[must_use]
-pub fn ota_confirmation_pending() -> bool {
-    ota_state() == OtaState::PendingConfirmation
-}
-
-#[must_use]
-pub fn ota_sleep_blocked() -> bool {
-    ota_state() != OtaState::Inactive
-}
-
-#[must_use]
-pub fn ota_update_in_progress() -> bool {
-    matches!(ota_state(), OtaState::Downloading | OtaState::Applying)
-}
-
-pub fn arm_rollback_test_pending_confirmation() {
-    set_ota_state(OtaState::PendingConfirmation);
-}
-
-#[must_use]
-pub struct OtaUpdateGuard;
-
-impl OtaUpdateGuard {
-    pub fn begin_download() -> Self {
-        set_ota_state(OtaState::Downloading);
-        Self
-    }
-
-    pub fn begin_apply() -> Self {
-        set_ota_state(OtaState::Applying);
-        Self
-    }
-}
-
-impl Drop for OtaUpdateGuard {
-    fn drop(&mut self) {
-        set_ota_state(OtaState::Inactive);
-    }
-}
-
-#[must_use]
-pub struct PendingConfirmationGuard;
-
-impl PendingConfirmationGuard {
-    pub fn begin() -> Self {
-        set_ota_state(OtaState::PendingConfirmation);
-        Self
-    }
-
-    pub fn confirm(self) {
-        set_ota_state(OtaState::Inactive);
-        core::mem::forget(self);
-    }
-}
-
-impl Drop for PendingConfirmationGuard {
-    fn drop(&mut self) {
-        set_ota_state(OtaState::PendingConfirmation);
     }
 }
 
@@ -860,24 +787,6 @@ mod tests {
             ota_status_topic("test-sensor").map(|topic| topic.to_string()),
             Ok("motonet/test-sensor/ota/status".to_owned())
         );
-    }
-
-    #[test]
-    fn ota_state_distinguishes_update_from_pending_confirmation() {
-        set_ota_state(OtaState::Inactive);
-        assert!(!ota_sleep_blocked());
-        assert!(!ota_update_in_progress());
-
-        set_ota_state(OtaState::Downloading);
-        assert!(ota_sleep_blocked());
-        assert!(ota_update_in_progress());
-
-        set_ota_state(OtaState::PendingConfirmation);
-        assert!(ota_sleep_blocked());
-        assert!(ota_confirmation_pending());
-        assert!(!ota_update_in_progress());
-
-        set_ota_state(OtaState::Inactive);
     }
 
     #[test]

@@ -13,7 +13,7 @@ const USE_HARDWARE_SHA: bool = true;
 /// Reset the SHA peripheral to a clean state before operations.
 ///
 /// This is a no-op placeholder; hardware SHA is serialized block-by-block in
-/// [`hw_sha256`] to work around the ESP32 SHA_CONTINUE pipelining bug.
+/// [`hw_sha256`] to work around the ESP32 `SHA_CONTINUE` pipelining bug.
 pub fn gate_sha_clock() {
     // No-op: hardware SHA is serialized block-by-block below.
 }

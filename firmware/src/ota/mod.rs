@@ -73,7 +73,4 @@ pub(crate) unsafe fn sha_ref() -> &'static esp_hal::peripherals::SHA<'static> {
 
 pub use boot_metadata::OtaBootMetadata;
 pub use flash_write::OtaFlashWriteError;
-pub use ota_core::{
-    OtaState, OtaUpdateGuard, PendingConfirmationGuard, arm_rollback_test_pending_confirmation,
-    ota_confirmation_pending, ota_sleep_blocked, ota_state, ota_update_in_progress, set_ota_state,
-};
+pub use ota_core::OtaState;

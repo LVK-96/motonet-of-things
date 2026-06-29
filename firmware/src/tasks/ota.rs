@@ -22,7 +22,7 @@ fn ota_manifest_verifier() -> Ed25519ManifestVerifier {
 
 use crate::app_bus;
 use crate::app_bus::{MqttHealth, MqttHealthReceiver};
-use crate::ota::{OtaUpdateGuard, flash_write};
+use crate::ota::flash_write;
 use crate::secrets;
 
 const MQTT_STANDDOWN_TIMEOUT_SECS: u64 = 15;
@@ -80,8 +80,6 @@ pub async fn ota_task(
         }
 
         ota_state_sender.send(OtaState::Downloading);
-
-        let _ota_guard = OtaUpdateGuard::begin_download();
         wait_for_mqtt_stand_down(&mut mqtt_health_receiver, MQTT_STANDDOWN_TIMEOUT_SECS).await;
 
         ota_state_sender.send(OtaState::Applying);

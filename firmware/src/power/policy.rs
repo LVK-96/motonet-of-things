@@ -5,8 +5,21 @@ use app_core::runtime_policy::{
     PredictiveSleepDecision, next_ui_idle_deadline_secs, predictive_sleep_decision,
 };
 use defmt::info;
+use ota_core::OtaState;
 
 use crate::messages::PowerSettings;
+
+fn is_ota_sleep_blocked(state: OtaState) -> bool {
+    state != OtaState::Inactive
+}
+
+fn is_ota_update_in_progress(state: OtaState) -> bool {
+    matches!(state, OtaState::Downloading | OtaState::Applying)
+}
+
+fn is_ota_confirmation_pending(state: OtaState) -> bool {
+    state == OtaState::PendingConfirmation
+}
 
 fn apply_settings(settings: PowerSettings, persist: bool, rearm_idle_countdown: bool) {
     let clamped = super::clamp_settings(settings);
@@ -60,11 +73,15 @@ pub fn notify_ui_activity() {
     }
 }
 
-pub fn maybe_sleep_after_publish(queue_empty: bool, time_since_mesaurement_receive: Duration) {
+pub fn maybe_sleep_after_publish(
+    queue_empty: bool,
+    time_since_mesaurement_receive: Duration,
+    ota_state: OtaState,
+) {
     let settings = get_settings();
     let now = super::now_secs();
     let idle_deadline = super::UI_IDLE_DEADLINE_SECS.load(Ordering::Relaxed);
-    if crate::ota::ota_sleep_blocked() {
+    if is_ota_sleep_blocked(ota_state) {
         info!("PowerSave: skip deep sleep (OTA in progress)");
         return;
     }
@@ -74,7 +91,7 @@ pub fn maybe_sleep_after_publish(queue_empty: bool, time_since_mesaurement_recei
         settings.predictive_sleep_enabled,
         settings.sleep_duration_secs,
         now,
-        crate::ota::ota_sleep_blocked(),
+        is_ota_update_in_progress(ota_state),
         idle_deadline,
     );
 
@@ -100,7 +117,7 @@ pub fn maybe_sleep_after_publish(queue_empty: bool, time_since_mesaurement_recei
             );
         }
         PredictiveSleepDecision::OTAUpdateInProgress => {
-            if crate::ota::ota_confirmation_pending() {
+            if is_ota_confirmation_pending(ota_state) {
                 info!("PowerSave: skip deep sleep (OTA confirmation pending)");
             } else {
                 info!("PowerSave: skip deep sleep (OTA update in progress)");

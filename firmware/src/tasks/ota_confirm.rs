@@ -13,7 +13,7 @@ use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use esp_bootloader_esp_idf::partitions::PARTITION_TABLE_MAX_LEN;
 use esp_storage::FlashStorage;
-use ota_core::{OtaState, PendingConfirmationGuard};
+use ota_core::OtaState;
 
 use crate::app_bus;
 use crate::ota::OtaBootMetadata;
@@ -28,9 +28,6 @@ pub async fn ota_confirm_task(
     flash_mutex: &'static Mutex<CriticalSectionRawMutex, FlashStorage<'static>>,
 ) {
     // ── Check bootloader state ────────────────────────────────────────
-    // Must set PendingConfirmation BEFORE acquiring the flash lock,
-    // otherwise the MQTT task might deep-sleep before we block it.
-    let guard = PendingConfirmationGuard::begin();
     ota_state_sender.send(OtaState::PendingConfirmation);
 
     let boot_metadata_pending = {
@@ -60,7 +57,6 @@ pub async fn ota_confirm_task(
 
     if !boot_metadata_pending {
         info!("OTA confirm: image already confirmed, nothing to do");
-        guard.confirm();
         ota_state_sender.send(OtaState::Inactive);
         return;
     }
@@ -128,7 +124,6 @@ pub async fn ota_confirm_task(
     }
 
     info!("OTA confirm: image marked valid, publishing confirmation via MQTT");
-    guard.confirm();
     ota_state_sender.send(OtaState::Inactive);
     mqtt_command_sender
         .send(crate::app_bus::AppCommand::OtaConfirmed)

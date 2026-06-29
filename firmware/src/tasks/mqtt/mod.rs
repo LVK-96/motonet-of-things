@@ -73,6 +73,7 @@ async fn handle_reading<'a, N>(
     receiver: &app_bus::MqttCommandReceiver,
     reading: RadioReading,
     last_activity: &mut Instant,
+    ota_state: OtaState,
 ) -> ReadingOutcome
 where
     N: AsyncRead + AsyncWrite,
@@ -91,15 +92,16 @@ where
     match publish::publish_reading(client, reading).await {
         publish::PublishOutcome::Published => {
             debug!("MQTT: Publish successful (QoS 1, awaiting PUBACK)");
-            if crate::ota::ota_sleep_blocked() {
-                info!("MQTT: Publish confirmed, OTA active, skipping deep sleep policy");
-            } else {
+            if ota_state == OtaState::Inactive {
                 info!("MQTT: Publish confirmed, checking deep sleep policy");
                 let time_since_measurement = Instant::now() - reading.received_at;
                 power::maybe_sleep_after_publish(
                     receiver.is_empty(),
                     CoreDuration::from_secs(time_since_measurement.as_secs()),
+                    ota_state,
                 );
+            } else {
+                info!("MQTT: Publish confirmed, OTA active, skipping deep sleep policy");
             }
             *last_activity = Instant::now();
             ReadingOutcome::Continue
@@ -228,7 +230,8 @@ where
     loop {
         if let Some(reading) = deferred_reading.take() {
             debug!("MQTT: Retrying deferred reading after reconnect");
-            match handle_reading(client, receiver, reading, &mut last_activity).await {
+            let ota_state = ota_state_receiver.try_get().unwrap_or(OtaState::Inactive);
+            match handle_reading(client, receiver, reading, &mut last_activity, ota_state).await {
                 ReadingOutcome::Continue => continue,
                 ReadingOutcome::Reconnect(reading) => {
                     deferred_reading = Some(reading);
@@ -248,7 +251,10 @@ where
         {
             Either4::First(command) => match command {
                 AppCommand::PublishTelemetry(reading) => {
-                    match handle_reading(client, receiver, reading, &mut last_activity).await {
+                    let ota_state = ota_state_receiver.try_get().unwrap_or(OtaState::Inactive);
+                    match handle_reading(client, receiver, reading, &mut last_activity, ota_state)
+                        .await
+                    {
                         ReadingOutcome::Continue => {}
                         ReadingOutcome::Reconnect(reading) => {
                             deferred_reading = Some(reading);
