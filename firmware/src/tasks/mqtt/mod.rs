@@ -24,17 +24,40 @@ use crate::secrets::MQTT_USE_TLS;
 use crate::tls_workspace::TlsWorkspaceGuard;
 
 #[cfg(feature = "release-ota")]
-fn ota_manifest_verifier() -> Ed25519ManifestVerifier {
+pub(super) fn ota_manifest_verifier() -> Ed25519ManifestVerifier {
     Ed25519ManifestVerifier::release_ota()
 }
 
 #[cfg(not(feature = "release-ota"))]
-fn ota_manifest_verifier() -> Ed25519ManifestVerifier {
+pub(super) fn ota_manifest_verifier() -> Ed25519ManifestVerifier {
     Ed25519ManifestVerifier::dev_test()
 }
 
 mod publish;
 mod session;
+
+/// Resolve the action for an incoming OTA manifest
+#[must_use]
+pub(super) fn resolve_ota_manifest_action(
+    ota_state: OtaState,
+    retained: bool,
+    manifest_bytes: &app_bus::OtaManifestBytes,
+) -> OtaManifestDeliveryAction {
+    let action = classify_ota_manifest_delivery(ota_state, retained);
+
+    if matches!(action, OtaManifestDeliveryAction::ClearRetainedOnly)
+        && let Ok(incoming) =
+            OtaManifest::parse_and_verify(manifest_bytes, &ota_manifest_verifier())
+        && incoming.force
+    {
+        info!(
+            "MQTT: Received retained OTA manifest with force=true during pending confirmation, forwarding"
+        );
+        OtaManifestDeliveryAction::ForwardAndClearRetained
+    } else {
+        action
+    }
+}
 
 type PlainClient<'a> = Client<'a, TcpSocket<'a>, BumpBuffer<'a>, 4, 2, 2, 0>;
 type TlsSocket<'a> = TlsConnection<'a, TcpSocket<'a>, Aes128GcmSha256>;
@@ -154,18 +177,7 @@ async fn handle_mqtt_event(
     };
 
     if let Some(manifest) = manifest {
-        let mut action = classify_ota_manifest_delivery(ota_state, manifest.retained);
-
-        if matches!(action, OtaManifestDeliveryAction::ClearRetainedOnly)
-            && let Ok(incoming) =
-                OtaManifest::parse_and_verify(&manifest.bytes, &ota_manifest_verifier())
-            && incoming.force
-        {
-            info!(
-                "MQTT: Received retained OTA manifest with force=true during pending confirmation, forwarding"
-            );
-            action = OtaManifestDeliveryAction::ForwardAndClearRetained;
-        }
+        let action = resolve_ota_manifest_action(ota_state, manifest.retained, &manifest.bytes);
 
         match action {
             OtaManifestDeliveryAction::ForwardOnly => {

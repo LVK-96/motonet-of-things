@@ -8,7 +8,7 @@ use embedded_tls::{
     Aes128GcmSha256, Certificate, CryptoProvider, MaxFragmentLength, TlsConfig, TlsConnection,
     TlsContext, TlsError, TlsVerifier,
 };
-use ota_core::{OtaManifestDeliveryAction, OtaState, classify_ota_manifest_delivery};
+use ota_core::{OtaManifestDeliveryAction, OtaState};
 use rand_core::RngCore;
 use rust_mqtt::Bytes;
 use rust_mqtt::buffer::BumpBuffer;
@@ -252,7 +252,11 @@ where
             }
             Event::Publish(publish) => {
                 if let Some(manifest) = super::copy_ota_manifest(&publish, ota_topic.as_str()) {
-                    match classify_ota_manifest_delivery(ota_state, manifest.retained) {
+                    match super::resolve_ota_manifest_action(
+                        ota_state,
+                        manifest.retained,
+                        &manifest.bytes,
+                    ) {
                         OtaManifestDeliveryAction::ForwardOnly => {
                             info!(
                                 "MQTT: Received early live OTA manifest command during subscribe setup"
