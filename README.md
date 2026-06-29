@@ -9,6 +9,23 @@ Receive 433 MHz data from cheap wireless temperature sensors (Rubicson protocol)
 
 This is also a little experiment to see how agentic AI workflows work in firmware development.
 
+## Pin Map
+
+| Peripheral | Signal | GPIO | Notes |
+|---|---|---|---|
+| **CC1101** (SPI2) | SCK | **18** | SPI clock (1 MHz, Mode 0) |
+| | MOSI | **23** | SPI master out |
+| | MISO | **19** | SPI master in |
+| | CS | **5** | Chip select (active low) |
+| | GDO0 | **4** | Data output → RMT channel 0 (pulse capture) |
+| | GDO2 | **15** | Auxiliary status (packet RX) |
+| **SH1106 OLED** (I2C0) | SDA | **21** | I2C data (400 kHz) |
+| | SCL | **22** | I2C clock |
+| **EC11 Encoder** | A | **14** | Rotary encoder A (quadrature) |
+| | B | **13** | Rotary encoder B (quadrature) |
+| | SW | **27** | Push button (active low, EXT0 deep-sleep wake) |
+
+
 ## Build And Flash
 
 Run firmware commands from `firmware/` so the local target config is used.
