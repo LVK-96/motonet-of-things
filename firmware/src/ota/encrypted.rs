@@ -1,22 +1,9 @@
 //! AES-256-CTR decryption, HMAC-SHA256 verification, and key derivation
-//! for v2 encrypted OTA firmware downloads.
-//!
-//! AES-256-CTR decryption uses the ESP32 hardware accelerator; SHA-256
-//! uses the hardware path where buffers fit and software hashing for
-//! streaming plaintext digests.
 
 use esp_hal::aes::{AesContext, Operation, cipher_modes::Ctr};
 use sha2::Digest;
 
 const USE_HARDWARE_SHA: bool = true;
-
-/// Reset the SHA peripheral to a clean state before operations.
-///
-/// This is a no-op placeholder; hardware SHA is serialized block-by-block in
-/// [`hw_sha256`] to work around the ESP32 `SHA_CONTINUE` pipelining bug.
-pub fn gate_sha_clock() {
-    // No-op: hardware SHA is serialized block-by-block below.
-}
 
 /// SHA-256 digest length in bytes.
 pub const SHA256_OUTPUT_SIZE: usize = 32;
@@ -60,31 +47,18 @@ pub const HMAC_TAG_SIZE: usize = SHA256_OUTPUT_SIZE;
 /// Per-chunk wire overhead: 4-byte length prefix + 32-byte HMAC tag.
 pub const CHUNK_WIRE_OVERHEAD: usize = 4 + HMAC_TAG_SIZE;
 
-// ── Hardware SHA-256 (block-serialized via esp-hal Sha driver) ──────
+// ── Hardware SHA-256 via esp-hal ShaBackend ───────────────────────────────
 
-/// Compute SHA-256 using the ESP32 hardware accelerator.
+/// Compute SHA-256 using esp-hal's SHA work-queue context.
 ///
-/// Uses the esp-hal [`Sha`] driver directly (not the work-queue-based
-/// [`ShaBackend`]) and spins on `is_busy()` between blocks to avoid the
-/// pipelining bug where `write_data` would overwrite `SHA_TEXT` while
-/// the engine is still processing the previous block.
-#[allow(dead_code)]
+/// The caller must keep an active [`esp_hal::sha::ShaBackend`] driver alive.
 #[must_use]
-pub fn hw_sha256(data: &[u8], sha_peripheral: &esp_hal::peripherals::SHA<'static>) -> [u8; 32] {
-    // Safety: the OTA task serialises SHA access.
-    let sha_handle = unsafe { sha_peripheral.clone_unchecked() };
-    let mut sha = esp_hal::sha::Sha::new(sha_handle);
-    let mut digest = sha.start::<esp_hal::sha::Sha256>();
-
-    let mut remaining: &[u8] = data;
-    while !remaining.is_empty() {
-        remaining = nb::block!(digest.update(remaining)).unwrap();
-        while digest.is_busy() {}
-    }
-
-    let mut result = [0u8; 32];
-    nb::block!(digest.finish(&mut result)).unwrap();
-    result
+pub fn hw_sha256(data: &[u8]) -> [u8; SHA256_OUTPUT_SIZE] {
+    let mut ctx = esp_hal::sha::Sha256Context::new();
+    ctx.update(data).wait_blocking();
+    let mut digest = [0u8; SHA256_OUTPUT_SIZE];
+    esp_hal::sha::Sha256Context::finalize(&mut ctx, &mut digest).wait_blocking();
+    digest
 }
 
 // ── Key derivation ────────────────────────────────────────────────────────
@@ -109,20 +83,16 @@ pub fn derive_subkeys(
 }
 
 /// Public test-only wrapper for [`hmac_sha256_raw`].
-/// Used by the boot-time HMAC self-test before the global OTA SHA peripheral is
-/// initialized.
+///
+/// The caller must keep an active [`esp_hal::sha::ShaBackend`] driver alive.
 ///
 /// # Errors
 ///
 /// Returns [`HmacError::InputTooLong`] if the hardware SHA staging buffer would
 /// overflow.
 #[doc(hidden)]
-pub fn hmac_sha256_test(
-    key: &[u8; 32],
-    parts: &[&[u8]],
-    sha_peripheral: &esp_hal::peripherals::SHA<'static>,
-) -> Result<[u8; 32], HmacError> {
-    hmac_sha256_raw_with_sha(key, parts, HardwareShaSource::Borrowed(sha_peripheral))
+pub fn hmac_sha256_test(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacError> {
+    hmac_sha256_raw(key, parts)
 }
 
 /// HMAC-SHA256-based key expansion: `HMAC-SHA256(prk, info || key_id_be)`.
@@ -140,34 +110,8 @@ pub enum HmacError {
     InputTooLong,
 }
 
-#[derive(Clone, Copy)]
-enum HardwareShaSource<'a> {
-    Global,
-    Borrowed(&'a esp_hal::peripherals::SHA<'static>),
-}
-
-impl HardwareShaSource<'_> {
-    fn sha256(self, data: &[u8]) -> [u8; SHA256_OUTPUT_SIZE] {
-        match self {
-            Self::Global => {
-                let sha = unsafe { crate::ota::sha_ref() };
-                hw_sha256(data, sha)
-            }
-            Self::Borrowed(sha) => hw_sha256(data, sha),
-        }
-    }
-}
-
 /// Compute HMAC-SHA256 with a 32-byte key, streaming over multiple input parts.
 fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacError> {
-    hmac_sha256_raw_with_sha(key, parts, HardwareShaSource::Global)
-}
-
-fn hmac_sha256_raw_with_sha(
-    key: &[u8; 32],
-    parts: &[&[u8]],
-    sha_source: HardwareShaSource<'_>,
-) -> Result<[u8; 32], HmacError> {
     let mut k_inner = [IPAD; HMAC_BLOCK_SIZE];
     let mut k_outer = [OPAD; HMAC_BLOCK_SIZE];
 
@@ -190,7 +134,7 @@ fn hmac_sha256_raw_with_sha(
             data.extend_from_slice(part)
                 .map_err(|_| HmacError::InputTooLong)?;
         }
-        sha_source.sha256(&data)
+        hw_sha256(&data)
     } else {
         let mut hasher = sha2::Sha256::new();
         hasher.update(k_inner);
@@ -208,7 +152,7 @@ fn hmac_sha256_raw_with_sha(
         let mut data = [0u8; HMAC_BLOCK_SIZE + SHA256_OUTPUT_SIZE];
         data[..HMAC_BLOCK_SIZE].copy_from_slice(&k_outer);
         data[HMAC_BLOCK_SIZE..].copy_from_slice(&inner);
-        sha_source.sha256(&data)
+        hw_sha256(&data)
     } else {
         let mut hasher = sha2::Sha256::new();
         hasher.update(k_outer);
@@ -227,9 +171,7 @@ fn hmac_sha256_raw_with_sha(
 #[must_use]
 pub fn compute_manifest_digest(canonical_json: &str) -> [u8; SHA256_OUTPUT_SIZE] {
     if USE_HARDWARE_SHA {
-        // SAFETY: called from OTA task which holds the SHA peripheral guard.
-        let sha = unsafe { crate::ota::sha_ref() };
-        hw_sha256(canonical_json.as_bytes(), sha)
+        hw_sha256(canonical_json.as_bytes())
     } else {
         let mut hasher = sha2::Sha256::new();
         hasher.update(canonical_json.as_bytes());

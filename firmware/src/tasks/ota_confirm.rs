@@ -34,7 +34,7 @@ pub async fn ota_confirm_task(
         let mut flash = flash_mutex.lock().await;
         let mut buf = [0u8; PARTITION_TABLE_MAX_LEN];
 
-        match OtaBootMetadata::new(&mut *flash, &mut buf) {
+        match OtaBootMetadata::new(&mut flash, &mut buf) {
             Ok(mut meta) => match meta.current_app_pending_confirmation() {
                 Ok(pending) => pending,
                 Err(e) => {
@@ -101,7 +101,7 @@ pub async fn ota_confirm_task(
         let mut flash = flash_mutex.lock().await;
         let mut buf = [0u8; PARTITION_TABLE_MAX_LEN];
 
-        match OtaBootMetadata::new(&mut *flash, &mut buf) {
+        match OtaBootMetadata::new(&mut flash, &mut buf) {
             Ok(mut meta) => {
                 if let Err(e) = meta.mark_current_app_valid() {
                     warn!(

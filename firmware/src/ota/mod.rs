@@ -63,14 +63,6 @@ pub(crate) unsafe fn take_rsa() -> esp_hal::peripherals::RSA<'static> {
     }
 }
 
-/// Get a reference to the SHA peripheral without consuming it.
-///
-/// # Safety
-/// Must only be called after `init_crypto_peripherals`.
-pub(crate) unsafe fn sha_ref() -> &'static esp_hal::peripherals::SHA<'static> {
-    unsafe { (*addr_of_mut!(SHA_PERIPHERAL)).assume_init_ref() }
-}
-
 pub use boot_metadata::OtaBootMetadata;
 pub use flash_write::OtaFlashWriteError;
 pub use ota_core::OtaState;
