@@ -1,4 +1,10 @@
 //! AES-256-CTR decryption, HMAC-SHA256 verification, and key derivation
+//! for v2 encrypted OTA firmware downloads.
+//!
+//! AES-256-CTR decryption uses the ESP32 hardware accelerator. HMAC and
+//! manifest SHA-256 use esp-hal's SHA work-queue contexts asynchronously.
+//! Plaintext image hashing stays software-streamed to avoid holding the
+//! single ESP32 SHA accelerator for the full OTA image.
 
 use esp_hal::aes::{AesContext, Operation, cipher_modes::Ctr};
 use sha2::Digest;
@@ -47,17 +53,41 @@ pub const HMAC_TAG_SIZE: usize = SHA256_OUTPUT_SIZE;
 /// Per-chunk wire overhead: 4-byte length prefix + 32-byte HMAC tag.
 pub const CHUNK_WIRE_OVERHEAD: usize = 4 + HMAC_TAG_SIZE;
 
-// ── Hardware SHA-256 via esp-hal ShaBackend ───────────────────────────────
+// ── Async SHA-256 via esp-hal ShaBackend ──────────────────────────────────
 
-/// Compute SHA-256 using esp-hal's SHA work-queue context.
+/// Compute SHA-256 over borrowed byte slices using esp-hal's SHA work queue.
 ///
-/// The caller must keep an active [`esp_hal::sha::ShaBackend`] driver alive.
-#[must_use]
-pub fn hw_sha256(data: &[u8]) -> [u8; SHA256_OUTPUT_SIZE] {
+/// The caller must keep an active [`esp_hal::sha::ShaBackend`] driver alive
+/// while this future is running.
+async fn hw_sha256_parts(parts: &[&[u8]]) -> [u8; SHA256_OUTPUT_SIZE] {
+    hw_sha256_prefixed_parts(&[], parts).await
+}
+
+async fn hw_sha256_prefixed_parts(prefix: &[u8], parts: &[&[u8]]) -> [u8; SHA256_OUTPUT_SIZE] {
     let mut ctx = esp_hal::sha::Sha256Context::new();
-    ctx.update(data).wait_blocking();
+    if !prefix.is_empty() {
+        let mut handle = ctx.update(prefix);
+        let _status = handle.wait().await;
+    }
+    for part in parts {
+        let mut handle = ctx.update(part);
+        let _status = handle.wait().await;
+    }
+
     let mut digest = [0u8; SHA256_OUTPUT_SIZE];
-    esp_hal::sha::Sha256Context::finalize(&mut ctx, &mut digest).wait_blocking();
+    let mut handle = esp_hal::sha::Sha256Context::finalize(&mut ctx, &mut digest);
+    let _status = handle.wait().await;
+    digest
+}
+
+fn sw_sha256_parts(parts: &[&[u8]]) -> [u8; SHA256_OUTPUT_SIZE] {
+    let mut hasher = sha2::Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    let result = hasher.finalize();
+    let mut digest = [0u8; SHA256_OUTPUT_SIZE];
+    digest.copy_from_slice(&result);
     digest
 }
 
@@ -69,49 +99,28 @@ pub fn hw_sha256(data: &[u8]) -> [u8; SHA256_OUTPUT_SIZE] {
 /// Uses HMAC-SHA256 as a KDF with separate info strings so the two subkeys
 /// are independent.
 ///
-/// # Errors
-///
-/// Returns [`HmacError::InputTooLong`] if the hardware SHA staging buffer would
-/// overflow.
-pub fn derive_subkeys(
+pub async fn derive_subkeys(
     master: &[u8; 32],
     key_id: u32,
-) -> Result<([u8; AES_KEY_SIZE], [u8; HMAC_KEY_SIZE]), HmacError> {
-    let aes_key = hkdf_expand(master, AES_KEY_INFO, key_id)?;
-    let hmac_key = hkdf_expand(master, HMAC_KEY_INFO, key_id)?;
-    Ok((aes_key, hmac_key))
-}
-
-/// Public test-only wrapper for [`hmac_sha256_raw`].
-///
-/// The caller must keep an active [`esp_hal::sha::ShaBackend`] driver alive.
-///
-/// # Errors
-///
-/// Returns [`HmacError::InputTooLong`] if the hardware SHA staging buffer would
-/// overflow.
-#[doc(hidden)]
-pub fn hmac_sha256_test(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacError> {
-    hmac_sha256_raw(key, parts)
+) -> ([u8; AES_KEY_SIZE], [u8; HMAC_KEY_SIZE]) {
+    let aes_key = hkdf_expand(master, AES_KEY_INFO, key_id).await;
+    let hmac_key = hkdf_expand(master, HMAC_KEY_INFO, key_id).await;
+    (aes_key, hmac_key)
 }
 
 /// HMAC-SHA256-based key expansion: `HMAC-SHA256(prk, info || key_id_be)`.
-fn hkdf_expand(prk: &[u8; 32], info: &[u8], key_id: u32) -> Result<[u8; 32], HmacError> {
+async fn hkdf_expand(prk: &[u8; 32], info: &[u8], key_id: u32) -> [u8; 32] {
     let key_id_be = key_id.to_be_bytes();
-    hmac_sha256_raw(prk, &[info, &key_id_be])
+    hmac_sha256_raw(prk, &[info, &key_id_be]).await
 }
 
 // ── HMAC-SHA256 ─────────────────────────────────────────────────────
 
-/// HMAC-SHA256 error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HmacError {
-    /// HMAC input exceeded the fixed hardware-SHA staging buffer.
-    InputTooLong,
-}
-
-/// Compute HMAC-SHA256 with a 32-byte key, streaming over multiple input parts.
-fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacError> {
+/// Compute HMAC-SHA256 with a 32-byte key over borrowed input parts.
+///
+/// Hardware SHA mode streams each HMAC part directly into `Sha256Context`;
+/// it does not stage the ciphertext and metadata into a combined buffer.
+async fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
     let mut k_inner = [IPAD; HMAC_BLOCK_SIZE];
     let mut k_outer = [OPAD; HMAC_BLOCK_SIZE];
 
@@ -120,21 +129,9 @@ fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacErro
         k_outer[i] ^= key[i];
     }
 
-    // Inner: SHA256(k_ipad || parts)
+    // Inner: SHA256(k_ipad || parts...)
     let inner = if USE_HARDWARE_SHA {
-        let mut data: heapless::Vec<
-            u8,
-            {
-                HMAC_BLOCK_SIZE + HMAC_TAG_SIZE + 32 + 4 + 4 + 4 + ota_core::ENC_CHUNK_SIZE as usize
-            },
-        > = heapless::Vec::new();
-        data.extend_from_slice(&k_inner)
-            .map_err(|_| HmacError::InputTooLong)?;
-        for part in parts {
-            data.extend_from_slice(part)
-                .map_err(|_| HmacError::InputTooLong)?;
-        }
-        hw_sha256(&data)
+        hw_sha256_prefixed_parts(&k_inner, parts).await
     } else {
         let mut hasher = sha2::Sha256::new();
         hasher.update(k_inner);
@@ -142,17 +139,14 @@ fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacErro
             hasher.update(part);
         }
         let result = hasher.finalize();
-        let mut d = [0u8; SHA256_OUTPUT_SIZE];
-        d.copy_from_slice(&result);
-        d
+        let mut digest = [0u8; SHA256_OUTPUT_SIZE];
+        digest.copy_from_slice(&result);
+        digest
     };
 
     // Outer: SHA256(k_opad || inner)
-    let digest = if USE_HARDWARE_SHA {
-        let mut data = [0u8; HMAC_BLOCK_SIZE + SHA256_OUTPUT_SIZE];
-        data[..HMAC_BLOCK_SIZE].copy_from_slice(&k_outer);
-        data[HMAC_BLOCK_SIZE..].copy_from_slice(&inner);
-        hw_sha256(&data)
+    if USE_HARDWARE_SHA {
+        hw_sha256_parts(&[&k_outer, &inner]).await
     } else {
         let mut hasher = sha2::Sha256::new();
         hasher.update(k_outer);
@@ -161,40 +155,28 @@ fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacErro
         let mut digest = [0u8; SHA256_OUTPUT_SIZE];
         digest.copy_from_slice(&result);
         digest
-    };
-    Ok(digest)
+    }
 }
 
 // ── Manifest digest ───────────────────────────────────────────────────────
 
 /// Compute the SHA-256 digest of the canonical unsigned manifest JSON.
-#[must_use]
-pub fn compute_manifest_digest(canonical_json: &str) -> [u8; SHA256_OUTPUT_SIZE] {
+pub async fn compute_manifest_digest(canonical_json: &str) -> [u8; SHA256_OUTPUT_SIZE] {
     if USE_HARDWARE_SHA {
-        hw_sha256(canonical_json.as_bytes())
+        hw_sha256_parts(&[canonical_json.as_bytes()]).await
     } else {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(canonical_json.as_bytes());
-        let result = hasher.finalize();
-        let mut digest = [0u8; SHA256_OUTPUT_SIZE];
-        digest.copy_from_slice(&result);
-        digest
+        sw_sha256_parts(&[canonical_json.as_bytes()])
     }
 }
 
 /// Compute the SHA-256 digest of arbitrary bytes.
 ///
 /// Always uses software SHA-256 (streaming).  The plaintext hashing
-/// accumulates across ~283 chunks; batching 1.1 MB for hardware SHA
-/// would require buffering the entire image in RAM.
+/// accumulates across ~283 chunks; holding a hardware SHA context for the
+/// full image would monopolize the ESP32's single SHA accelerator.
 #[must_use]
 pub fn sha256_digest(data: &[u8]) -> [u8; SHA256_OUTPUT_SIZE] {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    let mut digest = [0u8; SHA256_OUTPUT_SIZE];
-    digest.copy_from_slice(&result);
-    digest
+    sw_sha256_parts(&[data])
 }
 
 // ── Chunk HMAC ────────────────────────────────────────────────────────────
@@ -203,19 +185,14 @@ pub fn sha256_digest(data: &[u8]) -> [u8; SHA256_OUTPUT_SIZE] {
 ///
 /// Authenticated input (in order):
 /// `MOTONET-OTA-CHUNK-v2 || manifest_digest[32] || chunk_index_u32_be || plaintext_offset_u32_be || plaintext_len_u32_be || ciphertext`
-///
-/// # Errors
-///
-/// Returns [`HmacError::InputTooLong`] if the hardware SHA staging buffer would
-/// overflow.
-pub fn compute_chunk_hmac(
+pub async fn compute_chunk_hmac(
     hmac_key: &[u8; HMAC_KEY_SIZE],
     manifest_digest: &[u8; SHA256_OUTPUT_SIZE],
     chunk_index: u32,
     plaintext_offset: u32,
     plaintext_len: u32,
     ciphertext: &[u8],
-) -> Result<[u8; HMAC_TAG_SIZE], HmacError> {
+) -> [u8; HMAC_TAG_SIZE] {
     let chunk_index_be = chunk_index.to_be_bytes();
     let plaintext_offset_be = plaintext_offset.to_be_bytes();
     let plaintext_len_be = plaintext_len.to_be_bytes();
@@ -230,17 +207,13 @@ pub fn compute_chunk_hmac(
             ciphertext,
         ],
     )
+    .await
 }
 
 /// Verify a chunk HMAC tag in constant time.
 ///
 /// Returns `true` if `tag` matches the computed HMAC.
-///
-/// # Errors
-///
-/// Returns [`HmacError::InputTooLong`] if the hardware SHA staging buffer would
-/// overflow.
-pub fn verify_chunk_hmac(
+pub async fn verify_chunk_hmac(
     hmac_key: &[u8; HMAC_KEY_SIZE],
     manifest_digest: &[u8; SHA256_OUTPUT_SIZE],
     chunk_index: u32,
@@ -248,7 +221,7 @@ pub fn verify_chunk_hmac(
     plaintext_len: u32,
     ciphertext: &[u8],
     tag: &[u8; HMAC_TAG_SIZE],
-) -> Result<bool, HmacError> {
+) -> bool {
     let expected = compute_chunk_hmac(
         hmac_key,
         manifest_digest,
@@ -256,8 +229,9 @@ pub fn verify_chunk_hmac(
         plaintext_offset,
         plaintext_len,
         ciphertext,
-    )?;
-    Ok(constant_time_eq(&expected, tag))
+    )
+    .await;
+    constant_time_eq(&expected, tag)
 }
 
 /// Constant-time byte comparison.

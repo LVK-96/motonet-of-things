@@ -108,8 +108,6 @@ pub enum OtaFlashWriteError {
     InvalidNoncePrefix,
     /// HMAC tag verification failed for a chunk.
     HmacMismatch,
-    /// HMAC computation failed before tag comparison.
-    HmacError(encrypted::HmacError),
     /// AES hardware operation failed during decryption.
     AesError(encrypted::AesError),
     /// OTA v2 stream header too short.
@@ -154,12 +152,6 @@ impl From<encrypted::OtaHeaderError> for OtaFlashWriteError {
             encrypted::OtaHeaderError::InvalidVersion => Self::HeaderInvalidVersion,
             encrypted::OtaHeaderError::ReservedNonZero => Self::HeaderInvalidReserved,
         }
-    }
-}
-
-impl From<encrypted::HmacError> for OtaFlashWriteError {
-    fn from(e: encrypted::HmacError) -> Self {
-        Self::HmacError(e)
     }
 }
 
@@ -713,7 +705,8 @@ async fn process_encrypted_body(
             ciphertext_len,
             ct,
             &tag_buf,
-        )?;
+        )
+        .await;
         if !hmac_matches {
             warn!("OTA: HMAC verification failed for chunk {}", chunk_index);
             return Err(OtaFlashWriteError::HmacMismatch);
@@ -856,7 +849,7 @@ pub async fn download_and_write_to_flash(
     let mut sha_backend = ShaBackend::new(sha);
     let sha_driver = sha_backend.start();
     // Derive per-manifest subkeys from the encryption key id.
-    let (aes_key, hmac_key) = encrypted::derive_subkeys(master_key, manifest.enc.key_id)?;
+    let (aes_key, hmac_key) = encrypted::derive_subkeys(master_key, manifest.enc.key_id).await;
 
     info!(
         "OTA: enc.key_id={}, nonce_prefix={}",
@@ -871,7 +864,7 @@ pub async fn download_and_write_to_flash(
     let canonical = manifest
         .canonical_unsigned_json()
         .map_err(OtaFlashWriteError::ManifestCanonical)?;
-    let manifest_digest = encrypted::compute_manifest_digest(&canonical);
+    let manifest_digest = encrypted::compute_manifest_digest(&canonical).await;
 
     network::wait_for_config_up(network_stack).await;
 

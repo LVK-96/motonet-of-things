@@ -42,6 +42,28 @@ fn sw_sha256(parts: &[&[u8]]) -> [u8; 32] {
     digest
 }
 
+fn hw_hmac_sha256(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+    let mut k_inner = [0x36u8; 64];
+    let mut k_outer = [0x5Cu8; 64];
+    for i in 0..32 {
+        k_inner[i] ^= key[i];
+        k_outer[i] ^= key[i];
+    }
+
+    let inner = {
+        let mut ctx = esp_hal::sha::Sha256Context::new();
+        ctx.update(&k_inner).wait_blocking();
+        for part in parts {
+            ctx.update(part).wait_blocking();
+        }
+        let mut digest = [0u8; 32];
+        esp_hal::sha::Sha256Context::finalize(&mut ctx, &mut digest).wait_blocking();
+        digest
+    };
+
+    hw_sha256(&[&k_outer, &inner])
+}
+
 fn log_sha_result(label: &str, hw: &[u8; 32], sw: &[u8; 32]) {
     if hw == sw {
         info!("{}: PASSED", label);
@@ -75,11 +97,11 @@ fn sha_isolation_test() {
 
 // ── Test 2: helper used by OTA HMAC/manifest code ───────────────────────
 
-fn ota_sha_helper_test() {
+fn ota_sha_context_test() {
     let test_data = [0xA5u8; 128];
-    let hw = crate::ota::encrypted::hw_sha256(&test_data);
+    let hw = hw_sha256(&[&test_data]);
     let sw = sw_sha256(&[&test_data]);
-    log_sha_result("OTA SHA helper test", &hw, &sw);
+    log_sha_result("SHA context helper test", &hw, &sw);
 }
 
 // ── Test 3: multi-block SHA (input > 64 bytes) ──────────────────────────
@@ -160,10 +182,7 @@ fn hmac_self_test() {
         0xcf, 0xf7,
     ];
 
-    let Ok(hw) = crate::ota::encrypted::hmac_sha256_test(&key, &[data]) else {
-        error!("HMAC self-test: FAILED (input too long)");
-        return;
-    };
+    let hw = hw_hmac_sha256(&key, &[data]);
 
     if hw == rfc_expected {
         info!("HMAC self-test: PASSED");
@@ -246,7 +265,7 @@ pub(crate) fn run_sha_self_test(
     let _aes_driver = aes_backend.start();
 
     sha_isolation_test();
-    ota_sha_helper_test();
+    ota_sha_context_test();
     hmac_self_test();
     sha_multiblock_test();
     sha_sequential_reuse_test();
