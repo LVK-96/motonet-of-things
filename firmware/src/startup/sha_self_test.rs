@@ -349,7 +349,10 @@ fn hmac_self_test() {
         0xcf, 0xf7,
     ];
 
-    let hw_result = crate::ota::encrypted::hmac_sha256_test(&key, &[data]);
+    let Ok(hw_result) = crate::ota::encrypted::hmac_sha256_test(&key, &[data]) else {
+        error!("HMAC self-test: FAILED (input too long)");
+        return;
+    };
     let hw_hex = digest_hex(&hw_result);
     let rfc_hex = digest_hex(&rfc_expected);
 

@@ -94,31 +94,49 @@ pub fn hw_sha256(data: &[u8], sha_peripheral: &esp_hal::peripherals::SHA<'static
 ///
 /// Uses HMAC-SHA256 as a KDF with separate info strings so the two subkeys
 /// are independent.
-#[must_use]
-pub fn derive_subkeys(master: &[u8; 32], key_id: u32) -> ([u8; AES_KEY_SIZE], [u8; HMAC_KEY_SIZE]) {
-    let aes_key = hkdf_expand(master, AES_KEY_INFO, key_id);
-    let hmac_key = hkdf_expand(master, HMAC_KEY_INFO, key_id);
-    (aes_key, hmac_key)
+///
+/// # Errors
+///
+/// Returns [`HmacError::InputTooLong`] if the hardware SHA staging buffer would
+/// overflow.
+pub fn derive_subkeys(
+    master: &[u8; 32],
+    key_id: u32,
+) -> Result<([u8; AES_KEY_SIZE], [u8; HMAC_KEY_SIZE]), HmacError> {
+    let aes_key = hkdf_expand(master, AES_KEY_INFO, key_id)?;
+    let hmac_key = hkdf_expand(master, HMAC_KEY_INFO, key_id)?;
+    Ok((aes_key, hmac_key))
 }
 
 /// Public test-only wrapper for [`hmac_sha256_raw`].
 /// Used by the boot-time HMAC self-test.
+///
+/// # Errors
+///
+/// Returns [`HmacError::InputTooLong`] if the hardware SHA staging buffer would
+/// overflow.
 #[doc(hidden)]
-#[must_use]
-pub fn hmac_sha256_test(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+pub fn hmac_sha256_test(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacError> {
     hmac_sha256_raw(key, parts)
 }
 
 /// HMAC-SHA256-based key expansion: `HMAC-SHA256(prk, info || key_id_be)`.
-fn hkdf_expand(prk: &[u8; 32], info: &[u8], key_id: u32) -> [u8; 32] {
+fn hkdf_expand(prk: &[u8; 32], info: &[u8], key_id: u32) -> Result<[u8; 32], HmacError> {
     let key_id_be = key_id.to_be_bytes();
     hmac_sha256_raw(prk, &[info, &key_id_be])
 }
 
 // ── HMAC-SHA256 ─────────────────────────────────────────────────────
 
+/// HMAC-SHA256 error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HmacError {
+    /// HMAC input exceeded the fixed hardware-SHA staging buffer.
+    InputTooLong,
+}
+
 /// Compute HMAC-SHA256 with a 32-byte key, streaming over multiple input parts.
-fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacError> {
     let mut k_inner = [IPAD; HMAC_BLOCK_SIZE];
     let mut k_outer = [OPAD; HMAC_BLOCK_SIZE];
 
@@ -135,9 +153,11 @@ fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
                 HMAC_BLOCK_SIZE + HMAC_TAG_SIZE + 32 + 4 + 4 + 4 + ota_core::ENC_CHUNK_SIZE as usize
             },
         > = heapless::Vec::new();
-        data.extend_from_slice(&k_inner).ok();
+        data.extend_from_slice(&k_inner)
+            .map_err(|_| HmacError::InputTooLong)?;
         for part in parts {
-            data.extend_from_slice(part).ok();
+            data.extend_from_slice(part)
+                .map_err(|_| HmacError::InputTooLong)?;
         }
         let sha = unsafe { crate::ota::sha_ref() };
         hw_sha256(&data, sha)
@@ -154,7 +174,7 @@ fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
     };
 
     // Outer: SHA256(k_opad || inner)
-    if USE_HARDWARE_SHA {
+    let digest = if USE_HARDWARE_SHA {
         let sha = unsafe { crate::ota::sha_ref() };
         let mut data = [0u8; HMAC_BLOCK_SIZE + SHA256_OUTPUT_SIZE];
         data[..HMAC_BLOCK_SIZE].copy_from_slice(&k_outer);
@@ -168,7 +188,8 @@ fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
         let mut digest = [0u8; SHA256_OUTPUT_SIZE];
         digest.copy_from_slice(&result);
         digest
-    }
+    };
+    Ok(digest)
 }
 
 // ── Manifest digest ───────────────────────────────────────────────────────
@@ -211,7 +232,11 @@ pub fn sha256_digest(data: &[u8]) -> [u8; SHA256_OUTPUT_SIZE] {
 ///
 /// Authenticated input (in order):
 /// `MOTONET-OTA-CHUNK-v2 || manifest_digest[32] || chunk_index_u32_be || plaintext_offset_u32_be || plaintext_len_u32_be || ciphertext`
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`HmacError::InputTooLong`] if the hardware SHA staging buffer would
+/// overflow.
 pub fn compute_chunk_hmac(
     hmac_key: &[u8; HMAC_KEY_SIZE],
     manifest_digest: &[u8; SHA256_OUTPUT_SIZE],
@@ -219,7 +244,7 @@ pub fn compute_chunk_hmac(
     plaintext_offset: u32,
     plaintext_len: u32,
     ciphertext: &[u8],
-) -> [u8; HMAC_TAG_SIZE] {
+) -> Result<[u8; HMAC_TAG_SIZE], HmacError> {
     let chunk_index_be = chunk_index.to_be_bytes();
     let plaintext_offset_be = plaintext_offset.to_be_bytes();
     let plaintext_len_be = plaintext_len.to_be_bytes();
@@ -239,7 +264,11 @@ pub fn compute_chunk_hmac(
 /// Verify a chunk HMAC tag in constant time.
 ///
 /// Returns `true` if `tag` matches the computed HMAC.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`HmacError::InputTooLong`] if the hardware SHA staging buffer would
+/// overflow.
 pub fn verify_chunk_hmac(
     hmac_key: &[u8; HMAC_KEY_SIZE],
     manifest_digest: &[u8; SHA256_OUTPUT_SIZE],
@@ -248,7 +277,7 @@ pub fn verify_chunk_hmac(
     plaintext_len: u32,
     ciphertext: &[u8],
     tag: &[u8; HMAC_TAG_SIZE],
-) -> bool {
+) -> Result<bool, HmacError> {
     let expected = compute_chunk_hmac(
         hmac_key,
         manifest_digest,
@@ -256,8 +285,8 @@ pub fn verify_chunk_hmac(
         plaintext_offset,
         plaintext_len,
         ciphertext,
-    );
-    constant_time_eq(&expected, tag)
+    )?;
+    Ok(constant_time_eq(&expected, tag))
 }
 
 /// Constant-time byte comparison.

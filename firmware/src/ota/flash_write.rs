@@ -108,6 +108,8 @@ pub enum OtaFlashWriteError {
     InvalidNoncePrefix,
     /// HMAC tag verification failed for a chunk.
     HmacMismatch,
+    /// HMAC computation failed before tag comparison.
+    HmacError(encrypted::HmacError),
     /// AES hardware operation failed during decryption.
     AesError(encrypted::AesError),
     /// OTA v2 stream header too short.
@@ -152,6 +154,12 @@ impl From<encrypted::OtaHeaderError> for OtaFlashWriteError {
             encrypted::OtaHeaderError::InvalidVersion => Self::HeaderInvalidVersion,
             encrypted::OtaHeaderError::ReservedNonZero => Self::HeaderInvalidReserved,
         }
+    }
+}
+
+impl From<encrypted::HmacError> for OtaFlashWriteError {
+    fn from(e: encrypted::HmacError) -> Self {
+        Self::HmacError(e)
     }
 }
 
@@ -400,8 +408,8 @@ fn ota_tls_verify_for_url(url: &str) -> TlsVerify<'static> {
 struct EncryptedResult {
     total_plaintext: u32,
     digest: [u8; 32],
-    first_bytes: [u8; ESP_IMAGE_PREFIX_LEN],
-    first_filled: usize,
+    readback_len: usize,
+    readback_digest: [u8; encrypted::SHA256_OUTPUT_SIZE],
 }
 
 /// Fetch the v2 encrypted OTA payload and process it chunk-by-chunk:
@@ -668,6 +676,8 @@ async fn process_encrypted_body(
     let mut total_plaintext: u32 = 0;
     let mut flash_offset: u32 = 0;
     let mut sha_hasher = sha2::Sha256::new();
+    let mut readback_hasher = sha2::Sha256::new();
+    let mut readback_len = 0usize;
     let mut len_buf = [0u8; 4];
     let mut tag_buf = [0u8; encrypted::HMAC_TAG_SIZE];
     // Reusable static ciphertext buffer sized to the maximum chunk. Keeping
@@ -695,7 +705,7 @@ async fn process_encrypted_body(
         read_exact(&mut reader, ct).await?;
         read_exact(&mut reader, &mut tag_buf).await?;
 
-        if !encrypted::verify_chunk_hmac(
+        let hmac_matches = encrypted::verify_chunk_hmac(
             hmac_key,
             manifest_digest,
             chunk_index,
@@ -703,7 +713,8 @@ async fn process_encrypted_body(
             ciphertext_len,
             ct,
             &tag_buf,
-        ) {
+        )?;
+        if !hmac_matches {
             warn!("OTA: HMAC verification failed for chunk {}", chunk_index);
             return Err(OtaFlashWriteError::HmacMismatch);
         }
@@ -724,8 +735,14 @@ async fn process_encrypted_body(
             }
         }
 
-        Storage::write(region, flash_offset, plaintext).map_err(OtaFlashWriteError::from)?;
-        sha2::Digest::update(&mut sha_hasher, plaintext);
+        Storage::write(region, flash_offset, &*plaintext).map_err(OtaFlashWriteError::from)?;
+        sha2::Digest::update(&mut sha_hasher, &*plaintext);
+        let readback_remaining = FLASH_READBACK_LEN.saturating_sub(readback_len);
+        if readback_remaining > 0 {
+            let copy = plaintext.len().min(readback_remaining);
+            sha2::Digest::update(&mut readback_hasher, &plaintext[..copy]);
+            readback_len += copy;
+        }
 
         flash_offset += ciphertext_len;
         total_plaintext += ciphertext_len;
@@ -743,11 +760,15 @@ async fn process_encrypted_body(
     let result = sha2::Digest::finalize(sha_hasher);
     digest.copy_from_slice(&result);
 
+    let mut readback_digest = [0u8; encrypted::SHA256_OUTPUT_SIZE];
+    let result = sha2::Digest::finalize(readback_hasher);
+    readback_digest.copy_from_slice(&result);
+
     Ok(EncryptedResult {
         total_plaintext,
         digest,
-        first_bytes,
-        first_filled,
+        readback_len,
+        readback_digest,
     })
 }
 
@@ -782,15 +803,20 @@ fn verify_flash_readback<F: ReadStorage>(
     region: &mut FlashRegion<'_, F>,
     result: &EncryptedResult,
 ) -> Result<(), OtaFlashWriteError> {
-    let readback_len = FLASH_READBACK_LEN.min(result.total_plaintext as usize);
     let mut readback = [0u8; FLASH_READBACK_LEN];
-    ReadStorage::read(region, 0, &mut readback[..readback_len])
+    ReadStorage::read(region, 0, &mut readback[..result.readback_len])
         .map_err(OtaFlashWriteError::from)?;
-    let compare_len = result.first_filled.min(readback_len);
-    if readback[..compare_len] != result.first_bytes[..compare_len] {
+
+    let mut readback_hasher = sha2::Sha256::new();
+    sha2::Digest::update(&mut readback_hasher, &readback[..result.readback_len]);
+    let mut readback_digest = [0u8; encrypted::SHA256_OUTPUT_SIZE];
+    let digest = sha2::Digest::finalize(readback_hasher);
+    readback_digest.copy_from_slice(&digest);
+
+    if readback_digest != result.readback_digest {
         warn!(
             "OTA: flash readback mismatch (first {} bytes differ)",
-            compare_len
+            result.readback_len
         );
         return Err(OtaFlashWriteError::FlashVerifyFailed);
     }
@@ -830,7 +856,7 @@ pub async fn download_and_write_to_flash(
     let mut sha_backend = ShaBackend::new(sha);
     let sha_driver = sha_backend.start();
     // Derive per-manifest subkeys from the encryption key id.
-    let (aes_key, hmac_key) = encrypted::derive_subkeys(master_key, manifest.enc.key_id);
+    let (aes_key, hmac_key) = encrypted::derive_subkeys(master_key, manifest.enc.key_id)?;
 
     info!(
         "OTA: enc.key_id={}, nonce_prefix={}",
@@ -893,7 +919,7 @@ pub async fn download_and_write_to_flash(
     );
     info!(
         "OTA: readback verified (first {} bytes match)",
-        stream_result.first_filled.min(FLASH_READBACK_LEN)
+        stream_result.readback_len
     );
 
     // Phase 4: activate and reboot.
