@@ -19,6 +19,7 @@ pulse_sw = []
 pulse_rmt = []
 ota-rollback-test = []
 release-ota = []
+sha-self-test = []
 rsa-self-test = []
 
 [dependencies]
@@ -31,26 +32,26 @@ rsa-verify-core = { path = "../crates/rsa-verify-core" }
 telemetry-core = { path = "../crates/telemetry-core" }
 
 defmt = "1.1.0"
-esp-hal = { version = "~1.1", features = ["defmt", "esp32", "unstable"] }
-esp-rtos = { version = "0.3.0", features = [
+esp-hal = { git = "https://github.com/esp-rs/esp-hal", branch = "main", features = ["defmt", "esp32", "unstable"] }
+esp-rtos = { git = "https://github.com/esp-rs/esp-hal", branch = "main", features = [
   "defmt",
   "embassy",
   "esp-alloc",
   "esp32",
   "esp-radio",
 ] }
-esp-bootloader-esp-idf = { version = "0.5.0", features = ["defmt", "esp32"] }
-esp-storage = { version = "0.9", features = ["esp32", "defmt"] }
+esp-bootloader-esp-idf = { git = "https://github.com/esp-rs/esp-hal", branch = "main", features = ["defmt", "esp32", "embedded-storage"] }
+esp-storage = { git = "https://github.com/esp-rs/esp-hal", branch = "main", features = ["esp32", "defmt", "embedded-storage"] }
 embedded-storage = "0.3"
 embassy-executor = { version = "0.10.0", features = ["defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime-ms"] }
 embassy-sync = { version = "0.8.0", features = ["defmt"] }
 embassy-futures = { version = "0.1.2" }
 embassy-net = { version = "0.9.1", features = ["defmt", "tcp", "udp", "dhcpv4", "dns", "medium-ethernet"] }
-esp-alloc = { version = "0.10.0", features = ["defmt"] }
-esp-println = { version = "0.17.0", features = ["esp32", "defmt-espflash"] }
+esp-alloc = { git = "https://github.com/esp-rs/esp-hal", branch = "main", features = ["defmt"] }
+esp-println = { git = "https://github.com/esp-rs/esp-hal", branch = "main", features = ["esp32", "defmt-espflash"] }
 nb = "1.1"
-esp-radio = { version = "0.18.0", features = [
+esp-radio = { git = "https://github.com/esp-rs/esp-hal", branch = "main", features = [
   "esp32",
   "wifi",
   "defmt",

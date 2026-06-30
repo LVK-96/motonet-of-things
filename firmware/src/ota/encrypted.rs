@@ -109,15 +109,20 @@ pub fn derive_subkeys(
 }
 
 /// Public test-only wrapper for [`hmac_sha256_raw`].
-/// Used by the boot-time HMAC self-test.
+/// Used by the boot-time HMAC self-test before the global OTA SHA peripheral is
+/// initialized.
 ///
 /// # Errors
 ///
 /// Returns [`HmacError::InputTooLong`] if the hardware SHA staging buffer would
 /// overflow.
 #[doc(hidden)]
-pub fn hmac_sha256_test(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacError> {
-    hmac_sha256_raw(key, parts)
+pub fn hmac_sha256_test(
+    key: &[u8; 32],
+    parts: &[&[u8]],
+    sha_peripheral: &esp_hal::peripherals::SHA<'static>,
+) -> Result<[u8; 32], HmacError> {
+    hmac_sha256_raw_with_sha(key, parts, HardwareShaSource::Borrowed(sha_peripheral))
 }
 
 /// HMAC-SHA256-based key expansion: `HMAC-SHA256(prk, info || key_id_be)`.
@@ -135,8 +140,34 @@ pub enum HmacError {
     InputTooLong,
 }
 
+#[derive(Clone, Copy)]
+enum HardwareShaSource<'a> {
+    Global,
+    Borrowed(&'a esp_hal::peripherals::SHA<'static>),
+}
+
+impl HardwareShaSource<'_> {
+    fn sha256(self, data: &[u8]) -> [u8; SHA256_OUTPUT_SIZE] {
+        match self {
+            Self::Global => {
+                let sha = unsafe { crate::ota::sha_ref() };
+                hw_sha256(data, sha)
+            }
+            Self::Borrowed(sha) => hw_sha256(data, sha),
+        }
+    }
+}
+
 /// Compute HMAC-SHA256 with a 32-byte key, streaming over multiple input parts.
 fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacError> {
+    hmac_sha256_raw_with_sha(key, parts, HardwareShaSource::Global)
+}
+
+fn hmac_sha256_raw_with_sha(
+    key: &[u8; 32],
+    parts: &[&[u8]],
+    sha_source: HardwareShaSource<'_>,
+) -> Result<[u8; 32], HmacError> {
     let mut k_inner = [IPAD; HMAC_BLOCK_SIZE];
     let mut k_outer = [OPAD; HMAC_BLOCK_SIZE];
 
@@ -159,8 +190,7 @@ fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacErro
             data.extend_from_slice(part)
                 .map_err(|_| HmacError::InputTooLong)?;
         }
-        let sha = unsafe { crate::ota::sha_ref() };
-        hw_sha256(&data, sha)
+        sha_source.sha256(&data)
     } else {
         let mut hasher = sha2::Sha256::new();
         hasher.update(k_inner);
@@ -175,11 +205,10 @@ fn hmac_sha256_raw(key: &[u8; 32], parts: &[&[u8]]) -> Result<[u8; 32], HmacErro
 
     // Outer: SHA256(k_opad || inner)
     let digest = if USE_HARDWARE_SHA {
-        let sha = unsafe { crate::ota::sha_ref() };
         let mut data = [0u8; HMAC_BLOCK_SIZE + SHA256_OUTPUT_SIZE];
         data[..HMAC_BLOCK_SIZE].copy_from_slice(&k_outer);
         data[HMAC_BLOCK_SIZE..].copy_from_slice(&inner);
-        hw_sha256(&data, sha)
+        sha_source.sha256(&data)
     } else {
         let mut hasher = sha2::Sha256::new();
         hasher.update(k_outer);

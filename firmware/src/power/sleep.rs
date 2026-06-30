@@ -1,26 +1,31 @@
-use core::time::Duration;
-
 use defmt::{Debug2Format, info, warn};
 use esp_hal::rtc_cntl::{
-    Rtc,
+    Rtc, WakeupReason,
     sleep::{Ext0WakeupSource, RtcSleepConfig, TimerWakeupSource, WakeupLevel},
     wakeup_cause,
 };
-use esp_hal::system::SleepSource;
+use esp_hal::time::Duration;
 
 const DEEP_SLEEP_LOG_FLUSH_DELAY_US: u32 = 20_000;
 
 #[must_use]
 pub fn wake_reason_class() -> &'static str {
-    match wakeup_cause() {
-        SleepSource::Undefined => "cold_boot",
-        SleepSource::Timer => "timer_wake",
-        SleepSource::Ext0
-        | SleepSource::Ext1
-        | SleepSource::Gpio
-        | SleepSource::Uart
-        | SleepSource::TouchPad => "ui_wake",
-        _ => "other",
+    let cause = wakeup_cause();
+    if cause == WakeupReason::NoSleep {
+        "cold_boot"
+    } else if cause.contains(WakeupReason::Timer) {
+        "timer_wake"
+    } else if cause.intersects(
+        WakeupReason::Ext0
+            | WakeupReason::Ext1
+            | WakeupReason::Gpio
+            | WakeupReason::Uart0
+            | WakeupReason::Uart1
+            | WakeupReason::Touch,
+    ) {
+        "ui_wake"
+    } else {
+        "other"
     }
 }
 
@@ -32,7 +37,7 @@ pub fn log_wakeup_cause() {
         Debug2Format(&esp_hal::system::reset_reason())
     );
     info!("Wake cause: {:?} ({})", cause, class);
-    if matches!(cause, SleepSource::Undefined) {
+    if cause == WakeupReason::NoSleep {
         info!("PowerSave: cold boot (not waking from deep sleep)");
     } else {
         info!("PowerSave: exited deep sleep (wake class: {})", class);

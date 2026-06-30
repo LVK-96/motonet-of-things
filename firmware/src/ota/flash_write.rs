@@ -329,8 +329,8 @@ fn sha256_hex(digest: &[u8; 32]) -> String<64> {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::cast_possible_truncation)]
-fn prepare_inactive_slot<F: NorFlash>(
-    region: &mut FlashRegion<'_, F>,
+fn prepare_inactive_slot(
+    region: &mut FlashRegion<'_, '_>,
     image_bytes: u32,
 ) -> Result<(), OtaFlashWriteError> {
     let slot_size = region.partition_size() as u32;
@@ -419,7 +419,7 @@ struct EncryptedResult {
 async fn fetch_and_process_encrypted(
     network_stack: Stack<'static>,
     manifest: &OtaManifest,
-    region: &mut FlashRegion<'_, FlashStorage<'static>>,
+    region: &mut FlashRegion<'_, '_>,
     nonce_prefix: &[u8; 12],
     hmac_key: &[u8; encrypted::HMAC_KEY_SIZE],
     aes_key: &[u8; encrypted::AES_KEY_SIZE],
@@ -658,7 +658,7 @@ async fn read_exact(
 #[allow(clippy::too_many_arguments)]
 async fn process_encrypted_body(
     mut reader: impl embedded_io_async::BufRead,
-    region: &mut FlashRegion<'_, FlashStorage<'static>>,
+    region: &mut FlashRegion<'_, '_>,
     nonce_prefix: &[u8; 12],
     hmac_key: &[u8; encrypted::HMAC_KEY_SIZE],
     aes_key: &[u8; encrypted::AES_KEY_SIZE],
@@ -799,8 +799,8 @@ fn post_verify(result: &EncryptedResult, manifest: &OtaManifest) -> Result<(), O
     Ok(())
 }
 
-fn verify_flash_readback<F: ReadStorage>(
-    region: &mut FlashRegion<'_, F>,
+fn verify_flash_readback(
+    region: &mut FlashRegion<'_, '_>,
     result: &EncryptedResult,
 ) -> Result<(), OtaFlashWriteError> {
     let mut readback = [0u8; FLASH_READBACK_LEN];

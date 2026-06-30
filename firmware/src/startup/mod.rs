@@ -5,7 +5,7 @@ use embassy_executor::Spawner;
 mod hardware;
 #[cfg(not(feature = "ota-rollback-test"))]
 mod hw_context;
-#[cfg(not(feature = "ota-rollback-test"))]
+#[cfg(all(not(feature = "ota-rollback-test"), feature = "sha-self-test"))]
 mod sha_self_test;
 #[cfg(not(feature = "ota-rollback-test"))]
 mod spawn;

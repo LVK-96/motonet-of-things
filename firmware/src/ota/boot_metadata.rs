@@ -1,10 +1,10 @@
 use defmt::{Debug2Format, info};
-use embedded_storage::Storage;
 use esp_bootloader_esp_idf::{
     ota::OtaImageState,
     ota_updater::OtaUpdater,
     partitions::{AppPartitionSubType, Error, FlashRegion, PARTITION_TABLE_MAX_LEN},
 };
+use esp_storage::FlashStorage;
 
 /// Minimal wrapper around ESP-IDF OTA boot metadata.
 ///
@@ -13,17 +13,11 @@ use esp_bootloader_esp_idf::{
 /// (currently the shared `app_bus::FLASH` mutex). The wrapper does not retain
 /// the storage; the caller must keep it alive for the lifetime of the
 /// `OtaBootMetadata`.
-pub struct OtaBootMetadata<'a, F>
-where
-    F: Storage,
-{
-    updater: OtaUpdater<'a, F>,
+pub struct OtaBootMetadata<'a, 'd> {
+    updater: OtaUpdater<'a, 'd>,
 }
 
-impl<'a, F> OtaBootMetadata<'a, F>
-where
-    F: Storage,
-{
+impl<'a, 'd> OtaBootMetadata<'a, 'd> {
     /// Create an OTA boot metadata accessor from flash storage.
     ///
     /// # Errors
@@ -31,7 +25,7 @@ where
     /// Returns an ESP bootloader partition/OTA error if the partition table or
     /// OTA data partition cannot be read/validated.
     pub fn new(
-        flash: &'a mut F,
+        flash: &'a mut FlashStorage<'d>,
         partition_table: &'a mut [u8; PARTITION_TABLE_MAX_LEN],
     ) -> Result<Self, Error> {
         Ok(Self {
@@ -106,7 +100,7 @@ where
     /// Returns an OTA metadata/partition error if no inactive slot can be found.
     pub fn inactive_partition(
         &mut self,
-    ) -> Result<(FlashRegion<'_, F>, AppPartitionSubType), Error> {
+    ) -> Result<(FlashRegion<'_, 'd>, AppPartitionSubType), Error> {
         let (region, slot) = self.updater.next_partition()?;
         info!(
             "OTA boot metadata: inactive slot selected for update={:?}",

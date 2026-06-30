@@ -79,11 +79,14 @@ pub(crate) async fn hw_setup(spawner: &Spawner) -> HWContext {
 
     let peripherals = hardware::system_setup();
 
-    // SHA-256 hardware vs software self-test — runs once at boot.
-    crate::startup::sha_self_test::run_sha_self_test(
-        unsafe { peripherals.SHA.clone_unchecked() },
-        unsafe { peripherals.AES.clone_unchecked() },
-    );
+    #[cfg(feature = "sha-self-test")]
+    {
+        // SHA-256 hardware vs software self-test — runs once at boot.
+        crate::startup::sha_self_test::run_sha_self_test(
+            unsafe { peripherals.SHA.clone_unchecked() },
+            unsafe { peripherals.AES.clone_unchecked() },
+        );
+    }
 
     // SAFETY: initialised exactly once, before any task accesses them.
     unsafe {

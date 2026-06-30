@@ -40,7 +40,16 @@ esp-build:
     cp -n firmware/src/secrets.rs.example firmware/src/secrets.rs
     cargo build -Zbuild-std=core,alloc --release
 
-flash:
-    cd firmware && cargo run --release
+self_test_features := "sha-self-test,rsa-self-test"
+
+esp-self-test-build:
+    cp -n firmware/src/secrets.rs.example firmware/src/secrets.rs
+    cargo build -Zbuild-std=core,alloc --release --features {{self_test_features}}
+
+flash features="":
+    cd firmware && cargo run --release {{features}}
+
+flash-self-test:
+    just flash "--features {{self_test_features}}"
 
 verify: fmt-check esp-clippy host-clippy host-test esp-check

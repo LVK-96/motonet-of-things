@@ -14,7 +14,7 @@ use esp_hal::efuse;
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
 use esp_radio::wifi::{
-    self, Config as WifiConfig, ControllerConfig, Interface, WifiController, sta::StationConfig,
+    Config as WifiConfig, ControllerConfig, Interface, WifiController, sta::StationConfig,
 };
 use static_cell::StaticCell;
 
@@ -103,7 +103,8 @@ pub fn setup_network_stack(
     info!("NET[{}]: Setting up WiFi stack", power::wake_reason_class());
 
     let initial_config = build_client_config();
-    let (wifi_controller, interfaces) = wifi::new(
+    let wifi_interface = Interface::station();
+    let wifi_controller = WifiController::new(
         wifi_device,
         ControllerConfig::default().with_initial_config(initial_config),
     )
@@ -113,7 +114,7 @@ pub fn setup_network_stack(
     let stack_config = build_stack_config();
     let stack_seed = derive_network_seed();
 
-    let (stack, runner) = embassy_net::new(interfaces.station, stack_config, resources, stack_seed);
+    let (stack, runner) = embassy_net::new(wifi_interface, stack_config, resources, stack_seed);
     info!(
         "NET[{}]: Stack seed derived from hardware entropy",
         power::wake_reason_class()
@@ -211,7 +212,7 @@ pub async fn wait_for_config_up(stack: embassy_net::Stack<'static>) {
 }
 
 #[embassy_executor::task]
-async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
+async fn net_task(mut runner: Runner<'static, Interface>) {
     runner.run().await;
 }
 

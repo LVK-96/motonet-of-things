@@ -330,7 +330,7 @@ fn sha_sequential_reuse_test() {
 // ── Test 5: HMAC self-test ──────────────────────────────────────────
 
 #[allow(clippy::unwrap_used)]
-fn hmac_self_test() {
+fn hmac_self_test(sha_peripheral: &esp_hal::peripherals::SHA<'static>) {
     // Known test vectors for HMAC-SHA256.
     // RFC 4231 Test Case 1:
     //   key = 0x0b * 20
@@ -349,7 +349,8 @@ fn hmac_self_test() {
         0xcf, 0xf7,
     ];
 
-    let Ok(hw_result) = crate::ota::encrypted::hmac_sha256_test(&key, &[data]) else {
+    let Ok(hw_result) = crate::ota::encrypted::hmac_sha256_test(&key, &[data], sha_peripheral)
+    else {
         error!("HMAC self-test: FAILED (input too long)");
         return;
     };
@@ -420,8 +421,9 @@ pub(crate) fn run_sha_self_test(
     sha_peripheral: esp_hal::peripherals::SHA<'static>,
     aes_peripheral: esp_hal::peripherals::AES<'static>,
 ) {
-    // Test the corrected hardware SHA before it's consumed by ShaBackend.
+    // Test the corrected hardware SHA/HMAC before SHA is consumed by ShaBackend.
     hw_sha_mitigated_test(&sha_peripheral);
+    hmac_self_test(&sha_peripheral);
 
     let mut hw_backend = esp_hal::sha::ShaBackend::new(sha_peripheral);
     let _hw_driver = hw_backend.start();
@@ -432,7 +434,6 @@ pub(crate) fn run_sha_self_test(
     sha_multiblock_test();
     sha_sequential_reuse_test();
     hmac_simplified_test();
-    hmac_self_test();
     sha_concurrent_test();
     sha_clockgate_after_aes_test();
     sha_clockgate_restore_test();
