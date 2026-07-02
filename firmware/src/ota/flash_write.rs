@@ -1,21 +1,13 @@
-//! Flash-aware OTA download for **v2 encrypted** firmware.
-//!
-//! The pipeline decrypts and verifies each chunk on the fly using the ESP32
-//! hardware AES and SHA accelerators (via `esp-hal` work-queue contexts).
-//!
-//! 1. [`prepare_inactive_slot`] — size check + sector-aligned erase.
-//! 2. [`fetch_and_process_encrypted`] — HTTP fetch, v2 header validation,
-//!    chunk HMAC verify → AES-CTR decrypt → flash write + SHA-256 hash.
-//! 3. [`post_verify`] + [`verify_flash_readback`] — manifest and
-//!    readback checks against the decrypted result.
-//! 4. Activate the new slot, mark the app `New`, and reboot.
-
 use alloc::boxed::Box;
 
+use core::cell::Cell;
 use core::mem::MaybeUninit;
 use core::net::{IpAddr, Ipv4Addr};
 use core::ptr::addr_of_mut;
+use core::ptr::write_bytes;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use critical_section::Mutex;
 
 use defmt::{Debug2Format, info, warn};
 use embassy_net::{
@@ -52,35 +44,15 @@ use crate::ota::encrypted;
 use crate::secrets;
 use crate::tls_workspace::TlsWorkspaceGuard;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Buffer size for each direction of the OTA download TCP socket.
 const OTA_TCP_BUF_SIZE: usize = 4096;
-/// ESP32 flash sector size used for erase alignment.
 const FLASH_SECTOR_SIZE: u32 = 4096;
-/// Maximum HTTP header bytes buffered for a response.
-///
-/// GitHub release downloads first return a large redirect response with many
-/// security/cache headers; the current max measured block is about 5.1 KiB, so
-/// keep 8 KiB to leave redirect-query churn margin without spending 16 KiB.
 const HTTP_HEADER_BUF_SIZE: usize = 8 * 1024;
 const OTA_HTTP_READ_TIMEOUT_SECS: u64 = 10;
 const TLS_WORKSPACE_WAIT_ATTEMPTS: usize = 250;
 const TLS_WORKSPACE_WAIT_INTERVAL_MS: u64 = 100;
-/// Number of leading bytes of the image retained for ESP prefix validation.
 const ESP_IMAGE_PREFIX_LEN: usize = 64;
-/// Number of bytes read back from flash for post-write verification.
-/// The first sector (4096 bytes) covers the ESP image header and
-/// early boot data that would cause catastrophic failures if corrupt.
 const FLASH_READBACK_LEN: usize = 4096;
 
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
-/// Combined error for the flash-write OTA pipeline.
 #[derive(Debug)]
 pub enum OtaFlashWriteError {
     Partition(PartitionError),
@@ -104,25 +76,25 @@ pub enum OtaFlashWriteError {
         image_size: u32,
         slot_size: u32,
     },
-    /// Bad nonce prefix hex in manifest.
+    /// Bad nonce prefix hex in manifest
     InvalidNoncePrefix,
-    /// HMAC tag verification failed for a chunk.
+    /// HMAC tag verification failed for a chunk
     HmacMismatch,
-    /// AES hardware operation failed during decryption.
+    /// AES hardware operation failed during decryption
     AesError(encrypted::AesError),
-    /// OTA v2 stream header too short.
+    /// OTA stream header too short
     HeaderTooShort,
-    /// OTA v2 stream header has invalid magic.
+    /// OTA stream header has invalid magic
     HeaderInvalidMagic,
-    /// OTA v2 stream header has unsupported version.
+    /// OTA stream header has unsupported version
     HeaderInvalidVersion,
-    /// OTA v2 stream header has non-zero reserved bytes.
+    /// OTA stream header has non-zero reserved bytes
     HeaderInvalidReserved,
-    /// Chunk truncated before HMAC tag.
+    /// Chunk truncated before HMAC tag
     ChunkTruncated,
-    /// Heap allocation failed for OTA network scratch buffers.
+    /// Heap allocation failed for OTA network scratch buffers
     OutOfMemory,
-    /// Manifest canonical JSON construction failed.
+    /// Manifest canonical JSON construction failed
     ManifestCanonical(ManifestError),
 }
 
@@ -189,10 +161,6 @@ impl From<reqwless::Error> for OtaFlashWriteError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DNS adapter
-// ---------------------------------------------------------------------------
-
 #[derive(Debug)]
 enum OtaDnsError {
     Lookup,
@@ -257,19 +225,45 @@ fn parse_ipv4_literal(host: &str) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(octets))
 }
 
-// ---------------------------------------------------------------------------
-// Shared TCP client pool (one concurrent connection)
-// ---------------------------------------------------------------------------
-
 static TCP_CLIENT_READY: AtomicBool = AtomicBool::new(false);
 static mut TCP_CLIENT_BUF: MaybeUninit<TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE>> =
     MaybeUninit::uninit();
 
 #[esp_hal::ram(reclaimed)]
-static mut OTA_HTTP_HEADER_BUF: MaybeUninit<[u8; HTTP_HEADER_BUF_SIZE]> = MaybeUninit::uninit();
-#[esp_hal::ram(reclaimed)]
-static mut OTA_CHUNK_BUF: MaybeUninit<[u8; ota_core::ENC_CHUNK_SIZE as usize]> =
+static mut OTA_HTTP_HEADER_BUF_UNINIT: MaybeUninit<[u8; HTTP_HEADER_BUF_SIZE]> =
     MaybeUninit::uninit();
+#[esp_hal::ram(reclaimed)]
+static mut OTA_CHUNK_BUF_UNINIT: MaybeUninit<[u8; ota_core::ENC_CHUNK_SIZE as usize]> =
+    MaybeUninit::uninit();
+static OTA_HTTP_HEADER_BUF_INIT: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
+static OTA_CHUNK_BUF_INIT: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
+
+fn init_reclaimed_ram<const N: usize>(
+    buf: *mut MaybeUninit<[u8; N]>,
+    initialized: bool,
+) -> &'static mut [u8; N] {
+    if !initialized {
+        unsafe {
+            write_bytes((*buf).as_mut_ptr().cast::<u8>(), 0, N);
+        }
+    }
+
+    unsafe { &mut *(*buf).as_mut_ptr() }
+}
+
+fn ota_http_header_buf() -> &'static mut [u8; HTTP_HEADER_BUF_SIZE] {
+    critical_section::with(|cs| {
+        let initialized = OTA_HTTP_HEADER_BUF_INIT.borrow(cs).get();
+        init_reclaimed_ram(addr_of_mut!(OTA_HTTP_HEADER_BUF_UNINIT), initialized)
+    })
+}
+
+fn ota_chunk_buf() -> &'static mut [u8; ota_core::ENC_CHUNK_SIZE as usize] {
+    critical_section::with(|cs| {
+        let initialized = OTA_CHUNK_BUF_INIT.borrow(cs).get();
+        init_reclaimed_ram(addr_of_mut!(OTA_CHUNK_BUF_UNINIT), initialized)
+    })
+}
 
 fn tcp_client_state() -> &'static mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE> {
     let raw: *mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TCP_BUF_SIZE> =
@@ -282,23 +276,7 @@ fn tcp_client_state() -> &'static mut TcpClientState<1, OTA_TCP_BUF_SIZE, OTA_TC
     unsafe { &mut *raw }
 }
 
-fn ota_http_header_buf() -> &'static mut [u8; HTTP_HEADER_BUF_SIZE] {
-    unsafe { (*addr_of_mut!(OTA_HTTP_HEADER_BUF)).assume_init_mut() }
-}
-
-fn ota_chunk_buf() -> &'static mut [u8; ota_core::ENC_CHUNK_SIZE as usize] {
-    // SAFETY: the OTA task serializes downloads; this buffer is borrowed by
-    // one encrypted-body processor at a time.
-    unsafe { (*addr_of_mut!(OTA_CHUNK_BUF)).assume_init_mut() }
-}
-
-// ---------------------------------------------------------------------------
-// SHA-256 hex helper
-// ---------------------------------------------------------------------------
-
 /// Convert a 32-byte SHA-256 digest to a 64-char lowercase hex string.
-///
-/// Uses a manual hex table so the conversion is infallible.
 #[allow(clippy::unwrap_used)]
 fn sha256_hex(digest: &[u8; 32]) -> String<64> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -315,10 +293,6 @@ fn sha256_hex(digest: &[u8; 32]) -> String<64> {
     // SAFETY: `vec` contains only valid UTF-8 (same hex chars).
     unsafe { String::from_utf8_unchecked(vec) }
 }
-
-// ---------------------------------------------------------------------------
-// Phase 1: prepare the inactive slot
-// ---------------------------------------------------------------------------
 
 #[allow(clippy::cast_possible_truncation)]
 fn prepare_inactive_slot(
@@ -349,10 +323,6 @@ fn prepare_inactive_slot(
     info!("OTA: erase complete");
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Phase 2: HTTP(S) fetch + encrypted stream processing
-// ---------------------------------------------------------------------------
 
 const OTA_HTTP_HEADERS: &[(&str, &str)] = &[
     ("User-Agent", "motonet-of-things-esp32-ota"),
@@ -404,7 +374,7 @@ struct EncryptedResult {
     readback_digest: [u8; encrypted::SHA256_OUTPUT_SIZE],
 }
 
-/// Fetch the v2 encrypted OTA payload and process it chunk-by-chunk:
+/// Fetch the OTA payload and process it chunk-by-chunk:
 /// validate the 16-byte header, verify HMAC, decrypt, write plaintext to
 /// flash, and accumulate a SHA-256 hash of the plaintext.
 #[allow(clippy::too_many_lines)]
@@ -765,10 +735,6 @@ async fn process_encrypted_body(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Phase 3: post-download verification
-// ---------------------------------------------------------------------------
-
 fn post_verify(result: &EncryptedResult, manifest: &OtaManifest) -> Result<(), OtaFlashWriteError> {
     if result.total_plaintext != manifest.image_size {
         warn!(
@@ -816,17 +782,8 @@ fn verify_flash_readback(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Top-level entry point
-// ---------------------------------------------------------------------------
-
 /// Download the v2 encrypted OTA firmware and stream it to the inactive
-/// flash partition. On success, activates the new slot and reboots.
-///
-/// The AES and SHA hardware-accelerator backends must already be started
-/// (their drivers alive) in the caller. This function creates transient
-/// `AesContext` / `Sha256Context` instances that submit work to the
-/// shared work queues.
+/// flash partition
 ///
 /// # Errors
 ///
@@ -848,6 +805,7 @@ pub async fn download_and_write_to_flash(
     let aes_driver = aes_backend.start();
     let mut sha_backend = ShaBackend::new(sha);
     let sha_driver = sha_backend.start();
+
     // Derive per-manifest subkeys from the encryption key id.
     let (aes_key, hmac_key) = encrypted::derive_subkeys(master_key, manifest.enc.key_id).await;
 
@@ -867,11 +825,7 @@ pub async fn download_and_write_to_flash(
     let manifest_digest = encrypted::compute_manifest_digest(&canonical).await;
 
     network::wait_for_config_up(network_stack).await;
-
     let mut boot_metadata = OtaBootMetadata::new(flash, partition_table_buf)?;
-
-    // Phase 1+2: prepare the inactive slot, fetch the encrypted download,
-    // decrypt/verify/write chunk-by-chunk.
     let stream_result = {
         let (mut region, slot) = boot_metadata
             .inactive_partition()
@@ -896,7 +850,6 @@ pub async fn download_and_write_to_flash(
         .await?
     };
 
-    // Phase 3: post-download verification.
     post_verify(&stream_result, manifest)?;
 
     {
@@ -915,7 +868,6 @@ pub async fn download_and_write_to_flash(
         stream_result.readback_len
     );
 
-    // Phase 4: activate and reboot.
     boot_metadata
         .activate_next_partition()
         .map_err(OtaFlashWriteError::from)?;
@@ -928,8 +880,6 @@ pub async fn download_and_write_to_flash(
         stream_result.total_plaintext
     );
 
-    // Drop hardware crypto backends and their peripheral guards
-    // before returning so the caller can reset cleanly.
     drop(aes_driver);
     drop(aes_backend);
     drop(sha_driver);
