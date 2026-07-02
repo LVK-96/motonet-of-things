@@ -27,3 +27,6 @@ firmware/src/secrets.rs
 scripts/.mqtt-test-tls/
 *.der
 docs
+
+# OTA dev keys (generated locally)
+tools/ota/keys/dev_master.hex
