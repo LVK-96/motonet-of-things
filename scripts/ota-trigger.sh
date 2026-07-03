@@ -148,7 +148,20 @@ if [[ -n "$MQTT_CAFILE" ]]; then
         echo "Error: CA file not found: $MQTT_CAFILE" >&2
         exit 1
     fi
-    mqtt_args+=(--cafile "$MQTT_CAFILE")
+    # Auto-convert DER to PEM (mosquitto_pub does not handle DER)
+    cafile_pem="$MQTT_CAFILE"
+    if head -c 4 "$MQTT_CAFILE" | hexdump -C 2>/dev/null | grep -q '30.*82' \
+       || head -c 1 "$MQTT_CAFILE" | xxd -p 2>/dev/null | grep -q '30'
+    then
+        require_cmd openssl
+        cafile_pem="$(mktemp)"
+        trap 'rm -f "$cafile_pem"' EXIT
+        openssl x509 -inform DER -in "$MQTT_CAFILE" -out "$cafile_pem" 2>/dev/null || {
+            # Not DER — use as-is
+            cafile_pem="$MQTT_CAFILE"
+        }
+    fi
+    mqtt_args+=(--cafile "$cafile_pem")
 fi
 
 if [[ "$CLEAR_RETAINED" == true ]]; then
@@ -175,4 +188,3 @@ echo "============================================"
 echo ""
 echo "The device should pick up the manifest and apply the update."
 echo "Monitor status on: motonet/${DEVICE_ID}/ota/status"
-EOF

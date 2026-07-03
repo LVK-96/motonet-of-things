@@ -24,7 +24,7 @@ pub(crate) fn system_setup() -> Peripherals {
     info!("Initializing system...");
     let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
     info!("Initializing heap...");
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 48 * 1024);
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
     info!("System setup complete!");
 
     peripherals

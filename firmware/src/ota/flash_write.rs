@@ -1,5 +1,3 @@
-use alloc::boxed::Box;
-
 use core::cell::Cell;
 use core::mem::MaybeUninit;
 use core::net::{IpAddr, Ipv4Addr};
@@ -377,7 +375,7 @@ struct EncryptedResult {
 /// Fetch the OTA payload and process it chunk-by-chunk:
 /// validate the 16-byte header, verify HMAC, decrypt, write plaintext to
 /// flash, and accumulate a SHA-256 hash of the plaintext.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::large_futures)]
 async fn fetch_and_process_encrypted(
     network_stack: Stack<'static>,
     manifest: &OtaManifest,
@@ -434,7 +432,8 @@ async fn fetch_and_process_encrypted(
                 },
             );
 
-            let mut request = Box::pin(client.request(Method::GET, current_url.as_str()))
+            let mut request = client
+                .request(Method::GET, current_url.as_str())
                 .await
                 .map_err(|err| {
                     if redirects == 0 {
@@ -790,7 +789,7 @@ fn verify_flash_readback(
 /// Returns [`OtaFlashWriteError`] on any flash, HTTP, crypto, or
 /// verification failure. On success the function never returns — it
 /// reboots the chip.
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::large_futures)]
 pub async fn download_and_write_to_flash(
     network_stack: Stack<'static>,
     manifest: &OtaManifest,
@@ -838,7 +837,7 @@ pub async fn download_and_write_to_flash(
         );
 
         prepare_inactive_slot(&mut region, manifest.image_size)?;
-        Box::pin(fetch_and_process_encrypted(
+        fetch_and_process_encrypted(
             network_stack,
             manifest,
             &mut region,
@@ -846,7 +845,7 @@ pub async fn download_and_write_to_flash(
             &hmac_key,
             &aes_key,
             &manifest_digest,
-        ))
+        )
         .await?
     };
 
