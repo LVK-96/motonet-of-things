@@ -2,7 +2,7 @@ use core::ptr::addr_of_mut;
 use defmt::{Debug2Format, info, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, with_timeout};
 use esp_bootloader_esp_idf::partitions::PARTITION_TABLE_MAX_LEN;
 use esp_hal::system::software_reset;
 use esp_storage::FlashStorage;
@@ -23,7 +23,7 @@ use crate::app_bus::{MqttHealth, MqttHealthReceiver};
 use crate::ota::flash_write;
 use crate::secrets;
 
-const MQTT_STANDDOWN_TIMEOUT_SECS: u64 = 15;
+const MQTT_STANDDOWN_TIMEOUT_SECS: u64 = 30;
 
 static mut OTA_PARTITION_TABLE_BUF: [u8; PARTITION_TABLE_MAX_LEN] = [0u8; PARTITION_TABLE_MAX_LEN];
 
@@ -79,7 +79,10 @@ pub async fn ota_task(
         }
 
         ota_state_sender.send(OtaState::Downloading);
-        wait_for_mqtt_stand_down(&mut mqtt_health_receiver, MQTT_STANDDOWN_TIMEOUT_SECS).await;
+        if !wait_for_mqtt_stand_down(&mut mqtt_health_receiver, MQTT_STANDDOWN_TIMEOUT_SECS).await {
+            ota_state_sender.send(OtaState::Inactive);
+            continue;
+        }
 
         ota_state_sender.send(OtaState::Applying);
 
@@ -117,16 +120,32 @@ pub async fn ota_task(
 async fn wait_for_mqtt_stand_down(
     mqtt_health_receiver: &mut MqttHealthReceiver,
     timeout_secs: u64,
-) {
-    if mqtt_health_receiver.try_get() == Some(MqttHealth::Disconnected) {
-        return;
-    }
+) -> bool {
+    let result = with_timeout(
+        Duration::from_secs(timeout_secs),
+        wait_until_mqtt_disconnected(mqtt_health_receiver),
+    )
+    .await;
 
-    Timer::after(Duration::from_secs(timeout_secs)).await;
-    if mqtt_health_receiver.try_get() != Some(MqttHealth::Disconnected) {
+    if result.is_ok() {
+        true
+    } else {
         warn!(
-            "OTA: MQTT did not stand down within {}s, proceeding anyway",
+            "OTA: MQTT did not stand down within {}s, aborting OTA attempt",
             timeout_secs
         );
+        false
+    }
+}
+
+async fn wait_until_mqtt_disconnected(mqtt_health_receiver: &mut MqttHealthReceiver) {
+    loop {
+        if mqtt_health_receiver.try_get() == Some(MqttHealth::Disconnected) {
+            return;
+        }
+
+        if mqtt_health_receiver.changed().await == MqttHealth::Disconnected {
+            return;
+        }
     }
 }

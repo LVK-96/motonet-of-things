@@ -258,17 +258,16 @@ where
                         &manifest.bytes,
                     ) {
                         OtaManifestDeliveryAction::ForwardOnly => {
-                            info!(
-                                "MQTT: Received early live OTA manifest command during subscribe setup"
-                            );
+                            info!("MQTT: Received early live OTA manifest command");
                             ota_sender.send(manifest.bytes).await;
+                            unsafe { client.buffer_mut().reset() };
+                            return Err(());
                         }
                         OtaManifestDeliveryAction::ForwardAndClearRetained => {
-                            info!(
-                                "MQTT: Received early retained OTA manifest command during subscribe setup; forwarding once and clearing"
-                            );
+                            info!("MQTT: Received early retained OTA manifest command");
                             ota_sender.send(manifest.bytes).await;
-                            super::publish::clear_ota_retained(client, ota_topic.as_str()).await;
+                            unsafe { client.buffer_mut().reset() };
+                            return Err(());
                         }
                         OtaManifestDeliveryAction::ClearRetainedOnly => {
                             info!(

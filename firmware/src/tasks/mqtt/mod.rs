@@ -116,6 +116,12 @@ struct IncomingOtaManifest {
     retained: bool,
 }
 
+enum MqttEventOutcome {
+    Continue,
+    ClearRetained,
+    OtaForwarded,
+}
+
 fn copy_ota_manifest(publish: &Publish<'_, 0>, ota_topic: &str) -> Option<IncomingOtaManifest> {
     if publish.topic.as_ref().as_ref() != ota_topic {
         trace!(
@@ -157,7 +163,7 @@ async fn handle_mqtt_event(
     ota_topic: &str,
     ota_sender: &app_bus::OtaCommandSender,
     ota_state: OtaState,
-) -> bool {
+) -> MqttEventOutcome {
     let manifest = match event {
         Event::Publish(publish) => copy_ota_manifest(&publish, ota_topic),
         Event::Pingresp => {
@@ -185,24 +191,22 @@ async fn handle_mqtt_event(
             OtaManifestDeliveryAction::ForwardOnly => {
                 info!("MQTT: Received live OTA manifest command, handing off to OTA task");
                 ota_sender.send(manifest.bytes).await;
-                false
+                MqttEventOutcome::OtaForwarded
             }
             OtaManifestDeliveryAction::ForwardAndClearRetained => {
-                info!(
-                    "MQTT: Received retained OTA manifest command, handing off once and clearing retained copy"
-                );
+                info!("MQTT: Received retained OTA manifest command, handing off to OTA task");
                 ota_sender.send(manifest.bytes).await;
-                true
+                MqttEventOutcome::OtaForwarded
             }
             OtaManifestDeliveryAction::ClearRetainedOnly => {
                 info!(
                     "MQTT: Clearing retained OTA manifest during pending confirmation without re-running OTA"
                 );
-                true
+                MqttEventOutcome::ClearRetained
             }
         }
     } else {
-        false
+        MqttEventOutcome::Continue
     }
 }
 
@@ -287,15 +291,23 @@ where
                 };
                 match client.poll_body(header).await {
                     Ok(event) => {
-                        let clear_retained = handle_mqtt_event(
+                        match handle_mqtt_event(
                             event,
                             ota_topic.as_str(),
                             ota_sender,
                             ota_state_receiver.try_get().unwrap_or(OtaState::Inactive),
                         )
-                        .await;
-                        if clear_retained {
-                            publish::clear_ota_retained(client, ota_topic.as_str()).await;
+                        .await
+                        {
+                            MqttEventOutcome::Continue => {}
+                            MqttEventOutcome::ClearRetained => {
+                                publish::clear_ota_retained(client, ota_topic.as_str()).await;
+                            }
+                            MqttEventOutcome::OtaForwarded => {
+                                info!("MQTT: OTA manifest handed off; standing down");
+                                unsafe { client.buffer_mut().reset() };
+                                break;
+                            }
                         }
                         unsafe { client.buffer_mut().reset() };
                         last_activity = Instant::now();
