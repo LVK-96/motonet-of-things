@@ -20,7 +20,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -45,13 +45,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Xtensa Rust toolchain
-        uses: esp-rs/xtensa-toolchain@v1.6
+        uses: esp-rs/xtensa-toolchain@v1.7
         with:
           default: true
           buildtargets: esp32
 
       - name: Install just
-        uses: extractions/setup-just@v2
+        uses: extractions/setup-just@v4
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2

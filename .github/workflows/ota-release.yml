@@ -29,7 +29,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Xtensa Rust toolchain
-        uses: esp-rs/xtensa-toolchain@v1.6
+        uses: esp-rs/xtensa-toolchain@v1.7
         with:
           default: true
           buildtargets: esp32
@@ -92,12 +92,16 @@ jobs:
             target/xtensa-esp32-none-elf/release/esp32-rust-project \
             target/ota/firmware.bin
           size=$(wc -c < target/ota/firmware.bin)
-          max=$((0x1C0000))
+          # Derive max image size from partitions.csv (ota_0 size)
+          # minus the reserved sector (FLASH_SECTOR_SIZE in flash_write.rs).
+          ota_size=$(grep '^ota_0,' firmware/partitions.csv | awk -F, '{gsub(/ /,"",$5); print $5}')
+          reserved=$(sed -n 's/^const FLASH_SECTOR_SIZE: u32 = \([0-9]*\);$/\1/p' firmware/src/ota/flash_write.rs)
+          max=$((ota_size - reserved))
           if (( size > max )); then
-            echo "firmware.bin is $size bytes, exceeds OTA slot max $max" >&2
+            echo "firmware.bin is $size bytes, exceeds OTA slot max $((ota_size)) - $((reserved)) = $max" >&2
             exit 1
           fi
-          echo "OTA firmware size: $size bytes"
+          echo "OTA firmware size: $size bytes (ota_0 partition $((ota_size)), reserved $((reserved)) bytes)"
 
       - name: Package encrypted OTA v2 container and signed manifest
         env:
@@ -141,7 +145,7 @@ jobs:
           echo "Manifest URL: $url"
 
       - name: Publish GitHub Release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_VERSION }}
           prerelease: ${{ github.event_name == 'workflow_dispatch' }}
